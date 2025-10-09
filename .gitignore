@@ -1,0 +1,16 @@
+.git
+.env
+.DS_Store
+__pycache__/
+astro
+.venv
+airflow-webserver.pid
+webserver_config.py
+airflow.cfg
+airflow.db
+.user.yml
+dbt/logs
+dbt/target
+/images
+dbt_packages
+package-lock.yml
