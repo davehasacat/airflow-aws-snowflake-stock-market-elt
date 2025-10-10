@@ -16,13 +16,13 @@ stock_market_elt:
       schema: "{{ env_var('SNOWFLAKE_SCHEMA') }}"
       threads: 4
       client_session_keep_alive: False
-  # This 'ci' profile is used only for the Docker build
     ci:
       type: snowflake
-      host: "host"
-      user: "user"
-      password: "password"
-      port: 5432
-      dbname: "db_name"
+      account: "db_host" # Placeholder for CI
+      user: "db_user"
+      password: "db_password"
+      role: "db_role"
+      database: "db_name"
+      warehouse: "db_warehouse"
       schema: "public"
       threads: 4
