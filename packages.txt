@@ -1,1 +1,3 @@
 build-essential
+libffi-dev
+openssl-dev
