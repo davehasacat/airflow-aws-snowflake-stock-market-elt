@@ -8,9 +8,9 @@ from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
 from airflow.datasets import Dataset
 
-# Define the Datasets for data-driven scheduling
 S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://test/manifests/polygon_options_manifest_latest.txt")
 SNOWFLAKE_DWH_POLYGON_OPTIONS_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_options_bars_daily")
+
 
 @dag(
     dag_id="polygon_options_load",
@@ -28,14 +28,19 @@ def polygon_options_load_dag():
     S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
     SNOWFLAKE_CONN_ID = "snowflake_default"
     BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+
+    SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE")
+    SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA")
     SNOWFLAKE_TABLE = "source_polygon_options_bars_daily"
+    FULLY_QUALIFIED_TABLE_NAME = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}"
+
 
     @task
     def create_snowflake_table():
         """Creates the target options table in Snowflake if it doesn't exist."""
         snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {SNOWFLAKE_TABLE} (
+        CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_TABLE_NAME} (
             option_symbol TEXT,
             trade_date DATE,
             underlying_ticker TEXT,
@@ -53,7 +58,6 @@ def polygon_options_load_dag():
         );
         """
         snowflake_hook.run(create_table_sql)
-        print(f"Ensured table {SNOWFLAKE_TABLE} exists.")
 
     @task
     def get_s3_keys_from_manifest() -> list[str]:
@@ -68,21 +72,16 @@ def polygon_options_load_dag():
         if not s3_keys:
             raise AirflowSkipException("Manifest is empty. No new files to process.")
         
-        print(f"Found {len(s3_keys)} new options files to load from manifest.")
         return s3_keys
 
     @task(outlets=[SNOWFLAKE_DWH_POLYGON_OPTIONS_RAW_DATASET])
     def load_data_to_snowflake(s3_keys: list[str]):
         """
-        Executes a COPY INTO command to load data from the specified S3 keys
-        into the target Snowflake table.
+        Executes a COPY INTO command to load data from S3 into the target Snowflake table.
         """
         snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-
-        # --- CORRECTED SECTION ---
-        # The curly braces in the regex are now doubled (e.g., {{4}}) to escape them in the f-string.
         copy_sql = f"""
-        COPY INTO {SNOWFLAKE_TABLE} (
+        COPY INTO {FULLY_QUALIFIED_TABLE_NAME} (
             option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
             open, high, low, close, volume, vwap, transactions
         )
@@ -106,11 +105,9 @@ def polygon_options_load_dag():
         FILES = ({', '.join(f"'{key}'" for key in s3_keys)})
         FILE_FORMAT = (TYPE = 'JSON');
         """
-        
         snowflake_hook.run(copy_sql)
-        print(f"Successfully loaded data from {len(s3_keys)} files into {SNOWFLAKE_TABLE}.")
+        print(f"Successfully loaded data from {len(s3_keys)} files into {FULLY_QUALIFIED_TABLE_NAME}.")
 
-    # --- Task Flow ---
     table_created = create_snowflake_table()
     s3_keys = get_s3_keys_from_manifest()
     

@@ -29,14 +29,18 @@ def polygon_stocks_load_dag():
     S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
     SNOWFLAKE_CONN_ID = "snowflake_default"
     BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+    
+    SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE")
+    SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA")
     SNOWFLAKE_TABLE = "source_polygon_stock_bars_daily"
+    FULLY_QUALIFIED_TABLE_NAME = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}"
 
     @task
     def create_snowflake_table():
         """Creates the target table in Snowflake if it doesn't exist."""
         snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {SNOWFLAKE_TABLE} (
+        CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_TABLE_NAME} (
             ticker TEXT,
             trade_date DATE,
             open NUMERIC(19, 4),
@@ -72,11 +76,8 @@ def polygon_stocks_load_dag():
         Executes a COPY INTO command to load data from S3 into Snowflake.
         """
         snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-
-        # --- CORRECTED SECTION ---
-        # Escaped the curly braces in the REGEXP_SUBSTR function by doubling them.
         copy_sql = f"""
-        COPY INTO {SNOWFLAKE_TABLE} (ticker, trade_date, volume, vwap, open, close, high, low, transactions)
+        COPY INTO {FULLY_QUALIFIED_TABLE_NAME} (ticker, trade_date, volume, vwap, open, close, high, low, transactions)
         FROM (
             SELECT
                 $1:ticker::TEXT,
@@ -93,9 +94,8 @@ def polygon_stocks_load_dag():
         FILES = ({', '.join(f"'{key}'" for key in s3_keys)})
         FILE_FORMAT = (TYPE = 'JSON');
         """
-        
         snowflake_hook.run(copy_sql)
-        print(f"Successfully loaded data from {len(s3_keys)} files into {SNOWFLAKE_TABLE}.")
+        print(f"Successfully loaded data from {len(s3_keys)} files into {FULLY_QUALIFIED_TABLE_NAME}.")
 
     table_created = create_snowflake_table()
     s3_keys = get_s3_keys_from_manifest()
