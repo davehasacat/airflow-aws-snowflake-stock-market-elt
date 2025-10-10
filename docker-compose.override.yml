@@ -38,13 +38,14 @@ services:
     container_name: dashboard
     ports:
       - "8501:8501"
-    # Use the same environment variables as the postgres_dwh service
-    # to ensure the Dashboard app can connect to it.
-    # environment:
-    #   - POSTGRES_DB=${POSTGRES_DB}
-    #   - POSTGRES_USER=${POSTGRES_USER}
-    #   - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    # Add the dashboard service to the same network as the other services
+    environment:
+      # Pass snowflake credentials to the dashboard
+      - SNOWFLAKE_USER=${SNOWFLAKE_USER}
+      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD}
+      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT}
+      - SNOWFLAKE_WAREHOUSE=STOCKS_DASHBOARD_WH # Use the smaller warehouse for the dashboard
+      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE}
+      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA}
     networks:
       - stocks-elt_default
 # add minio folder to airflow after connection is created
