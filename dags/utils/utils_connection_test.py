@@ -7,11 +7,10 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
+from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig
 
 # --- DAG Configuration ---
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR")
-DBT_EXECUTABLE_PATH = os.getenv("DBT_EXECUTABLE_PATH")
 S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
 SNOWFLAKE_CONN_ID = "snowflake_default"
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
@@ -48,21 +47,25 @@ def utils_connection_test_dag():
         snowflake_hook.get_first("SELECT 1;")
         print("Snowflake connection successful.")
 
-    # This TaskGroup finds the dbt project, parses it, and creates an Airflow task for the specified dbt resource.
     test_dbt_connection = DbtTaskGroup(
         group_id="test_dbt_connection",
-        project_config=ProjectConfig(dbt_project_path=DBT_PROJECT_DIR),
+        project_config=ProjectConfig(
+            dbt_project_path=DBT_PROJECT_DIR
+        ),
         profile_config=ProfileConfig(
             profile_name="stock_market_elt",
             target_name="dev",
             profiles_yml_filepath=os.path.join(DBT_PROJECT_DIR, "profiles.yml"),
         ),
-        execution_config=ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH),
-        # Test a specific source to confirm dbt can connect and parse the project
         operator_args={"select": "source:public.source_polygon_stock_bars_daily"},
     )
 
-    # Define task dependencies
-    [test_minio_connection(), test_snowflake_connection()] >> test_dbt_connection
+    # --- CORRECTED SECTION ---
+    # Instantiate the tasks by calling the decorated functions
+    minio_test = test_minio_connection()
+    snowflake_test = test_snowflake_connection()
+
+    # Define task dependencies using the instantiated task objects
+    [minio_test, snowflake_test] >> test_dbt_connection
 
 utils_connection_test_dag()
