@@ -120,6 +120,8 @@ def dbt_test_dag():
         snowflake_hook.run(merge_sql)
         print(f"Successfully loaded {len(test_results)} test results.")
 
-    run_dbt_tests >> parse_and_load_test_results()
+    # Instantiate the downstream task before setting the dependency
+    load_task = parse_and_load_test_results()
+    run_dbt_tests >> load_task
 
 dbt_test_dag()
