@@ -19,17 +19,6 @@ services:
       - default
       - stocks-elt_default
 # create custom services
-  postgres_dwh:
-    image: postgres:12
-    container_name: postgres_dwh
-    ports:
-      - "5433:5432"  # create host port on 5433 as default airflow postgres container uses 5432
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    networks:
-      - stocks-elt_default  # add services to same network
   minio:
     image: minio/minio
     container_name: minio
@@ -51,10 +40,10 @@ services:
       - "8501:8501"
     # Use the same environment variables as the postgres_dwh service
     # to ensure the Dashboard app can connect to it.
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    # environment:
+    #   - POSTGRES_DB=${POSTGRES_DB}
+    #   - POSTGRES_USER=${POSTGRES_USER}
+    #   - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     # Add the dashboard service to the same network as the other services
     networks:
       - stocks-elt_default

@@ -6,20 +6,22 @@ stock_market_elt:
   target: dev
   outputs:
     dev:
-      type: postgres
-      host: postgres_dwh # The service name from your docker-compose file
-      user: "{{ env_var('POSTGRES_USER') }}"
-      password: "{{ env_var('POSTGRES_PASSWORD') }}"
-      port: 5432
-      dbname: "{{ env_var('POSTGRES_DB') }}"
-      schema: public # The schema where dbt will build models
-      threads: 4 # Number of parallel threads dbt can use
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA') }}"
+      threads: 4
+      client_session_keep_alive: False
   # This 'ci' profile is used only for the Docker build
     ci:
-      type: postgres
-      host: "db_host"
-      user: "db_user"
-      password: "db_password"
+      type: snowflake
+      host: "host"
+      user: "user"
+      password: "password"
       port: 5432
       dbname: "db_name"
       schema: "public"
