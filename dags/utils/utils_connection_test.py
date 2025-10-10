@@ -7,10 +7,11 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig
+from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 
 # --- DAG Configuration ---
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR")
+DBT_EXECUTABLE_PATH = os.getenv("DBT_EXECUTABLE_PATH", "/usr/local/airflow/dbt_venv/bin/dbt")
 S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
 SNOWFLAKE_CONN_ID = "snowflake_default"
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
@@ -23,7 +24,6 @@ BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
     tags=["test", "minio", "snowflake", "dbt"],
     doc_md="""
     ### Full Stack Connection Test DAG
-
     This DAG tests the connections to MinIO S3 and Snowflake, and also
     verifies that dbt can successfully connect and parse a source.
     """,
@@ -49,23 +49,19 @@ def utils_connection_test_dag():
 
     test_dbt_connection = DbtTaskGroup(
         group_id="test_dbt_connection",
-        project_config=ProjectConfig(
-            dbt_project_path=DBT_PROJECT_DIR
-        ),
+        project_config=ProjectConfig(dbt_project_path=DBT_PROJECT_DIR),
         profile_config=ProfileConfig(
             profile_name="stock_market_elt",
             target_name="dev",
             profiles_yml_filepath=os.path.join(DBT_PROJECT_DIR, "profiles.yml"),
         ),
+        execution_config=ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH),
         operator_args={"select": "source:public.source_polygon_stock_bars_daily"},
     )
 
-    # --- CORRECTED SECTION ---
-    # Instantiate the tasks by calling the decorated functions
     minio_test = test_minio_connection()
     snowflake_test = test_snowflake_connection()
 
-    # Define task dependencies using the instantiated task objects
     [minio_test, snowflake_test] >> test_dbt_connection
 
 utils_connection_test_dag()

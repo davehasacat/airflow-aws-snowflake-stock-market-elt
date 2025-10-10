@@ -4,12 +4,12 @@ import pendulum
 import json
 from airflow.decorators import dag, task
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig
+from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 
 # --- dbt Configuration ---
-DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
+DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR")
+DBT_EXECUTABLE_PATH = os.getenv("DBT_EXECUTABLE_PATH", "/usr/local/airflow/dbt_venv/bin/dbt")
 SNOWFLAKE_CONN_ID = "snowflake_default"
-
 
 @dag(
     dag_id="dbt_test",
@@ -19,7 +19,6 @@ SNOWFLAKE_CONN_ID = "snowflake_default"
     tags=["dbt", "monitoring", "snowflake"],
     doc_md="""
     ### dbt Test Runner and Parser DAG
-
     This DAG runs `dbt test` and then uses a Python task to parse the
     `run_results.json` artifact and load the results into a table
     in the data warehouse for monitoring.
@@ -31,14 +30,13 @@ def dbt_test_dag():
     """
     run_dbt_tests = DbtTaskGroup(
         group_id="run_dbt_tests",
-        project_config=ProjectConfig(
-            dbt_project_path=DBT_PROJECT_DIR,
-        ),
+        project_config=ProjectConfig(dbt_project_path=DBT_PROJECT_DIR),
         profile_config=ProfileConfig(
             profile_name="stock_market_elt",
             target_name="dev",
             profiles_yml_filepath=os.path.join(DBT_PROJECT_DIR, "profiles.yml"),
         ),
+        execution_config=ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH),
         operator_args={"cmd": "test"}
     )
 
@@ -46,8 +44,7 @@ def dbt_test_dag():
     def parse_and_load_test_results():
         """
         Parses the dbt run_results.json artifact and loads the test
-        results into a dedicated table in Snowflake using a robust,
-        staging table approach.
+        results into a dedicated table in Snowflake.
         """
         run_results_path = os.path.join(DBT_PROJECT_DIR, "target/run_results.json")
         
@@ -76,7 +73,6 @@ def dbt_test_dag():
 
         snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         
-        # Create the target table if it doesn't exist
         snowflake_hook.run("""
             CREATE TABLE IF NOT EXISTS public.dbt_test_results (
                 test_id TEXT PRIMARY KEY,
@@ -89,10 +85,8 @@ def dbt_test_dag():
             );
         """)
 
-        # Create a temporary table to stage the new results
         snowflake_hook.run("CREATE OR REPLACE TEMPORARY TABLE dbt_test_results_staging LIKE public.dbt_test_results;")
         
-        # Prepare rows for insertion
         rows_to_insert = [
             (
                 res["test_id"],
@@ -105,11 +99,9 @@ def dbt_test_dag():
             for res in test_results
         ]
         
-        # Insert new results into the staging table using parameter binding for safety
         insert_sql = "INSERT INTO dbt_test_results_staging (test_id, test_name, status, failures, execution_time, run_generated_at) VALUES (%s, %s, %s, %s, %s, %s)"
         snowflake_hook.run(insert_sql, parameters=rows_to_insert)
 
-        # Merge from the staging table into the final table
         merge_sql = """
             MERGE INTO public.dbt_test_results t
             USING dbt_test_results_staging s
@@ -128,7 +120,6 @@ def dbt_test_dag():
         snowflake_hook.run(merge_sql)
         print(f"Successfully loaded {len(test_results)} test results.")
 
-    # Set the task dependency
     run_dbt_tests >> parse_and_load_test_results()
 
 dbt_test_dag()
