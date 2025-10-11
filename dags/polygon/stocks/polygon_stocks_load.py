@@ -8,10 +8,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
 
-from dags.utils.polygon_datasets import S3_MANIFEST_DATASET
-from airflow.datasets import Dataset
-SNOWFLAKE_DWH_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_stock_bars_daily")
-
+from dags.utils.polygon_datasets import S3_MANIFEST_DATASET, SNOWFLAKE_STOCKS_RAW_DATASET
 
 @dag(
     dag_id="polygon_stocks_load",
