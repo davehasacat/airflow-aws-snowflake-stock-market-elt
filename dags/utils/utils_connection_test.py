@@ -11,21 +11,22 @@ from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 
 # --- DAG Configuration ---
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR")
-DBT_EXECUTABLE_PATH = os.getenv("DBT_EXECUTABLE_PATH", "/usr/local/airflow/dbt_venv/bin/dbt") # Ensure this is defined
-S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
+DBT_EXECUTABLE_PATH = os.getenv("DBT_EXECUTABLE_PATH", "/usr/local/airflow/dbt_venv/bin/dbt")
+# Use the standard 'aws_default' connection ID
+S3_CONN_ID = "aws_default"
 SNOWFLAKE_CONN_ID = "snowflake_default"
-BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 @dag(
     dag_id="utils_connection_test",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     schedule=None,
     catchup=False,
-    tags=["test", "minio", "snowflake", "dbt"],
+    tags=["test", "aws", "s3", "snowflake", "dbt"],
     doc_md="""
     ### Full Stack Connection Test DAG
-    This DAG tests the connections to MinIO S3 and Snowflake, and also
-    verifies that dbt can successfully connect and parse a source.
+    This DAG tests the connections to AWS S3 and Snowflake, and also
+    verifies that dbt can successfully connect.
     """,
 )
 def utils_connection_test_dag():
@@ -34,11 +35,11 @@ def utils_connection_test_dag():
     """
 
     @task
-    def test_minio_connection():
-        """Checks the Minio S3 connection."""
+    def test_aws_s3_connection():
+        """Checks the AWS S3 connection by verifying the bucket exists."""
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
         s3_hook.check_for_bucket(bucket_name=BUCKET_NAME)
-        print(f"Minio connection to bucket '{BUCKET_NAME}' successful.")
+        print(f"AWS S3 connection to bucket '{BUCKET_NAME}' successful.")
 
     @task
     def test_snowflake_connection():
@@ -55,13 +56,15 @@ def utils_connection_test_dag():
             target_name="dev",
             profiles_yml_filepath=os.path.join(DBT_PROJECT_DIR, "profiles.yml"),
         ),
-        # Explicitly provide the path to the dbt executable
         execution_config=ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH),
         operator_args={"select": "source:public.source_polygon_stock_bars_daily"},
     )
 
-    minio_test = test_minio_connection()
+    # Instantiate the tasks
+    s3_test = test_aws_s3_connection()
     snowflake_test = test_snowflake_connection()
-    [minio_test, snowflake_test] >> test_dbt_connection
+
+    # Define task dependencies
+    [s3_test, snowflake_test] >> test_dbt_connection
 
 utils_connection_test_dag()
