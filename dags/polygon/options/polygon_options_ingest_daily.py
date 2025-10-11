@@ -11,7 +11,8 @@ from airflow.hooks.base import BaseHook
 from airflow.datasets import Dataset
 from airflow.exceptions import AirflowSkipException
 
-S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://test/manifests/polygon_options_manifest_latest.txt")
+# Define the Dataset that this DAG will produce upon completion
+S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://stock-market-elt/manifests/polygon_options_manifest_latest.txt")
 
 @dag(
     dag_id="polygon_options_ingest_daily",
@@ -22,6 +23,11 @@ S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://test/manifests/polygon_optio
     dagrun_timeout=timedelta(hours=12),
 )
 def polygon_options_ingest_daily_dag():
+    """
+    This DAG orchestrates the daily ingestion of options data from the Polygon API.
+    It fetches all option contracts for a predefined list of tickers and saves their
+    daily aggregate data to S3, creating a manifest file that triggers the downstream 'load' DAG.
+    """
     S3_CONN_ID = "aws_default"
     BUCKET_NAME = os.getenv("BUCKET_NAME")
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
@@ -30,6 +36,7 @@ def polygon_options_ingest_daily_dag():
     def get_tickers_from_seed() -> list[str]:
         """
         Retrieves a list of stock tickers from the `custom_tickers` dbt seed file.
+        This is identical to the method used in the stocks_ingest DAG.
         """
         custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         with open(custom_tickers_path, mode='r') as csvfile:
@@ -48,10 +55,10 @@ def polygon_options_ingest_daily_dag():
         For a single underlying ticker, fetches all relevant option contracts
         and saves their daily aggregate data for a specific trade date to S3.
         """
-        # Correctly calculate the target date for the data pull
         execution_date = kwargs["ds"]
         trade_date = pendulum.parse(execution_date).subtract(days=1).to_date_string()
 
+        # Use the specific 'polygon_options_api' connection from your .env file
         conn = BaseHook.get_connection('polygon_options_api')
         api_key = conn.password
         if not api_key:
@@ -99,11 +106,10 @@ def polygon_options_ingest_daily_dag():
                     contracts_url += f"&apiKey={api_key}"
 
             except requests.exceptions.HTTPError as e:
-                # Add more specific error handling, similar to the stocks DAG
                 if e.response.status_code == 404:
-                    print(f"No contract data found for ticker {ticker} on {trade_date}. Skipping.")
-                    break
-                print(f"HTTP Error for ticker {ticker}: {e}. Skipping this ticker.")
+                    print(f"No data found for ticker {ticker} on {trade_date} (404). Skipping ticker.")
+                else:
+                    print(f"HTTP Error for ticker {ticker}: {e}. Skipping this ticker.")
                 break # Exit loop for this ticker if a persistent API error occurs
             except requests.exceptions.RequestException as e:
                 print(f"Network error while fetching data for {ticker}: {e}. Skipping this ticker.")
@@ -114,6 +120,10 @@ def polygon_options_ingest_daily_dag():
 
     @task(outlets=[S3_POLYGON_OPTIONS_MANIFEST_DATASET])
     def create_manifest(s3_keys_per_ticker: list):
+        """
+        Flattens the list of S3 keys from all parallel tasks and writes them to a
+        single manifest file in S3, triggering the downstream 'load' DAG.
+        """
         flat_list = [key for sublist in s3_keys_per_ticker for key in sublist if key]
         
         if not flat_list:
@@ -131,7 +141,9 @@ def polygon_options_ingest_daily_dag():
         )
         print(f"Manifest created with {len(flat_list)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
+    # Define the task flow
     tickers_list = get_tickers_from_seed()
+    # Use .expand() to dynamically create a parallel task for each ticker
     s3_keys_list = fetch_and_save_options_data.expand(ticker=tickers_list)
     create_manifest(s3_keys_list)
 
