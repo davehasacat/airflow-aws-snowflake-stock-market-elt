@@ -1,5 +1,5 @@
 -- ====================================================================
--- Snowflake Setup for Stock and Options ELT Project (Final Corrected)
+-- Snowflake Setup for Stock and Options ELT Project
 -- ====================================================================
 -- This script is idempotent and can be run multiple times safely.
 
@@ -22,12 +22,12 @@ CREATE ROLE IF NOT EXISTS STOCKS_ELT_ROLE;
 -- STORAGE INTEGRATION CREATION
 -- ----------------------------
 -- This object creates the secure link between Snowflake and your AWS IAM Role.
--- !! IMPORTANT !! -> Replace '586159464756' with your AWS_ACCOUNT_ID.
+-- !! IMPORTANT !! -> Replace 'AWS_ACCOUNT_ID' with your AWS_ACCOUNT_ID.
 CREATE OR REPLACE STORAGE INTEGRATION s3_integration
   TYPE = EXTERNAL_STAGE
   STORAGE_PROVIDER = 'S3'
   ENABLED = TRUE
-  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::586159464756:role/SnowflakeS3Role'
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::AWS_ACCOUNT_ID:role/SnowflakeS3Role'
   STORAGE_ALLOWED_LOCATIONS = ('s3://stock-market-elt/');
 
 
