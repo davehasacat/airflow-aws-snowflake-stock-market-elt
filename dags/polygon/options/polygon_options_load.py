@@ -151,7 +151,9 @@ def polygon_options_load_dag():
         )
         SELECT
             sym                                                                 AS option_symbol,
-            TO_DATE(TO_TIMESTAMP_NTZ(TRY_TO_NUMBER(rec:results[0]:t)::NUMBER / 1000))  AS trade_date,
+
+            /* trade_date from ms epoch in the first result bar */
+            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))      AS trade_date,
 
             /* UNDERLYING immediately after 'O:' */
             REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)        AS underlying_ticker,
