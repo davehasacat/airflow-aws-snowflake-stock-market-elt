@@ -22,7 +22,7 @@ CREATE ROLE IF NOT EXISTS STOCKS_ELT_ROLE;
 -- STORAGE INTEGRATION CREATION
 -- ----------------------------
 -- This object creates the secure link between Snowflake and your AWS IAM Role.
--- !! IMPORTANT !! -> Replace 'YOUR_AWS_ACCOUNT_ID' and 'your-bucket-name'
+-- !! IMPORTANT !! -> Replace '586159464756' with your AWS_ACCOUNT_ID.
 CREATE OR REPLACE STORAGE INTEGRATION s3_integration
   TYPE = EXTERNAL_STAGE
   STORAGE_PROVIDER = 'S3'
@@ -42,9 +42,9 @@ CREATE OR REPLACE STAGE STOCKS_ELT_DB.PUBLIC.s3_stage
 
 -- PERMISSION GRANTING
 -- -------------------
--- Grant all necessary privileges to the custom role in logical order
+-- Grant all necessary privileges to the custom role in logical order.
 
--- 1. Grant usage on the warehouses
+-- 1. Grant usage on warehouses
 GRANT USAGE ON WAREHOUSE STOCKS_ELT_WH TO ROLE STOCKS_ELT_ROLE;
 GRANT USAGE ON WAREHOUSE STOCKS_DASHBOARD_WH TO ROLE STOCKS_ELT_ROLE;
 
@@ -52,13 +52,11 @@ GRANT USAGE ON WAREHOUSE STOCKS_DASHBOARD_WH TO ROLE STOCKS_ELT_ROLE;
 GRANT USAGE ON DATABASE STOCKS_ELT_DB TO ROLE STOCKS_ELT_ROLE;
 GRANT USAGE ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
 
--- 3. Grant usage on the Storage Integration
+-- 3. Grant usage on the Storage Integration and Stage
 GRANT USAGE ON INTEGRATION s3_integration TO ROLE STOCKS_ELT_ROLE;
-
--- 4. Grant usage on the Stage
 GRANT USAGE ON STAGE STOCKS_ELT_DB.PUBLIC.s3_stage TO ROLE STOCKS_ELT_ROLE;
 
--- 5. Grant permissions for the role to create objects within the schema
+-- 4. Grant permissions for the role to create objects within the schema
 GRANT ALL PRIVILEGES ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
 
 
