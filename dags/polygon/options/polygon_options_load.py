@@ -8,11 +8,7 @@ from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
 from airflow.datasets import Dataset
 
-# Define the Dataset that this DAG consumes
-S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://stock-market-elt/manifests/polygon_options_manifest_latest.txt")
-# Define the Dataset that this DAG produces
-SNOWFLAKE_DWH_POLYGON_OPTIONS_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_options_bars_daily")
-
+from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET, SNOWFLAKE_OPTIONS_RAW_DATASET
 
 @dag(
     dag_id="polygon_options_load",

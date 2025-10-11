@@ -11,8 +11,7 @@ from airflow.hooks.base import BaseHook
 from airflow.datasets import Dataset
 from airflow.exceptions import AirflowSkipException
 
-# Define the Dataset that this DAG will produce upon completion
-S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://stock-market-elt/manifests/polygon_options_manifest_latest.txt")
+from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
 @dag(
     dag_id="polygon_options_ingest_daily",
