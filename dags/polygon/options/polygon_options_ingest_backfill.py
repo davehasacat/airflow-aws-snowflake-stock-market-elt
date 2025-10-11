@@ -1,191 +1,237 @@
 from __future__ import annotations
-import pendulum
-import os
-import requests
-import json
+
 import csv
+import json
+import os
 import time
+from typing import List
+
+import pendulum
+import requests
 from datetime import timedelta
+
 from airflow.decorators import dag, task
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowSkipException
+from airflow.hooks.base import BaseHook
 from airflow.models.param import Param
+from airflow.operators.python import get_current_context
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
-# Define the DAG with parameters for the backfill date range.
-# This makes the DAG manually triggerable with custom start and end dates.
+# ────────────────────────────────────────────────────────────────────────────────
+# Config / Constants
+# ────────────────────────────────────────────────────────────────────────────────
+POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
+POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
+
+S3_CONN_ID = os.getenv("S3_CONN_ID", "aws_default")
+BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
+
+REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (manual)")
+API_POOL = "api_pool"  # defined in airflow_settings.yaml
+
+# Rate limiting / batching
+REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.5"))
+SYMBOL_BATCH_SIZE = int(os.getenv("BACKFILL_SYMBOL_BATCH_SIZE", "500"))
+
+API_CONN_ID = "polygon_options_api"
+
+
+def _get_polygon_api_key(conn_id: str, env_fallback: str) -> str:
+    """Resolve the Polygon API key from Airflow connection or env fallback."""
+    try:
+        return BaseHook.get_connection(conn_id).password
+    except Exception:
+        key = os.getenv(env_fallback)
+        if not key:
+            raise RuntimeError(
+                f"Polygon API key not found. Define Airflow connection '{conn_id}' or set env var {env_fallback}"
+            )
+        return key
+
+
+def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
+    """
+    Robust GET with exponential backoff for 429/5xx.
+    Respects Retry-After when present. Raises for non-OK (except 404 which caller handles).
+    """
+    headers = {"User-Agent": USER_AGENT}
+    backoff = 1.5
+    delay = 1.0
+    tries = 0
+    while True:
+        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SECS)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            sleep_s = float(retry_after) if retry_after else delay
+            time.sleep(sleep_s)
+            delay *= backoff
+        elif 500 <= resp.status_code < 600:
+            if tries >= max_tries:
+                resp.raise_for_status()
+            time.sleep(delay)
+            delay *= backoff
+            tries += 1
+        else:
+            return resp
+
+
 @dag(
     dag_id="polygon_options_ingest_backfill",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=None,  # This DAG is not scheduled and must be run manually.
+    schedule=None,  # manual only
     catchup=False,
     tags=["ingestion", "polygon", "options", "backfill"],
-    # `params` allow users to provide input when manually triggering the DAG.
     params={
-        "start_date": Param(default="2024-01-01", type="string", description="The start date for the backfill (YYYY-MM-DD)."),
-        "end_date": Param(default="2024-01-31", type="string", description="The end date for the backfill (YYYY-MM-DD).")
-    }
+        "start_date": Param(default="2025-10-06", type="string", description="Backfill start date (YYYY-MM-DD)"),
+        "end_date": Param(default="2025-10-09", type="string", description="Backfill end date (YYYY-MM-DD)"),
+    },
+    dagrun_timeout=timedelta(hours=24),
 )
 def polygon_options_ingest_backfill_dag():
     """
-    ## Polygon Options Backfill DAG
-
-    This DAG is designed for manually backfilling historical options data from Polygon.
-
-    ### Process:
-    1.  **Get All Option Symbols**: Reads a list of underlying stock tickers from a CSV file in the dbt project and fetches all associated option contract symbols from the Polygon API.
-    2.  **Batch Symbols**: Groups the large list of symbols into smaller batches to avoid overwhelming Airflow's dynamic task mapping limits.
-    3.  **Process Batches**: For each batch of symbols, it fetches the historical aggregate data for the user-specified date range.
-    4.  **Save to S3**: Each trading day's data for each contract is saved as a separate JSON file in S3.
-    5.  **Create Manifest**: A final manifest file is created in S3, listing all the new file paths. This manifest update triggers the downstream `polygon_options_load` DAG.
+    Manually backfill historical options data from Polygon:
+      1) Discover option contracts for seed underlyings (via /v3/reference/options/contracts)
+      2) Batch symbols to respect mapping limits and API rate limits
+      3) For each symbol, pull aggregates over the date range (/v2/aggs/ticker/.../range/1/day)
+      4) Write one JSON per (contract, trading day) to S3
+      5) Write manifest to trigger downstream load
     """
-    # --- Global Variables ---
-    S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
-    BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
-    DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
-    # A small delay between API calls to respect rate limits.
-    REQUEST_DELAY_SECONDS = 0.5 
 
-    # --- Task Definitions ---
-
-    @task(pool="api_pool")
-    def get_all_option_symbols() -> list[str]:
+    @task(pool=API_POOL)
+    def get_all_option_symbols() -> List[str]:
         """
-        Reads underlying tickers from a dbt seed file and fetches all associated
-        option contract symbols from the Polygon API. This task paginates through
-        the API results to build a complete list.
+        Read underlyings from dbt seeds and fetch all option contract symbols (paginated).
         """
-        api_key = os.getenv('POLYGON_OPTIONS_API_KEY')
-        if not api_key:
-            raise ValueError("API key POLYGON_OPTIONS_API_KEY not found in environment variables.")
+        api_key = _get_polygon_api_key(API_CONN_ID, "POLYGON_OPTIONS_API_KEY")
 
-        # Read the list of target stocks from the dbt seed file.
         custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
-        with open(custom_tickers_path, mode='r') as csvfile:
+        with open(custom_tickers_path, mode="r") as csvfile:
             reader = csv.DictReader(csvfile)
-            underlying_tickers = [row["ticker"] for row in reader]
+            underlyings = [row["ticker"].strip().upper() for row in reader if row.get("ticker")]
 
-        all_option_symbols = []
-        print(f"Fetching option contracts for tickers: {underlying_tickers}")
-        
-        # Loop through each underlying ticker to find its option contracts.
-        for ticker in underlying_tickers:
-            next_url = f"https://api.polygon.io/v3/reference/options/contracts?underlying_ticker={ticker}&limit=1000&apiKey={api_key}"
-            
-            # The API is paginated, so we loop until there's no `next_url`.
+        all_symbols: List[str] = []
+        for ticker in underlyings:
+            params = {"underlying_ticker": ticker, "limit": 1000, "apiKey": api_key}
+            # First page
+            resp = _rate_limited_get(POLYGON_CONTRACTS_URL, params)
+            resp.raise_for_status()
+            data = resp.json()
+            all_symbols.extend([c["ticker"] for c in (data.get("results") or []) if "ticker" in c])
+
+            # Pagination
+            next_url = data.get("next_url")
             while next_url:
-                response = requests.get(next_url)
-                response.raise_for_status()
-                data = response.json()
-                
-                # Extract the option ticker symbol from each contract.
-                symbols = [contract["ticker"] for contract in data.get("results", [])]
-                all_option_symbols.extend(symbols)
-                
+                resp = _rate_limited_get(next_url, {"apiKey": api_key})
+                resp.raise_for_status()
+                data = resp.json()
+                all_symbols.extend([c["ticker"] for c in (data.get("results") or []) if "ticker" in c])
                 next_url = data.get("next_url")
-                if next_url:
-                    next_url += f"&apiKey={api_key}"
-                time.sleep(REQUEST_DELAY_SECONDS) # Be respectful of the API rate limit.
-        
-        if not all_option_symbols:
-            raise AirflowSkipException("No option symbols found for the provided tickers.")
-        
-        print(f"Found {len(all_option_symbols)} total option contracts to process.")
-        return all_option_symbols
+                time.sleep(REQUEST_DELAY_SECONDS)
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        # De-dup and sort for determinism
+        all_symbols = sorted(set(all_symbols))
+        if not all_symbols:
+            raise AirflowSkipException("No option symbols found for the provided underlyings.")
+        return all_symbols
 
     @task
-    def batch_option_symbols(symbol_list: list[str]) -> list[list[str]]:
-        """
-        Batches the list of option symbols into smaller chunks. This allows the
-        downstream tasks to be parallelized efficiently without hitting Airflow's
-        `max_map_length` limit.
-        """
-        batch_size = 500  # Each parallel task will process 500 symbols.
-        return [symbol_list[i:i + batch_size] for i in range(0, len(symbol_list), batch_size)]
+    def batch_option_symbols(symbol_list: List[str]) -> List[List[str]]:
+        """Batch symbols for parallel processing to avoid mapping limits."""
+        return [symbol_list[i : i + SYMBOL_BATCH_SIZE] for i in range(0, len(symbol_list), SYMBOL_BATCH_SIZE)]
 
-    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
-    def process_symbol_batch_backfill(symbol_batch: list[str], **kwargs) -> list[str]:
+    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool=API_POOL)
+    def process_symbol_batch_backfill(symbol_batch: List[str]) -> List[str]:
         """
-        Fetches historical data for a BATCH of option symbols over a date range.
-        It then formats and saves one S3 file per trading day for each symbol.
+        Fetch historical aggregates for each symbol over the date range in params.
+        Write one JSON file per (symbol, trading day).
         """
-        # Retrieve the date range from the DAG's parameters.
-        start_date = kwargs["params"]["start_date"]
-        end_date = kwargs["params"]["end_date"]
-        api_key = os.getenv('POLYGON_OPTIONS_API_KEY')
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        
-        all_processed_s3_keys = []
-        # Process each option symbol within the assigned batch.
+        ctx = get_current_context()
+        start_date = ctx["params"]["start_date"]
+        end_date = ctx["params"]["end_date"]
+
+        # Validate dates
+        try:
+            sd = pendulum.parse(start_date)
+            ed = pendulum.parse(end_date)
+        except Exception:
+            raise ValueError("Invalid start_date or end_date. Expected format YYYY-MM-DD.")
+        if sd > ed:
+            raise ValueError("start_date cannot be after end_date.")
+
+        api_key = _get_polygon_api_key(API_CONN_ID, "POLYGON_OPTIONS_API_KEY")
+        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
+
+        processed_keys: List[str] = []
         for option_symbol in symbol_batch:
-            # This API endpoint fetches aggregate bars for a ticker over a date range.
-            url = f"https://api.polygon.io/v2/aggs/ticker/{option_symbol}/range/1/day/{start_date}/{end_date}?adjusted=true&sort=asc&apiKey={api_key}"
-            try:
-                response = requests.get(url)
-                response.raise_for_status()
-                data = response.json()
+            url = f"{POLYGON_AGGS_URL_BASE}/{option_symbol}/range/1/day/{start_date}/{end_date}"
+            params = {"adjusted": "true", "sort": "asc", "apiKey": api_key}
 
-                # If the API returns results, loop through each day's bar.
-                if data.get("resultsCount", 0) > 0 and data.get("results"):
-                    for result in data["results"]:
-                        trade_date = pendulum.from_timestamp(result["t"] / 1000).to_date_string()
-                        
-                        # Re-format the data to match the structure expected by the load DAG.
-                        formatted_result = {"ticker": data["ticker"], "resultsCount": 1, "results": [result]}
-                        json_string = json.dumps(formatted_result)
-                        
-                        # Create a unique S3 key for each contract and trade date.
+            try:
+                resp = _rate_limited_get(url, params)
+                if resp.status_code == 404:
+                    # No data for that range — skip quietly
+                    time.sleep(REQUEST_DELAY_SECONDS)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+
+                results = data.get("results") or []
+                if results:
+                    # Persist each trading day’s bar as a separate object (aligns with daily ingest layout)
+                    for bar in results:
+                        # bar["t"] is ms since epoch
+                        trade_date = pendulum.from_timestamp(bar["t"] / 1000).to_date_string()
+
+                        payload = {
+                            "ticker": data.get("ticker", option_symbol),
+                            "resultsCount": 1,
+                            "results": [bar],
+                        }
+                        body = json.dumps(payload)
                         s3_key = f"raw_data/options/{option_symbol}_{trade_date}.json"
-                        s3_hook.load_string(string_data=json_string, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
-                        all_processed_s3_keys.append(s3_key)
-                
-                time.sleep(REQUEST_DELAY_SECONDS) # Rate limit delay.
+                        s3.load_string(string_data=body, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
+                        processed_keys.append(s3_key)
+
+                time.sleep(REQUEST_DELAY_SECONDS)
             except requests.exceptions.HTTPError as e:
-                # Log errors but don't fail the entire batch.
-                print(f"Could not process {option_symbol}. Status: {e.response.status_code}. Skipping.")
-        
-        return all_processed_s3_keys
+                status = e.response.status_code if e.response is not None else "unknown"
+                print(f"[WARN] Could not process {option_symbol}. HTTP {status}. Skipping.")
+            except Exception as e:
+                print(f"[WARN] Unexpected error for {option_symbol}: {e}")
+
+        return processed_keys
 
     @task
-    def flatten_s3_key_list(nested_list: list[list[str]]) -> list[str]:
-        """
-        Takes the list of lists of S3 keys generated by the parallel tasks and
-        flattens it into a single list for the manifest.
-        """
-        return [key for sublist in nested_list for key in sublist if key]
+    def flatten_s3_key_list(nested_list: List[List[str]]) -> List[str]:
+        """Flatten list of lists of S3 keys into a single list."""
+        return [k for sub in (nested_list or []) for k in (sub or []) if k]
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def write_manifest_to_s3(s3_keys: list[str], **kwargs):
-        """
-        Writes the final, flat list of S3 file paths to the manifest file in S3.
-        Updating this file triggers the downstream loading DAG.
-        """
-        if not s3_keys:
+    def write_manifest_to_s3(s3_keys: List[str]):
+        """Write the final manifest to S3 to trigger downstream load DAG."""
+        keys = [k for k in (s3_keys or []) if k]
+        if not keys:
             raise AirflowSkipException("No S3 keys were processed during the options backfill.")
-        
-        manifest_content = "\n".join(s3_keys)
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/polygon_options_manifest_latest.txt"
-        
-        s3_hook.load_string(string_data=manifest_content, key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
-        print(f"Options backfill manifest file created with {len(s3_keys)} keys: {manifest_key}")
 
-    # --- Task Flow Definition ---
-    
-    # 1. Get all symbols.
+        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
+        manifest_key = "manifests/polygon_options_manifest_latest.txt"
+        s3.load_string("\n".join(keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
+        print(f"Backfill manifest created with {len(keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
+
+    # ───────────────────────────────────────────────────────────────────────────
+    # Flow
+    # ───────────────────────────────────────────────────────────────────────────
     all_symbols = get_all_option_symbols()
-    
-    # 2. Batch the symbols for parallel processing.
     symbol_batches = batch_option_symbols(all_symbols)
-    
-    # 3. Use `.expand()` to dynamically create a parallel task for each batch.
     processed_keys_nested = process_symbol_batch_backfill.expand(symbol_batch=symbol_batches)
-    
-    # 4. Flatten the results from the parallel tasks.
     s3_keys_flat = flatten_s3_key_list(processed_keys_nested)
-    
-    # 5. Write the final manifest file.
     write_manifest_to_s3(s3_keys_flat)
+
 
 polygon_options_ingest_backfill_dag()
