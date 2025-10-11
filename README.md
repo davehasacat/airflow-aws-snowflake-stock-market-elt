@@ -35,11 +35,11 @@ The ELT process is orchestrated by a series of modular and data-driven Airflow D
 
 The DAGs are fully decoupled and communicate through **Airflow Datasets**, which are URIs that represent a piece of data. This creates a more resilient, event-driven workflow.
 
-1. Ingestion DAGs (`polygon_stocks_ingest_daily`, `polygon_options_ingest_daily`, `polygon_stocks_ingest_backfill`, `polygon_options_ingest_backfill`): These DAGs fetch daily and historical stock and options data from the Polygon.io API. They dynamically create parallel tasks to ingest the data, landing the raw JSON files in an S3 bucket. Upon completion, they write a list of all created file keys to a manifest file and **produce to an S3 Dataset**.
+1. **Ingestion DAGs** (`polygon_stocks_ingest_daily`, `polygon_options_ingest_daily`, `polygon_stocks_ingest_backfill`, `polygon_options_ingest_backfill`): These DAGs fetch daily and historical stock and options data from the Polygon.io API. They dynamically create parallel tasks to ingest the data, landing the raw JSON files in an S3 bucket. Upon completion, they write a list of all created file keys to a manifest file and **produce to an S3 Dataset**.
 
-2. Loading DAGs (`polygon_stocks_load`, `polygon_options_load`): These DAGs are scheduled to run only when the S3 manifest Dataset is updated. They read the list of newly created JSON files from the manifest and, using a similar batching strategy, load the data in parallel into a raw table in the Snowflake data warehouse. This ensures that the data loading process is just as scalable as the ingestion. When the load is successful, they produce to a Snowflake Dataset.
+2. **Loading DAGs** (`polygon_stocks_load`, `polygon_options_load`): These DAGs are scheduled to run only when the S3 manifest Dataset is updated. They read the list of newly created JSON files from the manifest and, using a similar batching strategy, load the data in parallel into a raw table in the Snowflake data warehouse. This ensures that the data loading process is just as scalable as the ingestion. When the load is successful, they produce to a Snowflake Dataset.
 
-3. Transformation DAG (`dbt_build`): When a `load` DAG successfully updates a raw table, it produces the corresponding Dataset that triggers the `dbt_build` DAG. This DAG runs `dbt build` to execute all dbt models, which transforms the raw data into:
+3. **Transformation DAG** (`dbt_build`): When a `load` DAG successfully updates a raw table, it produces the corresponding Dataset that triggers the `dbt_build` DAG. This DAG runs `dbt build` to execute all dbt models, which transforms the raw data into:
 
     Clean, casted staging models (`stg_polygon__stock_bars_casted`, `stg_polygon__options_bars_casted`).
 
@@ -47,7 +47,7 @@ The DAGs are fully decoupled and communicate through **Airflow Datasets**, which
 
     A final, analytics-ready facts table (`fct_polygon__stock_bars_performance`).
 
-4. Monitoring DAG (`dbt_test`): This DAG runs `dbt test` and then parses the `run_results.json` artifact to load the results into a table in the data warehouse for monitoring via the dashboard.
+4. **Monitoring DAG** (`dbt_test`): This DAG runs `dbt test` and then parses the `run_results.json` artifact to load the results into a table in the data warehouse for monitoring via the dashboard.
 
 ## Demonstration
 
