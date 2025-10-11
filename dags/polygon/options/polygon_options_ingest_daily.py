@@ -15,6 +15,8 @@ from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
+from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Config / Constants
 # ────────────────────────────────────────────────────────────────────────────────
@@ -195,7 +197,7 @@ def polygon_options_ingest_daily_dag():
     # ───────────────────────────────
     # Manifest Writer
     # ───────────────────────────────
-    @task
+    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
     def create_manifest(s3_keys: List[Optional[str]]) -> None:
         keys = [k for k in (s3_keys or []) if k]
         if not keys:
