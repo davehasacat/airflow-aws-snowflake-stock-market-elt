@@ -11,11 +11,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 
-from airflow.datasets import Dataset
-
-# Define a Dataset. When this DAG updates the specified S3 key, it signals
-# to other DAGs that new data is available, triggering them to run.
-S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://test/manifests/polygon_options_manifest_latest.txt")
+from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
 # Define the DAG with parameters for the backfill date range.
 # This makes the DAG manually triggerable with custom start and end dates.
@@ -159,7 +155,7 @@ def polygon_options_ingest_backfill_dag():
         """
         return [key for sublist in nested_list for key in sublist if key]
 
-    @task(outlets=[S3_POLYGON_OPTIONS_MANIFEST_DATASET])
+    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
     def write_manifest_to_s3(s3_keys: list[str], **kwargs):
         """
         Writes the final, flat list of S3 file paths to the manifest file in S3.
