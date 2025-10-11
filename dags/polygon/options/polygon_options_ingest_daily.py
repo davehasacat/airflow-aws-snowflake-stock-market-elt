@@ -10,6 +10,7 @@ from typing import List, Optional
 import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
+from airflow.operators.python import get_current_context
 from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -21,18 +22,14 @@ POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 S3_PREFIX = "raw_data/options/"
 
-# Centralized defaults (best practice)
 default_args = {
     "owner": "data-platform",
     "retries": 3,
     "retry_delay": pendulum.duration(minutes=5),
 }
 
-# Optional tunables from env
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
-API_POOL_NAME = os.getenv("API_POOL_NAME", "api_pool")
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-dag (daily)")
-
 
 @dag(
     dag_id="polygon_options_ingest_daily",
@@ -42,22 +39,20 @@ USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-dag (daily
     catchup=True,
     default_args=default_args,
     dagrun_timeout=timedelta(hours=12),
-    tags=["ingestion", "polygon", "options", "historical", "aws"],
-    max_active_runs=1,  # avoid overlapping daily runs
+    tags=["ingestion", "polygon", "options", "daily", "aws"],
+    max_active_runs=1,
 )
 def polygon_options_ingest_daily_dag():
-    # Read once from env at parse time; connections are resolved inside tasks
     S3_CONN_ID = "aws_default"
     BUCKET_NAME = os.getenv("BUCKET_NAME")
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
     API_CONN_ID = "polygon_options_api"
+    API_POOL = "api_pool"  # defined in airflow_settings.yaml
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # Helper functions
+    # ───────────────────────────────
     def _get_polygon_api_key(conn_id: str, env_fallback: str) -> str:
-        """
-        Resolve the Polygon API key from an Airflow connection's 'password'.
-        Falls back to an environment variable if the connection doesn't exist.
-        """
         try:
             return BaseHook.get_connection(conn_id).password
         except Exception:
@@ -70,10 +65,6 @@ def polygon_options_ingest_daily_dag():
             return key
 
     def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
-        """
-        Robust GET with exponential backoff for 429/5xx.
-        Respects Retry-After when present. Raises for non-OK (except 404 which caller handles).
-        """
         headers = {"User-Agent": USER_AGENT}
         backoff = 1.5
         delay = 1.0
@@ -94,10 +85,11 @@ def polygon_options_ingest_daily_dag():
             else:
                 return resp
 
-    # ── Inputs ────────────────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # Input Tasks
+    # ───────────────────────────────
     @task
     def get_custom_tickers() -> List[str]:
-        """Load custom underlyings from dbt seeds (idempotent)."""
         path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers: List[str] = []
         with open(path, mode="r") as csvfile:
@@ -108,24 +100,23 @@ def polygon_options_ingest_daily_dag():
         return tickers
 
     @task
-    def compute_target_date(execution_date: str) -> str:
+    def compute_target_date() -> str:
         """
-        Use previous calendar day; if you need true trading days,
-        swap to an exchange calendar service.
+        Compute the target date using the DAG's logical_date.
+        For a daily schedule, this returns the previous calendar day.
         """
-        return pendulum.parse(execution_date).subtract(days=1).to_date_string()
+        ctx = get_current_context()
+        logical_date = ctx["logical_date"]
+        return logical_date.subtract(days=1).to_date_string()
 
-    # ── Contract Discovery ──────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # Contract Discovery
+    # ───────────────────────────────
     @task_group(group_id="discover_contracts")
     def tg_discover_contracts(custom_tickers: List[str], target_date: str):
-        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL_NAME)
+        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
         def discover_for_ticker(ticker: str, target_date: str) -> List[str]:
-            """
-            Return all contract tickers for the underlying as of target_date.
-            Uses pagination and robust retry.
-            """
             api_key = _get_polygon_api_key(API_CONN_ID, "POLYGON_OPTIONS_API_KEY")
-
             params = {
                 "underlying_ticker": ticker,
                 "expiration_date.gte": target_date,
@@ -133,20 +124,15 @@ def polygon_options_ingest_daily_dag():
                 "limit": 1000,
                 "apiKey": api_key,
             }
-
             contracts: List[str] = []
-            # First page
             resp = _rate_limited_get(POLYGON_CONTRACTS_URL, params)
             resp.raise_for_status()
             data = resp.json()
             for r in data.get("results", []) or []:
                 if "ticker" in r:
                     contracts.append(r["ticker"])
-
-            # Pagination
             next_url = data.get("next_url")
             while next_url:
-                # next_url may already include query params; we only ensure apiKey is present
                 resp = _rate_limited_get(next_url, {"apiKey": api_key})
                 resp.raise_for_status()
                 data = resp.json()
@@ -154,36 +140,32 @@ def polygon_options_ingest_daily_dag():
                     if "ticker" in r:
                         contracts.append(r["ticker"])
                 next_url = data.get("next_url")
-
-            # De-dup and sort for determinism
             return sorted(set(contracts))
 
         @task
         def flatten(nested: List[List[str]]) -> List[str]:
             return [c for sub in (nested or []) for c in (sub or [])]
 
-        discovered = discover_for_ticker.expand(
-            ticker=custom_tickers,          # list -> mapped
-            target_date=target_date,        # scalar -> broadcast
+        # IMPORTANT: use partial(...) to keep target_date as a constant (not mapped)
+        discovered = (
+            discover_for_ticker
+            .partial(target_date=target_date)
+            .expand(ticker=custom_tickers)
         )
         all_contracts = flatten(discovered)
         return all_contracts
 
-    # ── Fetch Aggregates ───────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # Fetch & Store Aggregates
+    # ───────────────────────────────
     @task_group(group_id="fetch_and_store")
     def tg_fetch_and_store(contracts: List[str], target_date: str):
-        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL_NAME)
+        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
         def fetch_contract_bars(contract_ticker: str, target_date: str) -> Optional[str]:
-            """
-            Fetch a contract's daily bar on target_date and write to S3 (idempotent).
-            Returns S3 key or None if no data.
-            """
             api_key = _get_polygon_api_key(API_CONN_ID, "POLYGON_OPTIONS_API_KEY")
             s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-
             url = f"{POLYGON_AGGS_URL_BASE}/{contract_ticker}/range/1/day/{target_date}/{target_date}"
             params = {"adjusted": "true", "apiKey": api_key}
-
             resp = _rate_limited_get(url, params)
             if resp.status_code == 404:
                 return None
@@ -192,27 +174,29 @@ def polygon_options_ingest_daily_dag():
             results = data.get("results") or []
             if not results:
                 return None
-
             payload = json.dumps(data)
             s3_key = f"{S3_PREFIX}{contract_ticker}_{target_date}.json"
             s3_hook.load_string(
                 string_data=payload,
                 key=s3_key,
                 bucket_name=BUCKET_NAME,
-                replace=True,  # idempotent overwrite
+                replace=True,
             )
             return s3_key
 
-        s3_keys = fetch_contract_bars.expand(
-            contract_ticker=contracts,   # list -> mapped
-            target_date=target_date,     # scalar -> broadcast
+        # IMPORTANT: use partial(...) to keep target_date as a constant (not mapped)
+        s3_keys = (
+            fetch_contract_bars
+            .partial(target_date=target_date)
+            .expand(contract_ticker=contracts)
         )
         return s3_keys
 
-    # ── Manifest ───────────────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # Manifest Writer
+    # ───────────────────────────────
     @task
     def create_manifest(s3_keys: List[Optional[str]]) -> None:
-        """Collect keys, write manifest; skip if none."""
         keys = [k for k in (s3_keys or []) if k]
         if not keys:
             raise AirflowSkipException("No new files created; skipping manifest.")
@@ -224,11 +208,13 @@ def polygon_options_ingest_daily_dag():
             bucket_name=BUCKET_NAME,
             replace=True,
         )
+        print(f"✅ Manifest created with {len(keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
-    # ── Wiring ─────────────────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # DAG Wiring
+    # ───────────────────────────────
     custom_tickers = get_custom_tickers()
-    target_date = compute_target_date("{{ ds }}")
-
+    target_date = compute_target_date()
     all_contracts = tg_discover_contracts(custom_tickers, target_date)
     s3_keys = tg_fetch_and_store(all_contracts, target_date)
     create_manifest(s3_keys)
