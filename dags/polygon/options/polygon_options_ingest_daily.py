@@ -38,78 +38,65 @@ def polygon_options_ingest_daily_dag():
                 tickers.append(row["ticker"])
         return tickers
 
-    @task(pool="api_pool")
-    def fetch_and_save_options_data(ticker: str, trade_date: str) -> list[str]:
+    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
+    def get_grouped_daily_data_and_split(custom_tickers: list[str], **kwargs) -> list[str]:
         """
-        For a single underlying ticker, fetches all relevant option contracts
-        and saves their daily aggregate data for a specific trade date to S3.
+        Fetches all daily options data for a single date using the grouped bars endpoint
+        and saves the data for each relevant ticker to a separate file in S3.
         """
+        execution_date = kwargs["ds"]
+        target_date = pendulum.parse(execution_date).subtract(days=1).to_date_string()
+        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
         conn = BaseHook.get_connection('polygon_options_api')
         api_key = conn.password
-        if not api_key:
-            raise ValueError("Polygon API key not found in connection 'polygon_options_api'.")
-
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        saved_keys = []
         
-        contracts_url = (
-            f"https://api.polygon.io/v3/reference/options/contracts"
-            f"?underlying_ticker={ticker}"
-            f"&expiration_date.gte={trade_date}"
-            f"&limit=1000&apiKey={api_key}"
-        )
+        custom_tickers_set = set(custom_tickers)
+
+        # Use the more efficient grouped daily bars endpoint for options
+        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/options/{target_date}?adjusted=true&apiKey={api_key}"
         
-        while contracts_url:
-            try:
-                response = requests.get(contracts_url)
-                response.raise_for_status()
-                data = response.json()
-                
-                contracts = data.get("results", [])
-                
-                for contract in contracts:
-                    options_ticker = contract["ticker"]
-                    
-                    bar_url = (
-                        f"https://api.polygon.io/v2/aggs/ticker/{options_ticker}/range/1/day/{trade_date}/{trade_date}"
-                        f"?apiKey={api_key}"
-                    )
-                    bar_response = requests.get(bar_url)
-                    bar_response.raise_for_status()
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"No data found for {target_date} (likely a holiday). Skipping.")
+                return []
+            raise e
 
-                    bar_data = bar_response.json()
-                    if bar_data.get("resultsCount") > 0:
-                        s3_key = f"raw_data/options/{options_ticker}_{trade_date}.json"
-                        s3_hook.load_string(
-                            string_data=json.dumps(bar_data),
-                            key=s3_key,
-                            bucket_name=BUCKET_NAME,
-                            replace=True,
-                        )
-                        saved_keys.append(s3_key)
+        processed_s3_keys = []
+        if data.get('resultsCount', 0) > 0 and data.get('results'):
+            for result in data['results']:
+                # The options ticker format is O:TICKERYYMMDD[C/P]STRIKE
+                # We can extract the underlying ticker from the options ticker
+                options_ticker = result.get("T")
+                underlying_ticker = options_ticker.split(":")[1][:6].rstrip('0123456789')
 
-                contracts_url = data.get("next_url")
-                if contracts_url:
-                    contracts_url += f"&apiKey={api_key}"
+                if underlying_ticker in custom_tickers_set:
+                    formatted_result = {
+                        "ticker": options_ticker, "queryCount": 1, "resultsCount": 1, "adjusted": True,
+                        "results": [{"v": result.get("v"), "vw": result.get("vw"), "o": result.get("o"),
+                                     "c": result.get("c"), "h": result.get("h"), "l": result.get("l"),
+                                     "t": result.get("t"), "n": result.get("n")}],
+                        "status": "OK", "request_id": data.get("request_id")
+                    }
+                    json_string = json.dumps(formatted_result)
+                    s3_key = f"raw_data/options/{options_ticker}_{target_date}.json"
+                    s3_hook.load_string(string_data=json_string, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
+                    processed_s3_keys.append(s3_key)
 
-            except requests.exceptions.RequestException as e:
-                print(f"Failed to fetch data for ticker {ticker}: {e}")
-                break
-
-        print(f"Saved {len(saved_keys)} option contract files for ticker {ticker}.")
-        return saved_keys
+        return processed_s3_keys
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def create_manifest(s3_keys_per_ticker: list):
+    def create_manifest(s3_keys: list[str]):
         """
         Flattens the list of S3 keys and writes them to the manifest file in S3.
         """
-        flat_list = [key for sublist in s3_keys_per_ticker for key in sublist if key]
-        
-        if not flat_list:
+        if not s3_keys:
             raise AirflowSkipException("No new files were created; skipping manifest generation.")
         
-        manifest_content = "\n".join(flat_list)
+        manifest_content = "\n".join(s3_keys)
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
         manifest_key = "manifests/polygon_options_manifest_latest.txt"
 
@@ -119,12 +106,10 @@ def polygon_options_ingest_daily_dag():
             bucket_name=BUCKET_NAME,
             replace=True,
         )
-        print(f"Manifest created with {len(flat_list)} keys at s3://{BUCKET_NAME}/{manifest_key}")
+        print(f"Manifest created with {len(s3_keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
-    trade_date_str = "{{ ds }}"
-    
-    tickers_list = get_custom_tickers()
-    s3_keys_list = fetch_and_save_options_data.partial(trade_date=trade_date_str).expand(ticker=tickers_list)
-    create_manifest(s3_keys_list)
+    custom_tickers = get_custom_tickers()
+    s3_keys = get_grouped_daily_data_and_split(custom_tickers)
+    create_manifest(s3_keys)
 
 polygon_options_ingest_daily_dag()
