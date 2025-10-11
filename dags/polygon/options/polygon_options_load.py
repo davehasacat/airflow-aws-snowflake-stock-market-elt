@@ -126,7 +126,7 @@ def polygon_options_load_dag():
 
             copy_sql = f"""
             COPY INTO {FULLY_QUALIFIED_STAGE_TABLE} (rec)
-            FROM @{{{SNOWFLAKE_STAGE}}}
+            FROM @{SNOWFLAKE_STAGE}
             FILES = ({files_clause})
             FILE_FORMAT = (TYPE = 'JSON');
             """
@@ -189,8 +189,7 @@ def polygon_options_load_dag():
 
         hook.run(insert_sql)
 
-        # Return how many rows were inserted (approximate using: last query rowcount)
-        # If the provider doesn't expose rowcount reliably, you can select count(*) after.
+        # Optionally return how many staging rows we processed
         cnt = hook.get_first(f"SELECT COUNT(*) FROM {FULLY_QUALIFIED_STAGE_TABLE}")[0] or 0
         return int(cnt)
 
