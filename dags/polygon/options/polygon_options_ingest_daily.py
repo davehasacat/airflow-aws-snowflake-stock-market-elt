@@ -28,9 +28,12 @@ default_args = {
     "retry_delay": pendulum.duration(minutes=5),
 }
 
-# ────────────────────────────────────────────────────────────────────────────────
-# DAG
-# ────────────────────────────────────────────────────────────────────────────────
+# Optional tunables from env
+REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
+API_POOL_NAME = os.getenv("API_POOL_NAME", "api_pool")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-dag (daily)")
+
+
 @dag(
     dag_id="polygon_options_ingest_daily",
     description="Discover option contracts by underlying, fetch daily aggregates per contract, write to S3, and build a manifest.",
@@ -40,26 +43,43 @@ default_args = {
     default_args=default_args,
     dagrun_timeout=timedelta(hours=12),
     tags=["ingestion", "polygon", "options", "historical", "aws"],
-    max_active_runs=1,   # keep backfills tidy; adjust if needed
+    max_active_runs=1,  # avoid overlapping daily runs
 )
 def polygon_options_ingest_daily_dag():
-    # Read once from env at parse time (safe); connections are fetched inside tasks (best practice)
+    # Read once from env at parse time; connections are resolved inside tasks
     S3_CONN_ID = "aws_default"
     BUCKET_NAME = os.getenv("BUCKET_NAME")
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
     API_CONN_ID = "polygon_options_api"
 
-    # ── Utilities ────────────────────────────────────────────────────────────────
-    def _rate_limited_get(url: str, params: dict, max_tries: int = 6) -> requests.Response:
+    # ── Helpers ────────────────────────────────────────────────────────────────
+    def _get_polygon_api_key(conn_id: str, env_fallback: str) -> str:
+        """
+        Resolve the Polygon API key from an Airflow connection's 'password'.
+        Falls back to an environment variable if the connection doesn't exist.
+        """
+        try:
+            return BaseHook.get_connection(conn_id).password
+        except Exception:
+            key = os.getenv(env_fallback)
+            if not key:
+                raise RuntimeError(
+                    f"Polygon API key not found. Define Airflow connection '{conn_id}' "
+                    f"or set env var {env_fallback}"
+                )
+            return key
+
+    def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
         """
         Robust GET with exponential backoff for 429/5xx.
         Respects Retry-After when present. Raises for non-OK (except 404 which caller handles).
         """
+        headers = {"User-Agent": USER_AGENT}
         backoff = 1.5
         delay = 1.0
         tries = 0
         while True:
-            resp = requests.get(url, params=params, timeout=60)
+            resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SECS)
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 sleep_s = float(retry_after) if retry_after else delay
@@ -74,7 +94,7 @@ def polygon_options_ingest_daily_dag():
             else:
                 return resp
 
-    # ── Inputs ─────────────────────────────────────────────────────────────────
+    # ── Inputs ────────────────────────────────────────────────────────────────
     @task
     def get_custom_tickers() -> List[str]:
         """Load custom underlyings from dbt seeds (idempotent)."""
@@ -98,13 +118,14 @@ def polygon_options_ingest_daily_dag():
     # ── Contract Discovery ──────────────────────────────────────────────────────
     @task_group(group_id="discover_contracts")
     def tg_discover_contracts(custom_tickers: List[str], target_date: str):
-        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool="api_pool")
+        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL_NAME)
         def discover_for_ticker(ticker: str, target_date: str) -> List[str]:
             """
             Return all contract tickers for the underlying as of target_date.
             Uses pagination and robust retry.
             """
-            api_key = BaseHook.get_connection(API_CONN_ID).password
+            api_key = _get_polygon_api_key(API_CONN_ID, "POLYGON_OPTIONS_API_KEY")
+
             params = {
                 "underlying_ticker": ticker,
                 "expiration_date.gte": target_date,
@@ -125,7 +146,7 @@ def polygon_options_ingest_daily_dag():
             # Pagination
             next_url = data.get("next_url")
             while next_url:
-                # next_url already includes query; just append apiKey
+                # next_url may already include query params; we only ensure apiKey is present
                 resp = _rate_limited_get(next_url, {"apiKey": api_key})
                 resp.raise_for_status()
                 data = resp.json()
@@ -134,7 +155,7 @@ def polygon_options_ingest_daily_dag():
                         contracts.append(r["ticker"])
                 next_url = data.get("next_url")
 
-            # De-dup just in case
+            # De-dup and sort for determinism
             return sorted(set(contracts))
 
         @task
@@ -151,13 +172,13 @@ def polygon_options_ingest_daily_dag():
     # ── Fetch Aggregates ───────────────────────────────────────────────────────
     @task_group(group_id="fetch_and_store")
     def tg_fetch_and_store(contracts: List[str], target_date: str):
-        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool="api_pool")
+        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL_NAME)
         def fetch_contract_bars(contract_ticker: str, target_date: str) -> Optional[str]:
             """
             Fetch a contract's daily bar on target_date and write to S3 (idempotent).
             Returns S3 key or None if no data.
             """
-            api_key = BaseHook.get_connection(API_CONN_ID).password
+            api_key = _get_polygon_api_key(API_CONN_ID, "POLYGON_OPTIONS_API_KEY")
             s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
 
             url = f"{POLYGON_AGGS_URL_BASE}/{contract_ticker}/range/1/day/{target_date}/{target_date}"
