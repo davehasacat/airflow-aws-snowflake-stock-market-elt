@@ -42,12 +42,16 @@ def polygon_options_ingest_daily_dag():
         print(f"Retrieved {len(tickers)} tickers from the 'custom_tickers' seed.")
         return tickers
 
-    @task(pool="api_pool")
-    def fetch_and_save_options_data(ticker: str, trade_date: str) -> list[str]:
+    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
+    def fetch_and_save_options_data(ticker: str, **kwargs) -> list[str]:
         """
         For a single underlying ticker, fetches all relevant option contracts
         and saves their daily aggregate data for a specific trade date to S3.
         """
+        # Correctly calculate the target date for the data pull
+        execution_date = kwargs["ds"]
+        trade_date = pendulum.parse(execution_date).subtract(days=1).to_date_string()
+
         conn = BaseHook.get_connection('polygon_options_api')
         api_key = conn.password
         if not api_key:
@@ -94,8 +98,15 @@ def polygon_options_ingest_daily_dag():
                 if contracts_url:
                     contracts_url += f"&apiKey={api_key}"
 
+            except requests.exceptions.HTTPError as e:
+                # Add more specific error handling, similar to the stocks DAG
+                if e.response.status_code == 404:
+                    print(f"No contract data found for ticker {ticker} on {trade_date}. Skipping.")
+                    break
+                print(f"HTTP Error for ticker {ticker}: {e}. Skipping this ticker.")
+                break # Exit loop for this ticker if a persistent API error occurs
             except requests.exceptions.RequestException as e:
-                print(f"Failed to fetch data for ticker {ticker}: {e}")
+                print(f"Network error while fetching data for {ticker}: {e}. Skipping this ticker.")
                 break
 
         print(f"Saved {len(saved_keys)} option contract files for ticker {ticker}.")
@@ -120,9 +131,8 @@ def polygon_options_ingest_daily_dag():
         )
         print(f"Manifest created with {len(flat_list)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
-    trade_date_str = "{{ ds }}"
     tickers_list = get_tickers_from_seed()
-    s3_keys_list = fetch_and_save_options_data.partial(trade_date=trade_date_str).expand(ticker=tickers_list)
+    s3_keys_list = fetch_and_save_options_data.expand(ticker=tickers_list)
     create_manifest(s3_keys_list)
 
 polygon_options_ingest_daily_dag()
