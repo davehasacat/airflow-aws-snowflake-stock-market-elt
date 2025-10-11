@@ -99,10 +99,8 @@ def polygon_options_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
-        # NOTE:
-        # We CAST the ticker to VARCHAR once (sym) and then regexp against that text.
-        # Patterns are anchored, using explicit capture groups.
-        # Example symbol: O:MSFT261218P00430000
+        # COPY with transformation: specify FILE_FORMAT on the stage reference,
+        # and project METADATA$FILENAME as 'filename' in the inner SELECT.
         base_copy_sql = f"""
         COPY INTO {FULLY_QUALIFIED_TABLE_NAME} (
             option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
@@ -110,8 +108,8 @@ def polygon_options_load_dag():
         )
         FROM (
             SELECT
-                sym                                                                 AS option_symbol,
-                TO_DATE(REGEXP_SUBSTR(METADATA$FILENAME, '([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})')) AS trade_date,
+                sym                                                                  AS option_symbol,
+                TO_DATE(REGEXP_SUBSTR(filename, '([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})')) AS trade_date,
 
                 /* UNDERLYING: capture group 1 immediately after 'O:' */
                 REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)        AS underlying_ticker,
@@ -142,11 +140,11 @@ def polygon_options_load_dag():
             FROM (
                 SELECT
                     $1 AS rec,
-                    TO_VARCHAR($1:ticker) AS sym
-                FROM @{SNOWFLAKE_STAGE}
+                    TO_VARCHAR($1:ticker) AS sym,
+                    METADATA$FILENAME AS filename
+                FROM @{SNOWFLAKE_STAGE} (FILE_FORMAT => (TYPE => 'JSON'))
             )
         )
-        FILE_FORMAT = (TYPE = 'JSON')
         """
 
         # Chunk the FILES list so statements stay reasonable in size
