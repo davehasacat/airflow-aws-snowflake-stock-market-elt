@@ -26,7 +26,7 @@ SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA")
 SNOWFLAKE_TABLE = os.getenv("SNOWFLAKE_OPTIONS_TABLE", "source_polygon_options_bars_daily")
 FULLY_QUALIFIED_TABLE_NAME = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}"
 
-# Use fully-qualified stage created in your guide
+# Use fully-qualified stage created in your setup guide
 SNOWFLAKE_STAGE = os.getenv("SNOWFLAKE_STAGE", "STOCKS_ELT_DB.PUBLIC.s3_stage")
 
 # Batch size for FILES=() COPY (avoid overly-long SQL statements)
@@ -99,8 +99,10 @@ def polygon_options_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
-        # Build the SELECT that maps Polygon JSON to columns.
-        # Note: FILES=() will restrict the stage scan to the batch we pass.
+        # NOTE:
+        # We CAST the ticker to VARCHAR once (sym) and then regexp against that text.
+        # Patterns are anchored, using explicit capture groups.
+        # Example symbol: O:MSFT261218P00430000
         base_copy_sql = f"""
         COPY INTO {FULLY_QUALIFIED_TABLE_NAME} (
             option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
@@ -108,20 +110,41 @@ def polygon_options_load_dag():
         )
         FROM (
             SELECT
-                $1:ticker::TEXT                                                     AS option_symbol,
+                sym                                                                 AS option_symbol,
                 TO_DATE(REGEXP_SUBSTR(METADATA$FILENAME, '([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})')) AS trade_date,
-                REGEXP_SUBSTR($1:ticker, '^O:([A-Z\\.]+)', 1, 1, 'e', 1)            AS underlying_ticker,
-                TO_DATE(REGEXP_SUBSTR($1:ticker, '(\\d{{6}})', 1, 1, 'e'), 'YYMMDD') AS expiration_date,
-                (REGEXP_SUBSTR($1:ticker, '(\\d{{8}}$)', 1, 1, 'e'))::NUMBER / 1000  AS strike_price,
-                IFF(REGEXP_SUBSTR($1:ticker, '([CP])', 1, 1, 'e') = 'C', 'call', 'put') AS option_type,
-                $1:results[0]:o::FLOAT AS open,
-                $1:results[0]:h::FLOAT AS high,
-                $1:results[0]:l::FLOAT AS low,
-                $1:results[0]:c::FLOAT AS close,
-                $1:results[0]:v::BIGINT AS volume,
-                $1:results[0]:vw::FLOAT AS vwap,
-                $1:results[0]:n::BIGINT AS transactions
-            FROM @{SNOWFLAKE_STAGE}
+
+                /* UNDERLYING: capture group 1 immediately after 'O:' */
+                REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)        AS underlying_ticker,
+
+                /* EXPIRATION: YYMMDD right after underlying */
+                TO_DATE(
+                  REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1),
+                  'YYMMDD'
+                )                                                                               AS expiration_date,
+
+                /* STRIKE: last 8 digits, then /1000 */
+                TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000            AS strike_price,
+
+                /* TYPE: single C/P right after expiration */
+                IFF(
+                  REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C',
+                  'call',
+                  'put'
+                )                                                                               AS option_type,
+
+                rec:results[0]:o::FLOAT AS open,
+                rec:results[0]:h::FLOAT AS high,
+                rec:results[0]:l::FLOAT AS low,
+                rec:results[0]:c::FLOAT AS close,
+                rec:results[0]:v::BIGINT AS volume,
+                rec:results[0]:vw::FLOAT AS vwap,
+                rec:results[0]:n::BIGINT AS transactions
+            FROM (
+                SELECT
+                    $1 AS rec,
+                    TO_VARCHAR($1:ticker) AS sym
+                FROM @{SNOWFLAKE_STAGE}
+            )
         )
         FILE_FORMAT = (TYPE = 'JSON')
         """
@@ -137,7 +160,7 @@ def polygon_options_load_dag():
             hook.run(copy_sql)
             loaded += len(batch)
 
-        print(f"Successfully loaded {loaded} files into {FULLY_QUALIFIED_TABLE_NAME}.")
+        print(f"✅ Successfully loaded {loaded} files into {FULLY_QUALIFIED_TABLE_NAME}.")
 
     table_created = create_snowflake_table()
     s3_keys = get_s3_keys_from_manifest()
