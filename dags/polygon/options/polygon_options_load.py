@@ -29,6 +29,10 @@ FULLY_QUALIFIED_TABLE_NAME = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAK
 # Use fully-qualified stage created in your setup guide
 SNOWFLAKE_STAGE = os.getenv("SNOWFLAKE_STAGE", "STOCKS_ELT_DB.PUBLIC.s3_stage")
 
+# Raw staging table (variant)
+SNOWFLAKE_STAGE_TABLE = os.getenv("SNOWFLAKE_OPTIONS_STAGE_TABLE", "stg_polygon_options_raw")
+FULLY_QUALIFIED_STAGE_TABLE = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_STAGE_TABLE}"
+
 # Batch size for FILES=() COPY (avoid overly-long SQL statements)
 COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
 
@@ -43,14 +47,18 @@ COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
 )
 def polygon_options_load_dag():
     """
-    Loads raw JSON options data from S3 (written by ingest DAG) into Snowflake using COPY INTO.
-    Triggered by the options manifest dataset.
+    Loads raw JSON options data from S3 (written by ingest DAG) into Snowflake:
+      1) COPY raw JSON into a VARIANT staging table (no transformation in COPY)
+      2) INSERT-SELECT parse into target table
+      3) TRUNCATE the staging table
     """
 
     @task
-    def create_snowflake_table():
-        """Creates the target options table in Snowflake if it doesn't exist."""
-        ddl = f"""
+    def create_tables():
+        """Create the target and staging tables if they don't exist."""
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+
+        ddl_target = f"""
         CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_TABLE_NAME} (
             option_symbol TEXT,
             trade_date DATE,
@@ -68,7 +76,15 @@ def polygon_options_load_dag():
             inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
         );
         """
-        SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID).run(ddl)
+
+        ddl_stage = f"""
+        CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_STAGE_TABLE} (
+            rec VARIANT
+        );
+        """
+
+        hook.run(ddl_target)
+        hook.run(ddl_stage)
 
     @task
     def get_s3_keys_from_manifest() -> List[str]:
@@ -88,83 +104,110 @@ def polygon_options_load_dag():
 
         return s3_keys
 
-    @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
-    def load_data_to_snowflake(s3_keys: List[str]):
+    @task
+    def copy_raw_into_staging(s3_keys: List[str]) -> int:
         """
-        COPY INTO the target table from the Snowflake stage, limiting FILES per statement for stability.
-        Assumes the stage points at the root of the bucket used by the ingest DAG.
+        COPY raw JSON into the VARIANT staging table.
+        We avoid COPY transformations entirely here (no SELECT), which is robust.
         """
         if not s3_keys:
             raise AirflowSkipException("No S3 keys provided to loader.")
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
-        # COPY with transformation: specify FILE_FORMAT on the stage reference,
-        # and project METADATA$FILENAME as 'filename' in the inner SELECT.
-        base_copy_sql = f"""
-        COPY INTO {FULLY_QUALIFIED_TABLE_NAME} (
-            option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
-            open, high, low, close, volume, vwap, transactions
-        )
-        FROM (
-            SELECT
-                sym                                                                  AS option_symbol,
-                TO_DATE(REGEXP_SUBSTR(filename, '([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})')) AS trade_date,
+        # Ensure staging table is empty for this run (optional but clean)
+        hook.run(f"TRUNCATE TABLE {FULLY_QUALIFIED_STAGE_TABLE};")
 
-                /* UNDERLYING: capture group 1 immediately after 'O:' */
-                REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)        AS underlying_ticker,
-
-                /* EXPIRATION: YYMMDD right after underlying */
-                TO_DATE(
-                  REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1),
-                  'YYMMDD'
-                )                                                                               AS expiration_date,
-
-                /* STRIKE: last 8 digits, then /1000 */
-                TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000            AS strike_price,
-
-                /* TYPE: single C/P right after expiration */
-                IFF(
-                  REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C',
-                  'call',
-                  'put'
-                )                                                                               AS option_type,
-
-                rec:results[0]:o::FLOAT AS open,
-                rec:results[0]:h::FLOAT AS high,
-                rec:results[0]:l::FLOAT AS low,
-                rec:results[0]:c::FLOAT AS close,
-                rec:results[0]:v::BIGINT AS volume,
-                rec:results[0]:vw::FLOAT AS vwap,
-                rec:results[0]:n::BIGINT AS transactions
-            FROM (
-                SELECT
-                    $1 AS rec,
-                    TO_VARCHAR($1:ticker) AS sym,
-                    METADATA$FILENAME AS filename
-                FROM @{SNOWFLAKE_STAGE} (FILE_FORMAT => (TYPE => 'JSON'))
-            )
-        )
-        """
-
-        # Chunk the FILES list so statements stay reasonable in size
         total = len(s3_keys)
         loaded = 0
         for i in range(0, total, COPY_BATCH_SIZE):
             batch = s3_keys[i : i + COPY_BATCH_SIZE]
             files_clause = ", ".join(f"'{k}'" for k in batch)
 
-            copy_sql = base_copy_sql + f"\nFILES = ({files_clause});"
+            copy_sql = f"""
+            COPY INTO {FULLY_QUALIFIED_STAGE_TABLE} (rec)
+            FROM @{{{SNOWFLAKE_STAGE}}}
+            FILES = ({files_clause})
+            FILE_FORMAT = (TYPE = 'JSON');
+            """
             hook.run(copy_sql)
             loaded += len(batch)
 
-        print(f"✅ Successfully loaded {loaded} files into {FULLY_QUALIFIED_TABLE_NAME}.")
+        return loaded
 
-    table_created = create_snowflake_table()
+    @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
+    def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
+        """
+        Parse from staging and insert into the target table.
+        - trade_date is derived from rec:results[0]:t (ms epoch)
+        - underlying/expiration/type/strike parsed from the symbol text
+        """
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+
+        insert_sql = f"""
+        INSERT INTO {FULLY_QUALIFIED_TABLE_NAME} (
+            option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
+            open, high, low, close, volume, vwap, transactions
+        )
+        SELECT
+            sym                                                                 AS option_symbol,
+            TO_DATE(TO_TIMESTAMP_NTZ(TRY_TO_NUMBER(rec:results[0]:t)::NUMBER / 1000))  AS trade_date,
+
+            /* UNDERLYING immediately after 'O:' */
+            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)        AS underlying_ticker,
+
+            /* EXPIRATION: YYMMDD right after underlying */
+            TO_DATE(
+              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1),
+              'YYMMDD'
+            )                                                                               AS expiration_date,
+
+            /* STRIKE: last 8 digits, then /1000 */
+            TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000            AS strike_price,
+
+            /* TYPE: single C/P right after expiration */
+            IFF(
+              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C',
+              'call',
+              'put'
+            )                                                                               AS option_type,
+
+            rec:results[0]:o::FLOAT AS open,
+            rec:results[0]:h::FLOAT AS high,
+            rec:results[0]:l::FLOAT AS low,
+            rec:results[0]:c::FLOAT AS close,
+            rec:results[0]:v::BIGINT AS volume,
+            rec:results[0]:vw::FLOAT AS vwap,
+            rec:results[0]:n::BIGINT AS transactions
+        FROM (
+            SELECT
+                rec,
+                TO_VARCHAR(rec:ticker) AS sym
+            FROM {FULLY_QUALIFIED_STAGE_TABLE}
+        );
+        """
+
+        hook.run(insert_sql)
+
+        # Return how many rows were inserted (approximate using: last query rowcount)
+        # If the provider doesn't expose rowcount reliably, you can select count(*) after.
+        cnt = hook.get_first(f"SELECT COUNT(*) FROM {FULLY_QUALIFIED_STAGE_TABLE}")[0] or 0
+        return int(cnt)
+
+    @task
+    def cleanup_staging(_inserted: int) -> None:
+        """Truncate staging to keep it clean between runs."""
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        hook.run(f"TRUNCATE TABLE {FULLY_QUALIFIED_STAGE_TABLE};")
+
+    # ───────────────────────────────────────────────────────────────────────────
+    # Flow
+    # ───────────────────────────────────────────────────────────────────────────
+    _ = create_tables()
     s3_keys = get_s3_keys_from_manifest()
-    load_op = load_data_to_snowflake(s3_keys)
-
-    table_created >> load_op
+    rows_to_stage = copy_raw_into_staging(s3_keys)
+    inserted = insert_from_staging_to_target(rows_to_stage)
+    cleanup_staging(inserted)
 
 
 polygon_options_load_dag()
