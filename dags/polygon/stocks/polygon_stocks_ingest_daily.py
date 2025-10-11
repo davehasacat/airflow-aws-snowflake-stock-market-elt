@@ -9,7 +9,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
 from airflow.exceptions import AirflowSkipException
 
-from dags.utils.polygon_datasets import S3_MANIFEST_DATASET
+from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
 @dag(
     dag_id="polygon_stocks_ingest_daily",
@@ -74,7 +74,7 @@ def polygon_stocks_ingest_daily_dag():
 
         return processed_s3_keys
 
-    @task(outlets=[S3_MANIFEST_DATASET])
+    @task(outlets=[S3_STOCKS_MANIFEST_DATASET])
     def write_manifest_to_s3(s3_keys: list[str], **kwargs):
         if not s3_keys:
             raise AirflowSkipException("No S3 keys were processed.")

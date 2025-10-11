@@ -10,7 +10,7 @@ from airflow.hooks.base import BaseHook
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 
-from dags.utils.polygon_datasets import S3_MANIFEST_DATASET
+from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
 @dag(
     dag_id="polygon_stocks_ingest_backfill",
@@ -119,7 +119,7 @@ def polygon_stocks_ingest_backfill_dag():
         """
         return [key for sublist in nested_list for key in sublist if key]
 
-    @task(outlets=[S3_MANIFEST_DATASET])
+    @task(outlets=[S3_STOCKS_MANIFEST_DATASET])
     def write_manifest_to_s3(s3_keys: list[str]):
         """
         Writes the list of all created S3 keys to a manifest file.
