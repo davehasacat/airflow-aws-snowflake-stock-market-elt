@@ -9,15 +9,17 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
 from airflow.exceptions import AirflowSkipException
-
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
+
+POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
+POLYGON_AGGS_URL = "https://api.polygon.io/v2/aggs/ticker"
 
 @dag(
     dag_id="polygon_options_ingest_daily",
     start_date=pendulum.now(tz="UTC"),
     schedule="0 0 * * 1-5",
     catchup=True,
-    tags=["ingestion", "polygon", "options", "daily", "aws"],
+    tags=["ingestion", "polygon", "options", "historical", "aws"],
     dagrun_timeout=timedelta(hours=12),
 )
 def polygon_options_ingest_daily_dag():
@@ -27,89 +29,125 @@ def polygon_options_ingest_daily_dag():
 
     @task
     def get_custom_tickers() -> list[str]:
-        """
-        Retrieves a list of stock tickers from the `custom_tickers` seed table.
-        """
-        custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
+        """Read custom tickers from dbt seeds."""
+        path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers = []
-        with open(custom_tickers_path, mode='r') as csvfile:
+        with open(path, mode="r") as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 tickers.append(row["ticker"])
         return tickers
 
-    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
-    def get_grouped_daily_data_and_split(custom_tickers: list[str], **kwargs) -> list[str]:
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool="api_pool")
+    def discover_contracts_for_date(ticker: str, target_date: str) -> list[str]:
         """
-        Fetches all daily options data for a single date using the grouped bars endpoint
-        and saves the data for each relevant ticker to a separate file in S3.
+        Uses Polygon's /v3/reference/options/contracts to list all contracts
+        for a given underlying and expiration >= target_date.
         """
-        execution_date = kwargs["ds"]
-        target_date = pendulum.parse(execution_date).subtract(days=1).to_date_string()
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        conn = BaseHook.get_connection('polygon_options_api')
+        conn = BaseHook.get_connection("polygon_options_api")
         api_key = conn.password
-        
-        custom_tickers_set = set(custom_tickers)
 
-        # Use the more efficient grouped daily bars endpoint for options
-        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/options/{target_date}?adjusted=true&apiKey={api_key}"
-        
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                print(f"No data found for {target_date} (likely a holiday). Skipping.")
-                return []
-            raise e
+        params = {
+            "underlying_ticker": ticker,
+            "expiration_date.gte": target_date,
+            "as_of": target_date,
+            "limit": 1000,
+            "apiKey": api_key,
+        }
 
-        processed_s3_keys = []
-        if data.get('resultsCount', 0) > 0 and data.get('results'):
-            for result in data['results']:
-                # The options ticker format is O:TICKERYYMMDD[C/P]STRIKE
-                # We can extract the underlying ticker from the options ticker
-                options_ticker = result.get("T")
-                underlying_ticker = options_ticker.split(":")[1][:6].rstrip('0123456789')
+        contracts = []
+        while True:
+            resp = requests.get(POLYGON_CONTRACTS_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
-                if underlying_ticker in custom_tickers_set:
-                    formatted_result = {
-                        "ticker": options_ticker, "queryCount": 1, "resultsCount": 1, "adjusted": True,
-                        "results": [{"v": result.get("v"), "vw": result.get("vw"), "o": result.get("o"),
-                                     "c": result.get("c"), "h": result.get("h"), "l": result.get("l"),
-                                     "t": result.get("t"), "n": result.get("n")}],
-                        "status": "OK", "request_id": data.get("request_id")
-                    }
-                    json_string = json.dumps(formatted_result)
-                    s3_key = f"raw_data/options/{options_ticker}_{target_date}.json"
-                    s3_hook.load_string(string_data=json_string, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
-                    processed_s3_keys.append(s3_key)
+            for result in data.get("results", []):
+                contracts.append(result["ticker"])
 
-        return processed_s3_keys
+            # pagination
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            resp = requests.get(f"{next_url}&apiKey={api_key}")
+            data = resp.json()
+
+        return contracts
+
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool="api_pool")
+    def fetch_contract_bars(contract_ticker: str, target_date: str) -> str | None:
+        """
+        Fetch daily custom bars for a single options contract and store in S3.
+        """
+        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+        conn = BaseHook.get_connection("polygon_options_api")
+        api_key = conn.password
+
+        url = f"{POLYGON_AGGS_URL}/{contract_ticker}/range/1/day/{target_date}/{target_date}"
+        params = {"adjusted": "true", "apiKey": api_key}
+
+        resp = requests.get(url, params=params)
+        if resp.status_code == 404:
+            # no data for this contract on that day
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get("results"):
+            return None
+
+        json_string = json.dumps(data)
+        s3_key = f"raw_data/options/{contract_ticker}_{target_date}.json"
+        s3_hook.load_string(
+            string_data=json_string,
+            key=s3_key,
+            bucket_name=BUCKET_NAME,
+            replace=True,
+        )
+        return s3_key
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
     def create_manifest(s3_keys: list[str]):
-        """
-        Flattens the list of S3 keys and writes them to the manifest file in S3.
-        """
-        if not s3_keys:
-            raise AirflowSkipException("No new files were created; skipping manifest generation.")
-        
-        manifest_content = "\n".join(s3_keys)
+        """Write manifest of ingested contract data."""
+        keys = [k for k in s3_keys if k]
+        if not keys:
+            raise AirflowSkipException("No new files created; skipping manifest.")
+        manifest_content = "\n".join(keys)
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
         manifest_key = "manifests/polygon_options_manifest_latest.txt"
-
         s3_hook.load_string(
             string_data=manifest_content,
             key=manifest_key,
             bucket_name=BUCKET_NAME,
             replace=True,
         )
-        print(f"Manifest created with {len(s3_keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
+        print(f"✅ Manifest created with {len(keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
+    # ─── DAG FLOW ────────────────────────────────────────────────
     custom_tickers = get_custom_tickers()
-    s3_keys = get_grouped_daily_data_and_split(custom_tickers)
+
+    # Use Airflow Task Mapping to discover contracts for each ticker
+    @task
+    def get_target_date(execution_date: str) -> str:
+        return pendulum.parse(execution_date).subtract(days=1).to_date_string()
+
+    target_date = get_target_date("{{ ds }}")
+    contracts_per_ticker = discover_contracts_for_date.expand(
+        ticker=custom_tickers,
+        target_date=[target_date] * len(custom_tickers),
+    )
+
+    # Flatten the list of lists into a single list
+    @task
+    def flatten_contracts(contracts_list: list[list[str]]) -> list[str]:
+        return [c for sublist in contracts_list for c in sublist]
+
+    all_contracts = flatten_contracts(contracts_per_ticker)
+
+    s3_keys = fetch_contract_bars.expand(
+        contract_ticker=all_contracts,
+        target_date=[target_date] * len(all_contracts),
+    )
+
     create_manifest(s3_keys)
 
 polygon_options_ingest_daily_dag()
