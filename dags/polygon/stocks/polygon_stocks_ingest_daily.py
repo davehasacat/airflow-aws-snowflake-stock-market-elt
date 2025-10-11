@@ -16,22 +16,15 @@ from dags.utils.polygon_datasets import S3_MANIFEST_DATASET
     start_date=pendulum.now(tz="UTC"),
     schedule="0 0 * * 1-5",
     catchup=True,
-    tags=["ingestion", "polygon", "daily"],
+    tags=["ingestion", "polygon", "daily", "aws"],
 )
 def polygon_stocks_ingest_daily_dag():
-    """
-    This DAG efficiently ingests daily stock market data from the Polygon API
-    for a list of custom tickers using the 'Grouped Daily' endpoint.
-    """
-    S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
-    BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+    S3_CONN_ID = "aws_default"
+    BUCKET_NAME = os.getenv("BUCKET_NAME")
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
     @task
     def get_custom_tickers() -> list[str]:
-        """
-        Reads the list of tickers from the dbt seeds directory.
-        """
         custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers = []
         with open(custom_tickers_path, mode='r') as csvfile:
@@ -42,14 +35,10 @@ def polygon_stocks_ingest_daily_dag():
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
     def get_grouped_daily_data_and_split(custom_tickers: list[str], **kwargs) -> list[str]:
-        """
-        Fetches all daily OHLCV data for the execution date and filters the results
-        to include only the tickers from the provided custom_tickers list.
-        """
         execution_date = kwargs["ds"]
         target_date = pendulum.parse(execution_date).subtract(days=1).to_date_string()
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        conn = BaseHook.get_connection('polygon_api')
+        conn = BaseHook.get_connection('polygon_stocks_api')
         api_key = conn.password
         
         custom_tickers_set = set(custom_tickers)
@@ -87,9 +76,6 @@ def polygon_stocks_ingest_daily_dag():
 
     @task(outlets=[S3_MANIFEST_DATASET])
     def write_manifest_to_s3(s3_keys: list[str], **kwargs):
-        """
-        Writes the list of S3 keys to the manifest file to trigger the downstream 'load' DAG.
-        """
         if not s3_keys:
             raise AirflowSkipException("No S3 keys were processed.")
 
@@ -99,7 +85,6 @@ def polygon_stocks_ingest_daily_dag():
         s3_hook.load_string(string_data=manifest_content, key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
         print(f"Manifest file updated: {manifest_key}")
 
-    # --- Task Flow Definition ---
     custom_tickers = get_custom_tickers()
     s3_keys = get_grouped_daily_data_and_split(custom_tickers)
     write_manifest_to_s3(s3_keys)
