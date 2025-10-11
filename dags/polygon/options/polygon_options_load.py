@@ -6,16 +6,13 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
-from airflow.datasets import Dataset
 
-S3_POLYGON_OPTIONS_MANIFEST_DATASET = Dataset("s3://test/manifests/polygon_options_manifest_latest.txt")
-SNOWFLAKE_DWH_POLYGON_OPTIONS_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_options_bars_daily")
-
+from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET, SNOWFLAKE_OPTIONS_RAW_DATASET
 
 @dag(
     dag_id="polygon_options_load",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=[S3_POLYGON_OPTIONS_MANIFEST_DATASET],
+    schedule=[S3_OPTIONS_MANIFEST_DATASET],
     catchup=False,
     tags=["load", "polygon", "options", "snowflake"],
     dagrun_timeout=timedelta(hours=4),
@@ -74,7 +71,7 @@ def polygon_options_load_dag():
         
         return s3_keys
 
-    @task(outlets=[SNOWFLAKE_DWH_POLYGON_OPTIONS_RAW_DATASET])
+    @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def load_data_to_snowflake(s3_keys: list[str]):
         """
         Executes a COPY INTO command to load data from S3 into the target Snowflake table.
