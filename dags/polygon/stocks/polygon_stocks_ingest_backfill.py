@@ -17,10 +17,10 @@ from dags.utils.polygon_datasets import S3_MANIFEST_DATASET
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=None,
     catchup=False,
-    tags=["ingestion", "polygon", "backfill"],
+    tags=["ingestion", "polygon", "backfill", "aws"],
     params={
-        "start_date": Param(default="2024-01-01", type="string", description="The start date for the backfill (YYYY-MM-DD)."),
-        "end_date": Param(default="2025-09-30", type="string", description="The end date for the backfill (YYYY-MM-DD).")
+        "start_date": Param(default="2025-10-06", type="string", description="The start date for the backfill (YYYY-MM-DD)."),
+        "end_date": Param(default="2025-10-11", type="string", description="The end date for the backfill (YYYY-MM-DD).")
     }
 )
 def polygon_stocks_ingest_backfill_dag():
@@ -28,8 +28,8 @@ def polygon_stocks_ingest_backfill_dag():
     This DAG efficiently backfills historical stock market data from the Polygon API
     for a specified date range, targeting only tickers from the custom_tickers.csv file.
     """
-    S3_CONN_ID = os.getenv("S3_CONN_ID", "minio_s3")
-    BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+    S3_CONN_ID = "aws_default"
+    BUCKET_NAME = os.getenv("BUCKET_NAME")
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
     @task
@@ -60,6 +60,7 @@ def polygon_stocks_ingest_backfill_dag():
         current_date = start
 
         while current_date <= end:
+            # Skip weekends (Saturday=5, Sunday=6)
             if current_date.day_of_week not in [5, 6]:
                 trading_dates.append(current_date.to_date_string())
             current_date = current_date.add(days=1)
@@ -73,7 +74,7 @@ def polygon_stocks_ingest_backfill_dag():
         only the tickers from the provided custom_tickers list.
         """
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        conn = BaseHook.get_connection('polygon_api')
+        conn = BaseHook.get_connection('polygon_stocks_api')
         api_key = conn.password
         
         # Use a set for efficient O(1) lookups
@@ -87,7 +88,7 @@ def polygon_stocks_ingest_backfill_dag():
             data = response.json()
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
-                print(f"No data found for {target_date} (likely a holiday). Skipping.")
+                print(f"No data found for {target_date} (likely a market holiday). Skipping.")
                 return []
             raise e
 
@@ -119,7 +120,7 @@ def polygon_stocks_ingest_backfill_dag():
         return [key for sublist in nested_list for key in sublist if key]
 
     @task(outlets=[S3_MANIFEST_DATASET])
-    def write_manifest_to_s3(s3_keys: list[str], **kwargs):
+    def write_manifest_to_s3(s3_keys: list[str]):
         """
         Writes the list of all created S3 keys to a manifest file.
         """
@@ -135,8 +136,10 @@ def polygon_stocks_ingest_backfill_dag():
     # --- Task Flow Definition ---
     custom_tickers = get_custom_tickers()
     date_range = generate_date_range()
+    
     # Pass the output of get_custom_tickers to each mapped process_date task
     processed_keys_nested = process_date.partial(custom_tickers=custom_tickers).expand(target_date=date_range)
+    
     s3_keys_flat = flatten_s3_key_list(processed_keys_nested)
     write_manifest_to_s3(s3_keys_flat)
 
