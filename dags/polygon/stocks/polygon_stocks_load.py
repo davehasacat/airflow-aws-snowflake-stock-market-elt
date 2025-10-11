@@ -8,15 +8,12 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
 
-from dags.utils.polygon_datasets import S3_MANIFEST_DATASET
-from airflow.datasets import Dataset
-SNOWFLAKE_DWH_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_stock_bars_daily")
-
+from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_STOCKS_RAW_DATASET
 
 @dag(
     dag_id="polygon_stocks_load",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule=[S3_MANIFEST_DATASET],
+    schedule=[S3_STOCKS_MANIFEST_DATASET],
     catchup=False,
     tags=["load", "polygon", "snowflake"],
     dagrun_timeout=timedelta(hours=2),
@@ -56,7 +53,7 @@ def polygon_stocks_load_dag():
             raise AirflowSkipException("Manifest is empty. No new files to process.")
         return s3_keys
 
-    @task(outlets=[SNOWFLAKE_DWH_RAW_DATASET])
+    @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET])
     def load_data_to_snowflake(s3_keys: list[str]):
         snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         copy_sql = f"""
