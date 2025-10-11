@@ -8,3 +8,6 @@ S3_OPTIONS_MANIFEST_DATASET = Dataset("s3://test/manifests/polygon_options_manif
 
 # Dataset for the raw stocks table updated by the load DAG
 SNOWFLAKE_STOCKS_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_stock_bars_daily")
+
+# Dataset for the raw options table updated by the load DAG
+SNOWFLAKE_OPTIONS_RAW_DATASET = Dataset("snowflake://stocks_elt_db/public/source_polygon_options_bars_daily")
