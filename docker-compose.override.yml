@@ -1,20 +1,29 @@
 # customize airflow services
 services:
   webserver:
+    environment:
+      - AWS_PROFILE=default
     volumes:
       - ./dbt:/usr/local/airflow/dbt
+      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
     networks:
       - default
       - stocks-elt_default
   scheduler:
+    environment:
+      - AWS_PROFILE=default
     volumes:
       - ./dbt:/usr/local/airflow/dbt
+      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
     networks:
       - default
       - stocks-elt_default
   triggerer:
+    environment:
+      - AWS_PROFILE=default
     volumes:
       - ./dbt:/usr/local/airflow/dbt
+      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
     networks:
       - default
       - stocks-elt_default
