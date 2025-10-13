@@ -14,6 +14,7 @@ services:
     networks:
       - default
       - stocks-elt_default
+
   webserver:
     env_file:
       - .env
@@ -28,6 +29,7 @@ services:
     networks:
       - default
       - stocks-elt_default
+
   triggerer:
     env_file:
       - .env
@@ -42,22 +44,33 @@ services:
     networks:
       - default
       - stocks-elt_default
-# create custom services
+
+  # create custom services
   dashboard:
     image: dashboard-app
     container_name: dashboard
     ports:
       - "8501:8501"
+    # Mount your local AWS profile so the app can read Secrets Manager
+    volumes:
+      # Many containers run as root; this path is robust.
+      - ${USERPROFILE}\.aws:/root/.aws:ro
     environment:
-      # Pass snowflake credentials to the dashboard
-      - SNOWFLAKE_USER=${SNOWFLAKE_USER}
-      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD}
-      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT}
-      - SNOWFLAKE_WAREHOUSE=STOCKS_DASHBOARD_WH # Use the smaller warehouse for the dashboard
-      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE}
-      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA}
+      # let the dashboard use the same local profile + region
+      - AWS_PROFILE=${AWS_PROFILE}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      # in case the app runs as a non-root user, force AWS SDK to these files
+      - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
+      - AWS_CONFIG_FILE=/root/.aws/config
+
+      # tell the app which secret to fetch (Airflow connection URI stored in SM)
+      - SNOWFLAKE_CONN_SECRET_NAME=airflow/connections/snowflake_default
+
+      # optional: a smaller WH just for dashboard queries (app should honor this override)
+      - SNOWFLAKE_OVERRIDE_WAREHOUSE=STOCKS_DASHBOARD_WH
     networks:
       - stocks-elt_default
+
 networks:
   stocks-elt_default:
     name: stocks-elt_default
