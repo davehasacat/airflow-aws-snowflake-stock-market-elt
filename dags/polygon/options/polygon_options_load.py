@@ -8,6 +8,7 @@ from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+from airflow.hooks.base import BaseHook  # <-- NEW
 
 from dags.utils.polygon_datasets import (
     S3_OPTIONS_MANIFEST_DATASET,
@@ -17,21 +18,9 @@ from dags.utils.polygon_datasets import (
 # -----------------------------
 # Config
 # -----------------------------
-S3_CONN_ID = os.getenv("S3_CONN_ID", "aws_default")  # align with ingest
+S3_CONN_ID = os.getenv("S3_CONN_ID", "aws_default")           # align with ingest
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
-
-SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE")
-SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA")
-SNOWFLAKE_TABLE = os.getenv("SNOWFLAKE_OPTIONS_TABLE", "source_polygon_options_bars_daily")
-FULLY_QUALIFIED_TABLE_NAME = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}"
-
-# Use fully-qualified stage created in your setup guide
-SNOWFLAKE_STAGE = os.getenv("SNOWFLAKE_STAGE", "STOCKS_ELT_DB.PUBLIC.s3_stage")
-
-# Raw staging table (variant)
-SNOWFLAKE_STAGE_TABLE = os.getenv("SNOWFLAKE_OPTIONS_STAGE_TABLE", "stg_polygon_options_raw")
-FULLY_QUALIFIED_STAGE_TABLE = f"{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_STAGE_TABLE}"
 
 # Batch size for FILES=() COPY (avoid overly-long SQL statements)
 COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
@@ -52,6 +41,27 @@ def polygon_options_load_dag():
       2) INSERT-SELECT parse into target table
       3) TRUNCATE the staging table
     """
+
+    # --- Resolve Snowflake context from connection extras ---
+    conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
+    x = conn.extra_dejson or {}
+
+    SF_DB = x.get("database")
+    SF_SCHEMA = x.get("schema")
+    if not SF_DB or not SF_SCHEMA:
+        raise ValueError(
+            "Snowflake connection extras must include 'database' and 'schema'. "
+            "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
+        )
+
+    # Optional overrides (provide via connection extra if you like)
+    STAGE_NAME = x.get("stage", "s3_stage")  # same stage name across stocks/options by default
+    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")
+    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "stg_polygon_options_raw")
+
+    FULLY_QUALIFIED_TABLE_NAME = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
+    FULLY_QUALIFIED_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
+    FULLY_QUALIFIED_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
 
     @task
     def create_tables():
@@ -97,7 +107,7 @@ def polygon_options_load_dag():
             raise AirflowSkipException(f"Manifest not found at s3://{BUCKET_NAME}/{manifest_key}")
 
         manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME)
-        s3_keys = [k.strip() for k in manifest_content.splitlines() if k.strip()]
+        s3_keys = [k.strip() for k in (manifest_content or "").splitlines() if k.strip()]
 
         if not s3_keys:
             raise AirflowSkipException("Manifest is empty. No new files to process.")
@@ -126,7 +136,7 @@ def polygon_options_load_dag():
 
             copy_sql = f"""
             COPY INTO {FULLY_QUALIFIED_STAGE_TABLE} (rec)
-            FROM @{SNOWFLAKE_STAGE}
+            FROM {FULLY_QUALIFIED_STAGE}
             FILES = ({files_clause})
             FILE_FORMAT = (TYPE = 'JSON');
             """
@@ -201,9 +211,7 @@ def polygon_options_load_dag():
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         hook.run(f"TRUNCATE TABLE {FULLY_QUALIFIED_STAGE_TABLE};")
 
-    # ───────────────────────────────────────────────────────────────────────────
     # Flow
-    # ───────────────────────────────────────────────────────────────────────────
     _ = create_tables()
     s3_keys = get_s3_keys_from_manifest()
     rows_to_stage = copy_raw_into_staging(s3_keys)
