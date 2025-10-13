@@ -4,12 +4,32 @@ import os
 import requests
 import json
 import csv
+
 from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.hooks.base import BaseHook
 from airflow.exceptions import AirflowSkipException
+from airflow.models import Variable  # <-- read secrets from AWS SM via Airflow Variables
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
+
+def _get_polygon_stocks_key() -> str:
+    """
+    Returns the Polygon Stocks API key from Airflow Variables (Secrets Manager-backed),
+    falling back to env var POLYGON_STOCKS_API_KEY if present.
+    """
+    try:
+        key = Variable.get("polygon_stocks_api_key")
+        if key:
+            return key
+    except Exception:
+        pass
+    key = os.getenv("POLYGON_STOCKS_API_KEY", "")
+    if key:
+        return key
+    raise RuntimeError(
+        "Missing Polygon API key. Create secret 'airflow/variables/polygon_stocks_api_key' "
+        "in AWS Secrets Manager (plain text), or set POLYGON_STOCKS_API_KEY as an env var."
+    )
 
 @dag(
     dag_id="polygon_stocks_ingest_daily",
@@ -26,50 +46,73 @@ def polygon_stocks_ingest_daily_dag():
     @task
     def get_custom_tickers() -> list[str]:
         custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
-        tickers = []
-        with open(custom_tickers_path, mode='r') as csvfile:
+        tickers: list[str] = []
+        with open(custom_tickers_path, mode="r", newline="") as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
-                tickers.append(row["ticker"])
+                t = (row.get("ticker") or "").strip()
+                if t:
+                    tickers.append(t)
         return tickers
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
     def get_grouped_daily_data_and_split(custom_tickers: list[str], **kwargs) -> list[str]:
         execution_date = kwargs["ds"]
         target_date = pendulum.parse(execution_date).subtract(days=1).to_date_string()
+
+        # Secrets Manager-backed key (via Airflow Variable)
+        api_key = _get_polygon_stocks_key()
+
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        conn = BaseHook.get_connection('polygon_stocks_api')
-        api_key = conn.password
-        
         custom_tickers_set = set(custom_tickers)
 
-        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{target_date}?adjusted=true&apiKey={api_key}"
-        
+        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{target_date}"
+        params = {"adjusted": "true", "apiKey": api_key}
+
         try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
+            resp = requests.get(url, params=params, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
+            if e.response is not None and e.response.status_code == 404:
                 print(f"No data found for {target_date} (likely a holiday). Skipping.")
                 return []
+            raise
+        except requests.exceptions.RequestException as e:
+            # network/timeout/etc.
             raise e
 
-        processed_s3_keys = []
-        if data.get('resultsCount', 0) > 0 and data.get('results'):
-            for result in data['results']:
+        processed_s3_keys: list[str] = []
+        if data.get("resultsCount", 0) > 0 and data.get("results"):
+            for result in data["results"]:
                 ticker = result.get("T")
                 if ticker in custom_tickers_set:
                     formatted_result = {
-                        "ticker": ticker, "queryCount": 1, "resultsCount": 1, "adjusted": True,
-                        "results": [{"v": result.get("v"), "vw": result.get("vw"), "o": result.get("o"),
-                                     "c": result.get("c"), "h": result.get("h"), "l": result.get("l"),
-                                     "t": result.get("t"), "n": result.get("n")}],
-                        "status": "OK", "request_id": data.get("request_id")
+                        "ticker": ticker,
+                        "queryCount": 1,
+                        "resultsCount": 1,
+                        "adjusted": True,
+                        "results": [{
+                            "v": result.get("v"),
+                            "vw": result.get("vw"),
+                            "o": result.get("o"),
+                            "c": result.get("c"),
+                            "h": result.get("h"),
+                            "l": result.get("l"),
+                            "t": result.get("t"),
+                            "n": result.get("n"),
+                        }],
+                        "status": "OK",
+                        "request_id": data.get("request_id"),
                     }
                     json_string = json.dumps(formatted_result)
                     s3_key = f"raw_data/{ticker}_{target_date}.json"
-                    s3_hook.load_string(string_data=json_string, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
+                    s3_hook.load_string(
+                        string_data=json_string,
+                        key=s3_key,
+                        bucket_name=BUCKET_NAME,
+                        replace=True,
+                    )
                     processed_s3_keys.append(s3_key)
 
         return processed_s3_keys
@@ -78,11 +121,15 @@ def polygon_stocks_ingest_daily_dag():
     def write_manifest_to_s3(s3_keys: list[str], **kwargs):
         if not s3_keys:
             raise AirflowSkipException("No S3 keys were processed.")
-
         manifest_content = "\n".join(s3_keys)
         s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
         manifest_key = "manifests/manifest_latest.txt"
-        s3_hook.load_string(string_data=manifest_content, key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
+        s3_hook.load_string(
+            string_data=manifest_content,
+            key=manifest_key,
+            bucket_name=BUCKET_NAME,
+            replace=True,
+        )
         print(f"Manifest file updated: {manifest_key}")
 
     custom_tickers = get_custom_tickers()
