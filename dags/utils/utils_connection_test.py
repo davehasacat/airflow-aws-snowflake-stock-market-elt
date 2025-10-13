@@ -1,21 +1,40 @@
 from __future__ import annotations
 
-import os
+import os, uuid, json
 import pendulum
+import boto3
 
 from airflow.decorators import dag, task
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+from airflow.models import Variable
 
 from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 
-# --- DAG Configuration ---
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR")
 DBT_EXECUTABLE_PATH = os.getenv("DBT_EXECUTABLE_PATH", "/usr/local/airflow/dbt_venv/bin/dbt")
-# Use the standard 'aws_default' connection ID
-S3_CONN_ID = "aws_default"
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+
+def resolve_bucket_name() -> str:
+    """
+    Prefer Secrets Manager-backed Airflow Variable `s3_data_bucket`.
+    Accepts either a plain string ("stock-market-elt") or a JSON object like {"s3_data_bucket":"stock-market-elt"}.
+    Falls back to BUCKET_NAME from env.
+    """
+    try:
+        raw = Variable.get("s3_data_bucket")
+        try:
+            maybe = json.loads(raw)
+            if isinstance(maybe, dict) and "s3_data_bucket" in maybe:
+                return str(maybe["s3_data_bucket"])
+        except Exception:
+            if raw:
+                return raw
+    except Exception:
+        pass
+    return os.getenv("BUCKET_NAME", "")
+
+BUCKET_NAME = resolve_bucket_name()
 SNOWFLAKE_CONN_ID = "snowflake_default"
-BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 @dag(
     dag_id="utils_connection_test",
@@ -25,28 +44,43 @@ BUCKET_NAME = os.getenv("BUCKET_NAME")
     tags=["test", "aws", "s3", "snowflake", "dbt"],
     doc_md="""
     ### Full Stack Connection Test DAG
-    This DAG tests the connections to AWS S3 and Snowflake, and also
-    verifies that dbt can successfully connect.
+    Validates:
+    - AWS via STS and an S3 round-trip (put/get/delete) using **profile-only** creds.
+    - Snowflake via a `current_*` identity query (connection from Secrets Manager).
+    - dbt connectivity for a representative source.
     """,
 )
 def utils_connection_test_dag():
-    """
-    A DAG to test connections to S3, Snowflake, and dbt.
-    """
-
     @task
-    def test_aws_s3_connection():
-        """Checks the AWS S3 connection by verifying the bucket exists."""
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        s3_hook.check_for_bucket(bucket_name=BUCKET_NAME)
-        print(f"AWS S3 connection to bucket '{BUCKET_NAME}' successful.")
+    def test_aws_connection_and_s3_roundtrip():
+        assert BUCKET_NAME, "Bucket name not set. Ensure Variable 's3_data_bucket' (plain string) or env BUCKET_NAME."
+        sts = boto3.client("sts", region_name=AWS_REGION)
+        ident = sts.get_caller_identity()
+        print({"aws_account": ident["Account"], "aws_arn": ident["Arn"], "region": AWS_REGION})
 
-    @task
-    def test_snowflake_connection():
-        """Checks the Snowflake DWH connection."""
-        snowflake_hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        snowflake_hook.get_first("SELECT 1;")
-        print("Snowflake connection successful.")
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        key = f"tmp/airflow_roundtrip_{uuid.uuid4().hex}.txt"
+        data = f"roundtrip-ok account={ident['Account']} arn={ident['Arn']}"
+        s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=data.encode("utf-8"))
+        got = s3.get_object(Bucket=BUCKET_NAME, Key=key)["Body"].read().decode("utf-8")
+        s3.delete_object(Bucket=BUCKET_NAME, Key=key)
+
+        print({"bucket": BUCKET_NAME, "key": key, "wrote": data, "read": got})
+        assert got == data, "S3 round-trip content mismatch"
+
+    test_snowflake_connection = SnowflakeOperator(
+        task_id="test_snowflake_connection",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql="""
+            select
+              current_user()      as user,
+              current_role()      as role,
+              current_warehouse() as warehouse,
+              current_database()  as database,
+              current_schema()    as schema;
+        """,
+        do_xcom_push=False,
+    )
 
     test_dbt_connection = DbtTaskGroup(
         group_id="test_dbt_connection",
@@ -60,11 +94,7 @@ def utils_connection_test_dag():
         operator_args={"select": "source:public.source_polygon_stock_bars_daily"},
     )
 
-    # Instantiate the tasks
-    s3_test = test_aws_s3_connection()
-    snowflake_test = test_snowflake_connection()
-
-    # Define task dependencies
-    [s3_test, snowflake_test] >> test_dbt_connection
+    aws_test = test_aws_connection_and_s3_roundtrip()
+    [aws_test, test_snowflake_connection] >> test_dbt_connection
 
 utils_connection_test_dag()

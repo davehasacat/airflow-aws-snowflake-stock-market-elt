@@ -1,20 +1,44 @@
 # customize airflow services
 services:
-  webserver:
+  scheduler:
+    env_file:
+      - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
+      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
+      - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
     networks:
       - default
       - stocks-elt_default
-  scheduler:
+  webserver:
+    env_file:
+      - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
+      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
+      - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
     networks:
       - default
       - stocks-elt_default
   triggerer:
+    env_file:
+      - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
+      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
+      - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
     networks:
       - default
       - stocks-elt_default
