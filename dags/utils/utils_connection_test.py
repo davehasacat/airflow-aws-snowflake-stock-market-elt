@@ -68,8 +68,8 @@ def utils_connection_test_dag():
         print({"bucket": BUCKET_NAME, "key": key, "wrote": data, "read": got})
         assert got == data, "S3 round-trip content mismatch"
 
-    snowflake_test = SnowflakeOperator(
-        task_id="snowflake_whoami",
+    test_snowflake_connection = SnowflakeOperator(
+        task_id="test_snowflake_connection",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql="""
             select
@@ -95,6 +95,6 @@ def utils_connection_test_dag():
     )
 
     aws_test = test_aws_connection_and_s3_roundtrip()
-    [aws_test, snowflake_test] >> test_dbt_connection
+    [aws_test, test_snowflake_connection] >> test_dbt_connection
 
 utils_connection_test_dag()
