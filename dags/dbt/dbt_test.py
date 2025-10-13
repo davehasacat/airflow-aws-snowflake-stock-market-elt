@@ -5,6 +5,7 @@ import json
 from airflow.decorators import dag, task
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
+from cosmos.profiles import SnowflakeUserPasswordProfileMapping
 
 # --- dbt Configuration ---
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR")
@@ -34,7 +35,16 @@ def dbt_test_dag():
         profile_config=ProfileConfig(
             profile_name="stock_market_elt",
             target_name="dev",
-            profiles_yml_filepath=os.path.join(DBT_PROJECT_DIR, "profiles.yml"),
+            profile_mapping=SnowflakeUserPasswordProfileMapping(
+                conn_id="snowflake_default",
+                # Optional: if you want to override/force values instead of reading from connection extras:
+                # profile_args={
+                #     "database": "STOCKS_ELT_DB",
+                #     "schema": "PUBLIC",
+                #     "warehouse": "STOCKS_ELT_WH",
+                #     "role": "STOCKS_ELT_ROLE",
+                # }
+            ),
         ),
         execution_config=ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH),
         operator_args={"cmd": "test"}
