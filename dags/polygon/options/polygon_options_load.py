@@ -1,3 +1,4 @@
+# dags/polygon/options/polygon_options_load.py
 from __future__ import annotations
 import os
 from datetime import timedelta
@@ -32,11 +33,17 @@ COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
 )
 def polygon_options_load_dag():
     """
-    Loads raw JSON options data from S3 (written by ingest DAG) into Snowflake:
+    Loads **raw** JSON options data from S3 (written by ingest DAG) into Snowflake,
+    with **no SQL parsing or custom field creation**. Downstream parsing happens in dbt.
 
-      1) COPY raw JSON into a VARIANT staging table (no transformation in COPY)
-      2) INSERT-SELECT parse into target table
-      3) TRUNCATE the staging table
+    Flow:
+      1) Ensure a single-column VARIANT landing table exists.
+      2) COPY raw JSON/.json.gz files from the external stage into the staging VARIANT table.
+      3) INSERT raw payloads from staging into the landing table with only:
+         - option_symbol (from rec:ticker, no regex)
+         - trade_date   (from first bar timestamp)
+         - raw_rec      (full JSON payload as VARIANT)
+      4) TRUNCATE staging.
 
     S3 paths produced by ingest:
       - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json[.gz]
@@ -58,10 +65,9 @@ def polygon_options_load_dag():
             "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
         )
 
-    # Optional overrides (kept consistent with your environment)
-    STAGE_NAME = x.get("stage", "s3_stage")  # same stage used for stocks/options
-    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")
-    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")
+    STAGE_NAME = x.get("stage", "s3_stage")  # external stage rooted at s3://<bucket>/raw/
+    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")  # landing/raw table
+    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")  # VARIANT staging table
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
     FQ_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
@@ -69,23 +75,18 @@ def polygon_options_load_dag():
 
     @task
     def create_tables():
+        """
+        Create/ensure:
+          - Landing table with minimal columns (option_symbol, trade_date, raw_rec, inserted_at)
+          - Staging table (single VARIANT column)
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
         ddl_target = f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             option_symbol TEXT,
             trade_date DATE,
-            underlying_ticker TEXT,
-            expiration_date DATE,
-            strike_price NUMERIC(19, 4),
-            option_type VARCHAR(4),
-            open NUMERIC(19, 4),
-            high NUMERIC(19, 4),
-            low NUMERIC(19, 4),
-            close NUMERIC(19, 4),
-            volume BIGINT,
-            vwap NUMERIC(19, 4),
-            transactions BIGINT,
+            raw_rec VARIANT,
             inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
         );
         """
@@ -160,61 +161,23 @@ def polygon_options_load_dag():
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
         """
-        Parse Polygon option symbols like:
-          O:MSFT261218P00505000
-          O:AAPL260103C00150000
-
-        Pattern: O:<UNDERLYING><YYMMDD><C|P><STRIKE(8 digits)>
-        Uses capture groups (REGEXP_SUBSTR with 'c' and group index); avoids lookbehind and \\d.
+        Insert raw payloads from staging into landing table with no regex or derived fields.
+        - option_symbol: rec:ticker (as-is)
+        - trade_date:    derived from first bar timestamp (minimal, preserved for partitioning)
+        - raw_rec:       full JSON response (Variant)
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
         insert_sql = f"""
         INSERT INTO {FQ_TABLE} (
-            option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
-            open, high, low, close, volume, vwap, transactions
+            option_symbol, trade_date, raw_rec
         )
         SELECT
-            sym AS option_symbol,
-
-            /* trade_date from ms epoch in the first result bar */
-            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))             AS trade_date,
-
-            /* UNDERLYING: capture group 1 from full pattern */
-            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)[0-9]{{6}}[CP][0-9]{{8}}$', 1, 1, 'c', 1)
-                AS underlying_ticker,
-
-            /* EXPIRATION: capture YYMMDD as group 1, then TO_DATE('YYMMDD') */
-            TO_DATE(
-              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+([0-9]{{6}})[CP][0-9]{{8}}$', 1, 1, 'c', 1),
-              'YYMMDD'
-            )                                                                           AS expiration_date,
-
-            /* STRIKE: final 8 digits (group 1) / 1000 */
-            TRY_TO_NUMBER(
-              REGEXP_SUBSTR(sym, '([0-9]{{8}})$', 1, 1, 'c', 1)
-            ) / 1000                                                                    AS strike_price,
-
-            /* TYPE: capture C/P as group 1 and map to call/put */
-            CASE REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+[0-9]{{6}}([CP])[0-9]{{8}}$', 1, 1, 'c', 1)
-              WHEN 'C' THEN 'call'
-              WHEN 'P' THEN 'put'
-            END                                                                           AS option_type,
-
-            rec:results[0]:o::FLOAT  AS open,
-            rec:results[0]:h::FLOAT  AS high,
-            rec:results[0]:l::FLOAT  AS low,
-            rec:results[0]:c::FLOAT  AS close,
-            rec:results[0]:v::BIGINT AS volume,
-            rec:results[0]:vw::FLOAT AS vwap,
-            rec:results[0]:n::BIGINT AS transactions
-        FROM (
-            SELECT
-                rec,
-                TO_VARCHAR(rec:ticker) AS sym
-            FROM {FQ_STAGE_TABLE}
-        )
-        WHERE sym LIKE 'O:%';
+            TO_VARCHAR(rec:ticker) AS option_symbol,
+            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 )) AS trade_date,
+            rec AS raw_rec
+        FROM {FQ_STAGE_TABLE}
+        WHERE rec:ticker IS NOT NULL;
         """
         hook.run(insert_sql)
 
