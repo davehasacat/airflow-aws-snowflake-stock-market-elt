@@ -165,7 +165,7 @@ def polygon_options_load_dag():
           O:AAPL260103C00150000
 
         Pattern: O:<UNDERLYING><YYMMDD><C|P><STRIKE(8 digits)>
-        Uses capture groups (REGEXP_SUBSTR with 'c' and group index) to avoid lookbehind.
+        Uses capture groups (REGEXP_SUBSTR with 'c' and group index); avoids lookbehind and \\d.
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -181,22 +181,22 @@ def polygon_options_load_dag():
             TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))             AS trade_date,
 
             /* UNDERLYING: capture group 1 from full pattern */
-            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}$', 1, 1, 'c', 1)
+            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)[0-9]{{6}}[CP][0-9]{{8}}$', 1, 1, 'c', 1)
                 AS underlying_ticker,
 
             /* EXPIRATION: capture YYMMDD as group 1, then TO_DATE('YYMMDD') */
             TO_DATE(
-              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}$', 1, 1, 'c', 1),
+              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+([0-9]{{6}})[CP][0-9]{{8}}$', 1, 1, 'c', 1),
               'YYMMDD'
             )                                                                           AS expiration_date,
 
             /* STRIKE: final 8 digits (group 1) / 1000 */
             TRY_TO_NUMBER(
-              REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)
+              REGEXP_SUBSTR(sym, '([0-9]{{8}})$', 1, 1, 'c', 1)
             ) / 1000                                                                    AS strike_price,
 
             /* TYPE: capture C/P as group 1 and map to call/put */
-            CASE REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}$', 1, 1, 'c', 1)
+            CASE REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+[0-9]{{6}}([CP])[0-9]{{8}}$', 1, 1, 'c', 1)
               WHEN 'C' THEN 'call'
               WHEN 'P' THEN 'put'
             END                                                                           AS option_type,
