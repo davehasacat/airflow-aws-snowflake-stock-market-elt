@@ -13,7 +13,7 @@ from airflow.decorators import dag, task, task_group
 from airflow.operators.python import get_current_context
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.models import Variable  # <-- NEW: read from Secrets Manager via Variables
+from airflow.models import Variable  # read from Secrets Manager via Airflow Variables
 
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
@@ -22,7 +22,7 @@ from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 # ────────────────────────────────────────────────────────────────────────────────
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
-S3_PREFIX = "raw_data/options/"
+S3_PREFIX = "raw/options/"  # <- scoped under raw/
 
 default_args = {
     "owner": "data-platform",
@@ -32,18 +32,55 @@ default_args = {
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-dag (daily)")
+API_POOL = "api_pool"  # defined in airflow_settings.yaml
 
 def _get_polygon_options_key() -> str:
-    """Resolve the Polygon OPTIONS API key from Airflow Variable (Secrets-backed) or env fallback."""
+    """
+    Return a clean Polygon OPTIONS API key whether the Airflow Variable is stored as:
+      - plain text: "abc123"
+      - JSON object: {"polygon_options_api_key":"abc123"}
+    Falls back to env POLYGON_OPTIONS_API_KEY.
+    """
+    # 1) Try JSON variable
     try:
-        val = Variable.get("polygon_options_api_key")
-        if val:
-            return val
+        v = Variable.get("polygon_options_api_key", deserialize_json=True)
+        if isinstance(v, dict):
+            for k in ("polygon_options_api_key", "api_key", "key", "value"):
+                s = v.get(k)
+                if isinstance(s, str) and s.strip():
+                    return s.strip()
+            if len(v) == 1:
+                s = next(iter(v.values()))
+                if isinstance(s, str) and s.strip():
+                    return s.strip()
     except Exception:
         pass
-    val = os.getenv("POLYGON_OPTIONS_API_KEY")
-    if val:
-        return val
+    # 2) Try plain-text variable (or JSON-ish string)
+    try:
+        s = Variable.get("polygon_options_api_key")
+        if s:
+            s = s.strip()
+            if s.startswith("{"):
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        for k in ("polygon_options_api_key", "api_key", "key", "value"):
+                            v = obj.get(k)
+                            if isinstance(v, str) and v.strip():
+                                return v.strip()
+                        if len(obj) == 1:
+                            v = next(iter(obj.values()))
+                            if isinstance(v, str) and v.strip():
+                                return v.strip()
+                except Exception:
+                    pass
+            return s
+    except Exception:
+        pass
+    # 3) Env fallback
+    env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
+    if env:
+        return env
     raise RuntimeError(
         "Polygon Options API key not found. Create secret 'airflow/variables/polygon_options_api_key' "
         "in AWS Secrets Manager (plain text), or set env POLYGON_OPTIONS_API_KEY."
@@ -82,10 +119,9 @@ def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requ
     max_active_runs=1,
 )
 def polygon_options_ingest_daily_dag():
-    S3_CONN_ID = "aws_default"
+    # Use default AWS credentials chain (mounted ~/.aws)
     BUCKET_NAME = os.getenv("BUCKET_NAME")
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
-    API_POOL = "api_pool"  # defined in airflow_settings.yaml
 
     # ───────────────────────────────
     # Input Tasks
@@ -97,8 +133,9 @@ def polygon_options_ingest_daily_dag():
         with open(path, mode="r") as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
-                if row.get("ticker"):
-                    tickers.append(row["ticker"].strip().upper())
+                t = (row.get("ticker") or "").strip().upper()
+                if t:
+                    tickers.append(t)
         return tickers
 
     @task
@@ -164,7 +201,7 @@ def polygon_options_ingest_daily_dag():
         @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
         def fetch_contract_bars(contract_ticker: str, target_date: str) -> Optional[str]:
             api_key = _get_polygon_options_key()
-            s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+            s3 = S3Hook()  # no aws_conn_id
             url = f"{POLYGON_AGGS_URL_BASE}/{contract_ticker}/range/1/day/{target_date}/{target_date}"
             params = {"adjusted": "true", "apiKey": api_key}
             resp = _rate_limited_get(url, params)
@@ -176,8 +213,9 @@ def polygon_options_ingest_daily_dag():
             if not results:
                 return None
             payload = json.dumps(data)
-            s3_key = f"{S3_PREFIX}{contract_ticker}_{target_date}.json"
-            s3_hook.load_string(
+            # s3://<bucket>/raw/options/<contract>/<YYYY-MM-DD>.json
+            s3_key = f"{S3_PREFIX}{contract_ticker}/{target_date}.json"
+            s3.load_string(
                 string_data=payload,
                 key=s3_key,
                 bucket_name=BUCKET_NAME,
@@ -200,9 +238,9 @@ def polygon_options_ingest_daily_dag():
         keys = [k for k in (s3_keys or []) if k]
         if not keys:
             raise AirflowSkipException("No new files created; skipping manifest.")
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/polygon_options_manifest_latest.txt"
-        s3_hook.load_string(
+        s3 = S3Hook()
+        manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
+        s3.load_string(
             string_data="\n".join(keys),
             key=manifest_key,
             bucket_name=BUCKET_NAME,

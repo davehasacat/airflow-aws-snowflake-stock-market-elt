@@ -15,7 +15,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.operators.python import get_current_context
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.models import Variable  # <-- NEW: read from Secrets Manager via Variables
+from airflow.models import Variable  # Secrets Manager-backed Variables
 
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
@@ -25,33 +25,70 @@ from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
-S3_CONN_ID = os.getenv("S3_CONN_ID", "aws_default")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (manual)")
-API_POOL = "api_pool"  # defined in airflow_settings.yaml
+API_POOL = "api_pool"  # ensure the pool exists or remove this
 
 # Rate limiting / batching
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.5"))
 SYMBOL_BATCH_SIZE = int(os.getenv("BACKFILL_SYMBOL_BATCH_SIZE", "500"))
 
+
 def _get_polygon_options_key() -> str:
-    """Resolve the Polygon OPTIONS API key from Airflow Variable (Secrets-backed) or env fallback."""
+    """
+    Return a clean Polygon OPTIONS API key whether the Airflow Variable is stored as:
+      - plain text: "abc123"
+      - JSON object: {"polygon_options_api_key":"abc123"}
+    Falls back to env POLYGON_OPTIONS_API_KEY.
+    """
+    # 1) Try JSON variable
     try:
-        val = Variable.get("polygon_options_api_key")
-        if val:
-            return val
+        v = Variable.get("polygon_options_api_key", deserialize_json=True)
+        if isinstance(v, dict):
+            for k in ("polygon_options_api_key", "api_key", "key", "value"):
+                s = v.get(k)
+                if isinstance(s, str) and s.strip():
+                    return s.strip()
+            if len(v) == 1:
+                s = next(iter(v.values()))
+                if isinstance(s, str) and s.strip():
+                    return s.strip()
     except Exception:
         pass
-    val = os.getenv("POLYGON_OPTIONS_API_KEY")
-    if val:
-        return val
+    # 2) Try plain-text variable (or JSON-ish string)
+    try:
+        s = Variable.get("polygon_options_api_key")
+        if s:
+            s = s.strip()
+            if s.startswith("{"):
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        for k in ("polygon_options_api_key", "api_key", "key", "value"):
+                            v = obj.get(k)
+                            if isinstance(v, str) and v.strip():
+                                return v.strip()
+                        if len(obj) == 1:
+                            v = next(iter(obj.values()))
+                            if isinstance(v, str) and v.strip():
+                                return v.strip()
+                except Exception:
+                    pass
+            return s
+    except Exception:
+        pass
+    # 3) Env fallback
+    env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
+    if env:
+        return env
     raise RuntimeError(
         "Polygon Options API key not found. Create secret 'airflow/variables/polygon_options_api_key' "
         "in AWS Secrets Manager (plain text), or set env POLYGON_OPTIONS_API_KEY."
     )
+
 
 def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
     """
@@ -78,6 +115,7 @@ def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requ
         else:
             return resp
 
+
 @dag(
     dag_id="polygon_options_ingest_backfill",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
@@ -86,7 +124,7 @@ def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requ
     tags=["ingestion", "polygon", "options", "backfill"],
     params={
         "start_date": Param(default="2025-10-06", type="string", description="Backfill start date (YYYY-MM-DD)"),
-        "end_date": Param(default="2025-10-09", type="string", description="Backfill end date (YYYY-MM-DD)"),
+        "end_date":   Param(default="2025-10-09", type="string", description="Backfill end date (YYYY-MM-DD)"),
     },
     dagrun_timeout=timedelta(hours=24),
 )
@@ -96,7 +134,7 @@ def polygon_options_ingest_backfill_dag():
       1) Discover option contracts for seed underlyings (via /v3/reference/options/contracts)
       2) Batch symbols to respect mapping limits and API rate limits
       3) For each symbol, pull aggregates over the date range (/v2/aggs/ticker/.../range/1/day)
-      4) Write one JSON per (contract, trading day) to S3
+      4) Write one JSON per (contract, trading day) to s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
       5) Write manifest to trigger downstream load
     """
 
@@ -110,7 +148,10 @@ def polygon_options_ingest_backfill_dag():
         custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         with open(custom_tickers_path, mode="r") as csvfile:
             reader = csv.DictReader(csvfile)
-            underlyings = [row["ticker"].strip().upper() for row in reader if row.get("ticker")]
+            underlyings = [
+                (row.get("ticker") or "").strip().upper()
+                for row in reader if row.get("ticker")
+            ]
 
         all_symbols: List[str] = []
         for ticker in underlyings:
@@ -148,7 +189,7 @@ def polygon_options_ingest_backfill_dag():
     def process_symbol_batch_backfill(symbol_batch: List[str]) -> List[str]:
         """
         Fetch historical aggregates for each symbol over the date range in params.
-        Write one JSON file per (symbol, trading day).
+        Write one JSON file per (symbol, trading day) to s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
         """
         ctx = get_current_context()
         start_date = ctx["params"]["start_date"]
@@ -164,7 +205,7 @@ def polygon_options_ingest_backfill_dag():
             raise ValueError("start_date cannot be after end_date.")
 
         api_key = _get_polygon_options_key()
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
+        s3 = S3Hook()  # Use default AWS creds (mounted ~/.aws)
 
         processed_keys: List[str] = []
         for option_symbol in symbol_batch:
@@ -183,13 +224,14 @@ def polygon_options_ingest_backfill_dag():
                 results = data.get("results") or []
                 if results:
                     for bar in results:
-                        trade_date = pendulum.from_timestamp(bar["t"] / 1000).to_date_string()
+                        trade_date = pendulum.from_timestamp(bar["t"] / 1000, tz="UTC").to_date_string()
                         payload = {
                             "ticker": data.get("ticker", option_symbol),
                             "resultsCount": 1,
                             "results": [bar],
                         }
-                        s3_key = f"raw_data/options/{option_symbol}_{trade_date}.json"
+                        # Write under raw/options/<symbol>/<YYYY-MM-DD>.json
+                        s3_key = f"raw/options/{option_symbol}/{trade_date}.json"
                         s3.load_string(json.dumps(payload), key=s3_key, bucket_name=BUCKET_NAME, replace=True)
                         processed_keys.append(s3_key)
 
@@ -214,8 +256,8 @@ def polygon_options_ingest_backfill_dag():
         if not keys:
             raise AirflowSkipException("No S3 keys were processed during the options backfill.")
 
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/polygon_options_manifest_latest.txt"
+        s3 = S3Hook()
+        manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
         s3.load_string("\n".join(keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
         print(f"Backfill manifest created with {len(keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
@@ -225,5 +267,6 @@ def polygon_options_ingest_backfill_dag():
     processed_keys_nested = process_symbol_batch_backfill.expand(symbol_batch=symbol_batches)
     s3_keys_flat = flatten_s3_key_list(processed_keys_nested)
     write_manifest_to_s3(s3_keys_flat)
+
 
 polygon_options_ingest_backfill_dag()

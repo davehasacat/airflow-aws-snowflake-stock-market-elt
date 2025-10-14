@@ -7,7 +7,7 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
-from airflow.hooks.base import BaseHook  # <-- NEW: read extras from conn
+from airflow.hooks.base import BaseHook  # read extras from conn
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_STOCKS_RAW_DATASET
 
@@ -21,18 +21,17 @@ from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_ST
     dagrun_timeout=timedelta(hours=2),
 )
 def polygon_stocks_load_dag():
-    S3_CONN_ID = "aws_default"
+    # Use default AWS credentials chain (no aws_conn_id)
     SNOWFLAKE_CONN_ID = "snowflake_default"
-    BUCKET_NAME = os.getenv("BUCKET_NAME")
+    BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 
     # --- Resolve Snowflake context from the Airflow connection (Secrets-backed) ---
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
 
-    # Required (we set these in the connection secret):
+    # Required
     SF_DB = x.get("database")
     SF_SCHEMA = x.get("schema")
-
     if not SF_DB or not SF_SCHEMA:
         raise ValueError(
             "Snowflake connection extras must include 'database' and 'schema'. "
@@ -51,30 +50,55 @@ def polygon_stocks_load_dag():
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         create_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_TABLE_NAME} (
-            ticker TEXT, trade_date DATE, open NUMERIC(19, 4), high NUMERIC(19, 4),
-            low NUMERIC(19, 4), close NUMERIC(19, 4), volume BIGINT, vwap NUMERIC(19, 4),
-            transactions BIGINT, inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
+            ticker TEXT,
+            trade_date DATE,
+            open NUMERIC(19, 4),
+            high NUMERIC(19, 4),
+            low NUMERIC(19, 4),
+            close NUMERIC(19, 4),
+            volume BIGINT,
+            vwap NUMERIC(19, 4),
+            transactions BIGINT,
+            inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
         );
         """
         hook.run(create_table_sql)
 
     @task
     def get_s3_keys_from_manifest() -> list[str]:
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/manifest_latest.txt"
+        """
+        Fetch manifest and convert absolute keys (starting with 'raw/') to
+        stage-relative paths for @.../raw/ (i.e., strip leading 'raw/').
+        """
+        s3 = S3Hook()
+        manifest_key = "raw/manifests/manifest_latest.txt"
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
-            raise FileNotFoundError(f"Manifest file not found: {manifest_key}")
-        manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME)
-        s3_keys = [k for k in (manifest_content or "").strip().splitlines() if k]
-        if not s3_keys:
+            raise FileNotFoundError(f"Manifest file not found at s3://{BUCKET_NAME}/{manifest_key}")
+
+        manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME) or ""
+        raw_keys = [k.strip() for k in manifest_content.splitlines() if k.strip()]
+
+        if not raw_keys:
             raise AirflowSkipException("Manifest is empty. No new files to process.")
-        return s3_keys
+
+        # Convert to stage-relative paths (stage URL is s3://.../raw/)
+        rel_keys = [k[4:] if k.startswith("raw/") else k for k in raw_keys]
+
+        # Optional: ensure we're only loading stocks files
+        rel_keys = [k for k in rel_keys if k.startswith("stocks/")]
+
+        if not rel_keys:
+            raise AirflowSkipException("No eligible stocks files found in manifest after normalization.")
+        return rel_keys
 
     @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET])
-    def load_data_to_snowflake(s3_keys: list[str]):
+    def load_data_to_snowflake(stage_relative_keys: list[str]):
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        files_clause = ", ".join(f"'{k}'" for k in stage_relative_keys)
+
         copy_sql = f"""
-        COPY INTO {FULLY_QUALIFIED_TABLE_NAME} (ticker, trade_date, volume, vwap, open, close, high, low, transactions)
+        COPY INTO {FULLY_QUALIFIED_TABLE_NAME}
+          (ticker, trade_date, volume, vwap, open, close, high, low, transactions)
         FROM (
             SELECT
                 $1:ticker::TEXT,
@@ -88,15 +112,17 @@ def polygon_stocks_load_dag():
                 $1:results[0]:n::BIGINT
             FROM {FULLY_QUALIFIED_STAGE_NAME}
         )
-        FILES = ({', '.join(f"'{k}'" for k in s3_keys)})
-        FILE_FORMAT = (TYPE = 'JSON');
+        FILES = ({files_clause})
+        FILE_FORMAT = (TYPE = 'JSON')
+        ON_ERROR = 'ABORT_STATEMENT'
+        FORCE = FALSE;
         """
         hook.run(copy_sql)
-        print(f"Loaded {len(s3_keys)} files into {FULLY_QUALIFIED_TABLE_NAME}.")
+        print(f"Loaded {len(stage_relative_keys)} files into {FULLY_QUALIFIED_TABLE_NAME}.")
 
     table_created = create_snowflake_table()
-    keys = get_s3_keys_from_manifest()
-    load_op = load_data_to_snowflake(keys)
+    rel_keys = get_s3_keys_from_manifest()
+    load_op = load_data_to_snowflake(rel_keys)
     table_created >> load_op
 
 
