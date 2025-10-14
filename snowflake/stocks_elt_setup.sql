@@ -2,7 +2,7 @@
 -- Snowflake Setup for Stock & Options ELT (Idempotent)
 -- ====================================================================
 -- AWS S3 Integration:
---   Bucket: s3://stock-market-elt/raw/
+--   Bucket: s3://stock-market-elt/
 --   Region: us-east-2
 --   IAM Role: arn:aws:iam::586159464756:role/SnowflakeS3Role
 -- ====================================================================
@@ -45,7 +45,7 @@ CREATE OR REPLACE STORAGE INTEGRATION S3_INTEGRATION
   STORAGE_PROVIDER = S3
   ENABLED = TRUE
   STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::586159464756:role/SnowflakeS3Role'
-  STORAGE_ALLOWED_LOCATIONS = ('s3://stock-market-elt/raw/')
+  STORAGE_ALLOWED_LOCATIONS = ('s3://stock-market-elt/')
   COMMENT = 'Integration between Snowflake and S3 for ELT data (scoped to /raw folder)';
 
 -- ------------------
@@ -69,7 +69,7 @@ CREATE OR REPLACE FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_CSV
 -- ------------------
 CREATE OR REPLACE STAGE STOCKS_ELT_DB.PUBLIC.S3_STAGE
   STORAGE_INTEGRATION = S3_INTEGRATION
-  URL = 's3://stock-market-elt/raw/'
+  URL = 's3://stock-market-elt/'
   FILE_FORMAT = STOCKS_ELT_DB.PUBLIC.FF_JSON
   COMMENT = 'Stage for ELT raw data ingestion (restricted to /raw prefix)';
 
