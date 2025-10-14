@@ -57,7 +57,7 @@ def polygon_options_load_dag():
     # Optional overrides
     STAGE_NAME = x.get("stage", "s3_stage")  # same stage used for stocks/options
     OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")
-    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "stg_polygon_options_raw")
+    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
     FQ_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
