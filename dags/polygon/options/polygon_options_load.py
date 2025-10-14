@@ -33,13 +33,17 @@ COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
 def polygon_options_load_dag():
     """
     Loads raw JSON options data from S3 (written by ingest DAG) into Snowflake:
+
       1) COPY raw JSON into a VARIANT staging table (no transformation in COPY)
       2) INSERT-SELECT parse into target table
       3) TRUNCATE the staging table
 
     S3 paths produced by ingest:
-      - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
+      - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json[.gz]
       - s3://<bucket>/raw/manifests/polygon_options_manifest_latest.txt
+
+    Assumes a Snowflake external stage pointing at s3://<bucket>/raw/
+    and a storage integration with permissions limited to /raw/.
     """
 
     # --- Resolve Snowflake context from connection extras ---
@@ -54,7 +58,7 @@ def polygon_options_load_dag():
             "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
         )
 
-    # Optional overrides
+    # Optional overrides (kept consistent with your environment)
     STAGE_NAME = x.get("stage", "s3_stage")  # same stage used for stocks/options
     OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")
     OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")
@@ -98,8 +102,9 @@ def polygon_options_load_dag():
         """
         Read manifest and convert absolute S3 keys (starting with 'raw/') to
         stage-relative paths for a stage rooted at s3://.../raw/.
+        Also filter to options-only files.
         """
-        s3 = S3Hook()
+        s3 = S3Hook()  # rely on default AWS creds chain
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
             raise AirflowSkipException(f"Manifest not found at s3://{BUCKET_NAME}/{manifest_key}")
@@ -121,6 +126,10 @@ def polygon_options_load_dag():
 
     @task
     def copy_raw_into_staging(stage_relative_keys: List[str]) -> int:
+        """
+        COPY the specified files from the external stage into the VARIANT staging table.
+        Handles .json and .json.gz (COMPRESSION=AUTO).
+        """
         if not stage_relative_keys:
             raise AirflowSkipException("No S3 keys provided to loader.")
 
@@ -139,7 +148,7 @@ def polygon_options_load_dag():
             COPY INTO {FQ_STAGE_TABLE} (rec)
             FROM {FQ_STAGE}
             FILES = ({files_clause})
-            FILE_FORMAT = (TYPE = 'JSON')
+            FILE_FORMAT = (TYPE = 'JSON')  -- Snowflake auto-detects gzip via COMPRESSION=AUTO
             ON_ERROR = 'ABORT_STATEMENT'
             FORCE = FALSE;
             """
@@ -151,10 +160,12 @@ def polygon_options_load_dag():
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
         """
-        Robust parsing of Polygon option symbols like:
+        Parse Polygon option symbols like:
           O:MSFT261218P00505000
           O:AAPL260103C00150000
+
         Pattern: O:<UNDERLYING><YYMMDD><C|P><STRIKE(8 digits)>
+        Uses capture groups (REGEXP_SUBSTR with 'c' and group index) to avoid lookbehind.
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -163,54 +174,52 @@ def polygon_options_load_dag():
             option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
             open, high, low, close, volume, vwap, transactions
         )
-        WITH src AS (
-          SELECT
-            rec,
-            TRIM(TO_VARCHAR(rec:ticker)) AS sym,
-            /* First (and only) bar */
-            rec:results[0] AS bar
-          FROM {FQ_STAGE_TABLE}
-        )
         SELECT
-          sym AS option_symbol,
+            sym AS option_symbol,
 
-          /* trade_date from ms epoch */
-          TO_DATE(TO_TIMESTAMP_NTZ( (bar:t)::NUMBER / 1000 ))                                   AS trade_date,
+            /* trade_date from ms epoch in the first result bar */
+            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))             AS trade_date,
 
-          /* UNDERLYING: everything after 'O:' up to the 6-digit date */
-          REGEXP_REPLACE(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}$', '\\\\1')             AS underlying_ticker,
+            /* UNDERLYING: capture group 1 from full pattern */
+            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}$', 1, 1, 'c', 1)
+                AS underlying_ticker,
 
-          /* EXPIRATION: 6 digits after underlying → YYMMDD */
-          TO_DATE(
-            REGEXP_REPLACE(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}$', '\\\\1'),
-            'YYMMDD'
-          )                                                                                     AS expiration_date,
+            /* EXPIRATION: capture YYMMDD as group 1, then TO_DATE('YYMMDD') */
+            TO_DATE(
+              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}$', 1, 1, 'c', 1),
+              'YYMMDD'
+            )                                                                           AS expiration_date,
 
-          /* STRIKE: last 8 digits ÷ 1000 */
-          TRY_TO_NUMBER(REGEXP_REPLACE(sym, '^.*(\\d{{8}})$', '\\\\1')) / 1000                  AS strike_price,
+            /* STRIKE: final 8 digits (group 1) / 1000 */
+            TRY_TO_NUMBER(
+              REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)
+            ) / 1000                                                                    AS strike_price,
 
-          /* TYPE: the single C/P right after the date */
-          CASE
-            WHEN REGEXP_INSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}C\\d{{8}}$') > 0 THEN 'call'
-            WHEN REGEXP_INSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}P\\d{{8}}$') > 0 THEN 'put'
-            ELSE NULL
-          END                                                                                   AS option_type,
+            /* TYPE: capture C/P as group 1 and map to call/put */
+            CASE REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}$', 1, 1, 'c', 1)
+              WHEN 'C' THEN 'call'
+              WHEN 'P' THEN 'put'
+            END                                                                           AS option_type,
 
-          /* OHLCV from the first bar */
-          bar:o::FLOAT  AS open,
-          bar:h::FLOAT  AS high,
-          bar:l::FLOAT  AS low,
-          bar:c::FLOAT  AS close,
-          bar:v::BIGINT AS volume,
-          bar:vw::FLOAT AS vwap,
-          bar:n::BIGINT AS transactions
-        FROM src;
+            rec:results[0]:o::FLOAT  AS open,
+            rec:results[0]:h::FLOAT  AS high,
+            rec:results[0]:l::FLOAT  AS low,
+            rec:results[0]:c::FLOAT  AS close,
+            rec:results[0]:v::BIGINT AS volume,
+            rec:results[0]:vw::FLOAT AS vwap,
+            rec:results[0]:n::BIGINT AS transactions
+        FROM (
+            SELECT
+                rec,
+                TO_VARCHAR(rec:ticker) AS sym
+            FROM {FQ_STAGE_TABLE}
+        )
+        WHERE sym LIKE 'O:%';
         """
         hook.run(insert_sql)
 
         cnt = hook.get_first(f"SELECT COUNT(*) FROM {FQ_STAGE_TABLE}")[0] or 0
         return int(cnt)
-
 
     @task
     def cleanup_staging(_inserted: int) -> None:
