@@ -27,17 +27,17 @@ END;
 -- ----------------------------
 -- Optional: clear other raw tables if needed
 -- ----------------------------
--- BEGIN
---     EXECUTE IMMEDIATE $$
---         BEGIN
---             IF (EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES
---                         WHERE TABLE_SCHEMA = 'PUBLIC'
---                           AND TABLE_NAME = 'SOURCE_POLYGON_STOCK_BARS_DAILY')) THEN
---                 TRUNCATE TABLE PUBLIC.SOURCE_POLYGON_STOCK_BARS_DAILY;
---             END IF;
---         END;
---     $$;
--- END;
+BEGIN
+    EXECUTE IMMEDIATE $$
+        BEGIN
+            IF (EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = 'PUBLIC'
+                          AND TABLE_NAME = 'SOURCE_POLYGON_STOCK_BARS_DAILY')) THEN
+                TRUNCATE TABLE PUBLIC.SOURCE_POLYGON_STOCK_BARS_DAILY;
+            END IF;
+        END;
+    $$;
+END;
 
 -- Done
 SELECT '✅ Snowflake raw tables reset complete.' AS status;
