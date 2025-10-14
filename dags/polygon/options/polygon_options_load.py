@@ -18,13 +18,9 @@ from dags.utils.polygon_datasets import (
 # -----------------------------
 # Config
 # -----------------------------
-# Option B: rely on default AWS creds chain (mounted ~/.aws) → no aws_conn_id
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
-
-# Batch size for FILES=() COPY (avoid overly-long SQL statements)
 COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
-
 
 @dag(
     dag_id="polygon_options_load",
@@ -41,7 +37,7 @@ def polygon_options_load_dag():
       2) INSERT-SELECT parse into target table
       3) TRUNCATE the staging table
 
-    S3 paths expected (from ingest):
+    S3 paths produced by ingest:
       - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
       - s3://<bucket>/raw/manifests/polygon_options_manifest_latest.txt
     """
@@ -58,22 +54,21 @@ def polygon_options_load_dag():
             "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
         )
 
-    # Optional overrides (provide via connection extra if you like)
-    STAGE_NAME = x.get("stage", "s3_stage")  # same stage name across stocks/options by default
+    # Optional overrides
+    STAGE_NAME = x.get("stage", "s3_stage")  # same stage used for stocks/options
     OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")
     OPTIONS_STAGE_TABLE = x.get("options_stage_table", "stg_polygon_options_raw")
 
-    FULLY_QUALIFIED_TABLE_NAME = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
-    FULLY_QUALIFIED_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
-    FULLY_QUALIFIED_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
+    FQ_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
+    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
 
     @task
     def create_tables():
-        """Create the target and staging tables if they don't exist."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
         ddl_target = f"""
-        CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_TABLE_NAME} (
+        CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             option_symbol TEXT,
             trade_date DATE,
             underlying_ticker TEXT,
@@ -92,9 +87,7 @@ def polygon_options_load_dag():
         """
 
         ddl_stage = f"""
-        CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_STAGE_TABLE} (
-            rec VARIANT
-        );
+        CREATE TABLE IF NOT EXISTS {FQ_STAGE_TABLE} ( rec VARIANT );
         """
 
         hook.run(ddl_target)
@@ -103,46 +96,52 @@ def polygon_options_load_dag():
     @task
     def get_s3_keys_from_manifest() -> List[str]:
         """
-        Reads the options manifest file from S3 to get the list of JSON files produced by the ingest DAG.
+        Read manifest and convert absolute S3 keys (starting with 'raw/') to
+        stage-relative paths for a stage rooted at s3://.../raw/.
         """
-        s3 = S3Hook()  # no aws_conn_id → use default AWS creds chain
+        s3 = S3Hook()
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
             raise AirflowSkipException(f"Manifest not found at s3://{BUCKET_NAME}/{manifest_key}")
 
-        manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME)
-        s3_keys = [k.strip() for k in (manifest_content or "").splitlines() if k.strip()]
-
-        if not s3_keys:
+        manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME) or ""
+        raw_keys = [k.strip() for k in manifest_content.splitlines() if k.strip()]
+        if not raw_keys:
             raise AirflowSkipException("Manifest is empty. No new files to process.")
 
-        return s3_keys
+        # Convert to stage-relative (strip leading 'raw/')
+        rel_keys = [k[4:] if k.startswith("raw/") else k for k in raw_keys]
+
+        # Keep only options files (avoid accidental stocks loads)
+        rel_keys = [k for k in rel_keys if k.startswith("options/")]
+
+        if not rel_keys:
+            raise AirflowSkipException("No eligible options files found in manifest after normalization.")
+        return rel_keys
 
     @task
-    def copy_raw_into_staging(s3_keys: List[str]) -> int:
-        """
-        COPY raw JSON into the VARIANT staging table.
-        We avoid COPY transformations entirely here (no SELECT), which is robust.
-        """
-        if not s3_keys:
+    def copy_raw_into_staging(stage_relative_keys: List[str]) -> int:
+        if not stage_relative_keys:
             raise AirflowSkipException("No S3 keys provided to loader.")
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
-        # Ensure staging table is empty for this run (optional but clean)
-        hook.run(f"TRUNCATE TABLE {FULLY_QUALIFIED_STAGE_TABLE};")
+        # Clean slate per run (optional but tidy)
+        hook.run(f"TRUNCATE TABLE {FQ_STAGE_TABLE};")
 
-        total = len(s3_keys)
+        total = len(stage_relative_keys)
         loaded = 0
         for i in range(0, total, COPY_BATCH_SIZE):
-            batch = s3_keys[i : i + COPY_BATCH_SIZE]
+            batch = stage_relative_keys[i : i + COPY_BATCH_SIZE]
             files_clause = ", ".join(f"'{k}'" for k in batch)
 
             copy_sql = f"""
-            COPY INTO {FULLY_QUALIFIED_STAGE_TABLE} (rec)
-            FROM {FULLY_QUALIFIED_STAGE}
+            COPY INTO {FQ_STAGE_TABLE} (rec)
+            FROM {FQ_STAGE}
             FILES = ({files_clause})
-            FILE_FORMAT = (TYPE = 'JSON');
+            FILE_FORMAT = (TYPE = 'JSON')
+            ON_ERROR = 'ABORT_STATEMENT'
+            FORCE = FALSE;
             """
             hook.run(copy_sql)
             loaded += len(batch)
@@ -151,43 +150,20 @@ def polygon_options_load_dag():
 
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
-        """
-        Parse from staging and insert into the target table.
-        - trade_date is derived from rec:results[0]:t (ms epoch)
-        - underlying/expiration/type/strike parsed from the symbol text
-        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
         insert_sql = f"""
-        INSERT INTO {FULLY_QUALIFIED_TABLE_NAME} (
+        INSERT INTO {FQ_TABLE} (
             option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
             open, high, low, close, volume, vwap, transactions
         )
         SELECT
             sym                                                                 AS option_symbol,
-
-            /* trade_date from ms epoch in the first result bar */
             TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))      AS trade_date,
-
-            /* UNDERLYING immediately after 'O:' */
-            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)        AS underlying_ticker,
-
-            /* EXPIRATION: YYMMDD right after underlying */
-            TO_DATE(
-              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1),
-              'YYMMDD'
-            )                                                                               AS expiration_date,
-
-            /* STRIKE: last 8 digits, then /1000 */
-            TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000            AS strike_price,
-
-            /* TYPE: single C/P right after expiration */
-            IFF(
-              REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C',
-              'call',
-              'put'
-            )                                                                               AS option_type,
-
+            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)  AS underlying_ticker,
+            TO_DATE(REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1), 'YYMMDD') AS expiration_date,
+            TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000 AS strike_price,
+            IFF(REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C', 'call', 'put') AS option_type,
             rec:results[0]:o::FLOAT AS open,
             rec:results[0]:h::FLOAT AS high,
             rec:results[0]:l::FLOAT AS low,
@@ -196,31 +172,25 @@ def polygon_options_load_dag():
             rec:results[0]:vw::FLOAT AS vwap,
             rec:results[0]:n::BIGINT AS transactions
         FROM (
-            SELECT
-                rec,
-                TO_VARCHAR(rec:ticker) AS sym
-            FROM {FULLY_QUALIFIED_STAGE_TABLE}
+            SELECT rec, TO_VARCHAR(rec:ticker) AS sym
+            FROM {FQ_STAGE_TABLE}
         );
         """
-
         hook.run(insert_sql)
 
-        # Optionally return how many staging rows we processed
-        cnt = hook.get_first(f"SELECT COUNT(*) FROM {FULLY_QUALIFIED_STAGE_TABLE}")[0] or 0
+        cnt = hook.get_first(f"SELECT COUNT(*) FROM {FQ_STAGE_TABLE}")[0] or 0
         return int(cnt)
 
     @task
     def cleanup_staging(_inserted: int) -> None:
-        """Truncate staging to keep it clean between runs."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(f"TRUNCATE TABLE {FULLY_QUALIFIED_STAGE_TABLE};")
+        hook.run(f"TRUNCATE TABLE {FQ_STAGE_TABLE};")
 
     # Flow
     _ = create_tables()
-    s3_keys = get_s3_keys_from_manifest()
-    rows_to_stage = copy_raw_into_staging(s3_keys)
+    rel_keys = get_s3_keys_from_manifest()
+    rows_to_stage = copy_raw_into_staging(rel_keys)
     inserted = insert_from_staging_to_target(rows_to_stage)
     cleanup_staging(inserted)
-
 
 polygon_options_load_dag()
