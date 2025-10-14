@@ -150,6 +150,12 @@ def polygon_options_load_dag():
 
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
+        """
+        Robust parsing of Polygon option symbols like:
+          O:MSFT261218P00505000
+          O:AAPL260103C00150000
+        Pattern: O:<UNDERLYING><YYMMDD><C|P><STRIKE(8 digits)>
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
         insert_sql = f"""
@@ -157,29 +163,54 @@ def polygon_options_load_dag():
             option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
             open, high, low, close, volume, vwap, transactions
         )
+        WITH src AS (
+          SELECT
+            rec,
+            TRIM(TO_VARCHAR(rec:ticker)) AS sym,
+            /* First (and only) bar */
+            rec:results[0] AS bar
+          FROM {FQ_STAGE_TABLE}
+        )
         SELECT
-            sym                                                                 AS option_symbol,
-            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))      AS trade_date,
-            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)  AS underlying_ticker,
-            TO_DATE(REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1), 'YYMMDD') AS expiration_date,
-            TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000 AS strike_price,
-            IFF(REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C', 'call', 'put') AS option_type,
-            rec:results[0]:o::FLOAT AS open,
-            rec:results[0]:h::FLOAT AS high,
-            rec:results[0]:l::FLOAT AS low,
-            rec:results[0]:c::FLOAT AS close,
-            rec:results[0]:v::BIGINT AS volume,
-            rec:results[0]:vw::FLOAT AS vwap,
-            rec:results[0]:n::BIGINT AS transactions
-        FROM (
-            SELECT rec, TO_VARCHAR(rec:ticker) AS sym
-            FROM {FQ_STAGE_TABLE}
-        );
+          sym AS option_symbol,
+
+          /* trade_date from ms epoch */
+          TO_DATE(TO_TIMESTAMP_NTZ( (bar:t)::NUMBER / 1000 ))                                   AS trade_date,
+
+          /* UNDERLYING: everything after 'O:' up to the 6-digit date */
+          REGEXP_REPLACE(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}$', '\\\\1')             AS underlying_ticker,
+
+          /* EXPIRATION: 6 digits after underlying → YYMMDD */
+          TO_DATE(
+            REGEXP_REPLACE(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}$', '\\\\1'),
+            'YYMMDD'
+          )                                                                                     AS expiration_date,
+
+          /* STRIKE: last 8 digits ÷ 1000 */
+          TRY_TO_NUMBER(REGEXP_REPLACE(sym, '^.*(\\d{{8}})$', '\\\\1')) / 1000                  AS strike_price,
+
+          /* TYPE: the single C/P right after the date */
+          CASE
+            WHEN REGEXP_INSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}C\\d{{8}}$') > 0 THEN 'call'
+            WHEN REGEXP_INSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}P\\d{{8}}$') > 0 THEN 'put'
+            ELSE NULL
+          END                                                                                   AS option_type,
+
+          /* OHLCV from the first bar */
+          bar:o::FLOAT  AS open,
+          bar:h::FLOAT  AS high,
+          bar:l::FLOAT  AS low,
+          bar:c::FLOAT  AS close,
+          bar:v::BIGINT AS volume,
+          bar:vw::FLOAT AS vwap,
+          bar:n::BIGINT AS transactions
+        FROM src;
         """
         hook.run(insert_sql)
 
         cnt = hook.get_first(f"SELECT COUNT(*) FROM {FQ_STAGE_TABLE}")[0] or 0
         return int(cnt)
+
 
     @task
     def cleanup_staging(_inserted: int) -> None:
