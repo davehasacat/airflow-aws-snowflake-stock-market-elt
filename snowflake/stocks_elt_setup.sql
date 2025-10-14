@@ -1,67 +1,108 @@
 -- ====================================================================
--- Snowflake Setup for Stock and Options ELT Project
+-- Snowflake Setup for Stock & Options ELT (Idempotent)
 -- ====================================================================
--- This script is idempotent and can be run multiple times safely.
+-- AWS S3 Integration:
+--   Bucket: s3://stock-market-elt/raw/
+--   Region: us-east-2
+--   IAM Role: arn:aws:iam::586159464756:role/SnowflakeS3Role
+-- ====================================================================
 
--- WAREHOUSE CREATION
+USE ROLE ACCOUNTADMIN;
+
+-- ------------------
+-- Warehouses
 -- ------------------
 CREATE WAREHOUSE IF NOT EXISTS STOCKS_ELT_WH
-  WAREHOUSE_SIZE = 'SMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
+  WAREHOUSE_SIZE = SMALL
+  AUTO_SUSPEND   = 60
+  AUTO_RESUME    = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'Primary ELT compute for stocks/options ingestion & transforms';
 
 CREATE WAREHOUSE IF NOT EXISTS STOCKS_DASHBOARD_WH
-  WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
+  WAREHOUSE_SIZE = XSMALL
+  AUTO_SUSPEND   = 60
+  AUTO_RESUME    = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'BI/analytics/dashboard compute';
 
+-- ------------------
+-- Database & Schema
+-- ------------------
+CREATE DATABASE IF NOT EXISTS STOCKS_ELT_DB COMMENT = 'Dev database for stocks/options ELT';
+CREATE SCHEMA IF NOT EXISTS STOCKS_ELT_DB.PUBLIC COMMENT = 'Default schema for ELT objects';
 
--- DATABASE, SCHEMA, and ROLE CREATION
--- -----------------------------------
-CREATE DATABASE IF NOT EXISTS STOCKS_ELT_DB;
-CREATE SCHEMA IF NOT EXISTS STOCKS_ELT_DB.PUBLIC;
-CREATE ROLE IF NOT EXISTS STOCKS_ELT_ROLE;
+-- ------------------
+-- Role
+-- ------------------
+CREATE ROLE IF NOT EXISTS STOCKS_ELT_ROLE COMMENT = 'Service role for Airflow/dbt running the ELT';
 
-
--- STORAGE INTEGRATION CREATION
--- ----------------------------
--- This object creates the secure link between Snowflake and your AWS IAM Role.
--- !! IMPORTANT !! -> Replace 'AWS_ACCOUNT_ID' with your AWS_ACCOUNT_ID.
-CREATE OR REPLACE STORAGE INTEGRATION s3_integration
+-- ------------------
+-- Storage Integration
+-- ------------------
+CREATE OR REPLACE STORAGE INTEGRATION S3_INTEGRATION
   TYPE = EXTERNAL_STAGE
-  STORAGE_PROVIDER = 'S3'
+  STORAGE_PROVIDER = S3
   ENABLED = TRUE
-  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::AWS_ACCOUNT_ID:role/SnowflakeS3Role'
-  STORAGE_ALLOWED_LOCATIONS = ('s3://stock-market-elt/');
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::586159464756:role/SnowflakeS3Role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://stock-market-elt/raw/')
+  COMMENT = 'Integration between Snowflake and S3 for ELT data (scoped to /raw folder)';
 
+-- ------------------
+-- File Formats
+-- ------------------
+CREATE OR REPLACE FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_JSON
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE
+  COMMENT = 'Default JSON format for Polygon & other API payloads';
 
--- STAGE CREATION
--- --------------
--- This command creates the Stage object that references the Storage Integration.
-CREATE OR REPLACE STAGE STOCKS_ELT_DB.PUBLIC.s3_stage
-  STORAGE_INTEGRATION = s3_integration
-  URL = 's3://stock-market-elt/'
-  FILE_FORMAT = (TYPE = 'JSON');
+CREATE OR REPLACE FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_CSV
+  TYPE = CSV
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  SKIP_HEADER = 1
+  NULL_IF = ('', 'NULL', 'null')
+  EMPTY_FIELD_AS_NULL = TRUE
+  COMMENT = 'CSV loader (headers in row 1)';
 
+-- ------------------
+-- Stage
+-- ------------------
+CREATE OR REPLACE STAGE STOCKS_ELT_DB.PUBLIC.S3_STAGE
+  STORAGE_INTEGRATION = S3_INTEGRATION
+  URL = 's3://stock-market-elt/raw/'
+  FILE_FORMAT = STOCKS_ELT_DB.PUBLIC.FF_JSON
+  COMMENT = 'Stage for ELT raw data ingestion (restricted to /raw prefix)';
 
--- PERMISSION GRANTING
--- -------------------
--- Grant all necessary privileges to the custom role in logical order.
+-- ------------------
+-- Privileges
+-- ------------------
+GRANT USAGE, OPERATE ON WAREHOUSE STOCKS_ELT_WH       TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE, OPERATE ON WAREHOUSE STOCKS_DASHBOARD_WH TO ROLE STOCKS_ELT_ROLE;
 
--- 1. Grant usage on warehouses
-GRANT USAGE ON WAREHOUSE STOCKS_ELT_WH TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE ON WAREHOUSE STOCKS_DASHBOARD_WH TO ROLE STOCKS_ELT_ROLE;
-
--- 2. Grant usage on the database and schema
 GRANT USAGE ON DATABASE STOCKS_ELT_DB TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE ON SCHEMA   STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
 
--- 3. Grant usage on the Storage Integration and Stage
-GRANT USAGE ON INTEGRATION s3_integration TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE ON STAGE STOCKS_ELT_DB.PUBLIC.s3_stage TO ROLE STOCKS_ELT_ROLE;
+GRANT CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT,
+      CREATE PIPE, CREATE FUNCTION, CREATE PROCEDURE
+  ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
 
--- 4. Grant permissions for the role to create objects within the schema
+GRANT USAGE ON INTEGRATION S3_INTEGRATION                TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE ON STAGE       STOCKS_ELT_DB.PUBLIC.S3_STAGE TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE ON FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_JSON  TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE ON FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_CSV   TO ROLE STOCKS_ELT_ROLE;
+
 GRANT ALL PRIVILEGES ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
 
+-- Auto-grants for future objects (keeps dbt + Airflow smooth)
+GRANT SELECT, INSERT, UPDATE, DELETE ON FUTURE TABLES    IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+GRANT SELECT                          ON FUTURE VIEWS     IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE                           ON FUTURE STAGES    IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+GRANT USAGE                           ON FUTURE FILE FORMATS IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
 
--- ROLE ASSIGNMENT
--- ---------------
--- Assign the custom role to your specific Snowflake user.
--- !! IMPORTANT !! -> Replace 'DAVEHASACAT' with your actual username if different.
+-- ------------------
+-- Assign Role
+-- ------------------
 GRANT ROLE STOCKS_ELT_ROLE TO USER DAVEHASACAT;
+-- Optional defaults:
+-- ALTER USER DAVEHASACAT SET DEFAULT_ROLE = STOCKS_ELT_ROLE;
+-- ALTER USER DAVEHASACAT SET DEFAULT_WAREHOUSE = STOCKS_ELT_WH;
