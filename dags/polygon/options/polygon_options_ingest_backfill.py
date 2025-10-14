@@ -15,7 +15,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.operators.python import get_current_context
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.models import Variable  # <-- NEW: read from Secrets Manager via Variables
+from airflow.models import Variable  # Secrets Manager-backed Variables
 
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
@@ -25,13 +25,12 @@ from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
-S3_CONN_ID = os.getenv("S3_CONN_ID", "aws_default")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (manual)")
-API_POOL = "api_pool"  # defined in airflow_settings.yaml
+API_POOL = "api_pool"  # ensure the pool exists or remove this
 
 # Rate limiting / batching
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.5"))
@@ -96,7 +95,7 @@ def polygon_options_ingest_backfill_dag():
       1) Discover option contracts for seed underlyings (via /v3/reference/options/contracts)
       2) Batch symbols to respect mapping limits and API rate limits
       3) For each symbol, pull aggregates over the date range (/v2/aggs/ticker/.../range/1/day)
-      4) Write one JSON per (contract, trading day) to S3
+      4) Write one JSON per (contract, trading day) to S3 under raw/
       5) Write manifest to trigger downstream load
     """
 
@@ -148,7 +147,7 @@ def polygon_options_ingest_backfill_dag():
     def process_symbol_batch_backfill(symbol_batch: List[str]) -> List[str]:
         """
         Fetch historical aggregates for each symbol over the date range in params.
-        Write one JSON file per (symbol, trading day).
+        Write one JSON file per (symbol, trading day) to s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
         """
         ctx = get_current_context()
         start_date = ctx["params"]["start_date"]
@@ -164,7 +163,7 @@ def polygon_options_ingest_backfill_dag():
             raise ValueError("start_date cannot be after end_date.")
 
         api_key = _get_polygon_options_key()
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
+        s3 = S3Hook()  # Option B: rely on default AWS creds (mounted ~/.aws), no Airflow connection lookup
 
         processed_keys: List[str] = []
         for option_symbol in symbol_batch:
@@ -183,13 +182,14 @@ def polygon_options_ingest_backfill_dag():
                 results = data.get("results") or []
                 if results:
                     for bar in results:
-                        trade_date = pendulum.from_timestamp(bar["t"] / 1000).to_date_string()
+                        trade_date = pendulum.from_timestamp(bar["t"] / 1000, tz="UTC").to_date_string()
                         payload = {
                             "ticker": data.get("ticker", option_symbol),
                             "resultsCount": 1,
                             "results": [bar],
                         }
-                        s3_key = f"raw_data/options/{option_symbol}_{trade_date}.json"
+                        # Write under raw/options/<symbol>/<YYYY-MM-DD>.json
+                        s3_key = f"raw/options/{option_symbol}/{trade_date}.json"
                         s3.load_string(json.dumps(payload), key=s3_key, bucket_name=BUCKET_NAME, replace=True)
                         processed_keys.append(s3_key)
 
@@ -214,8 +214,8 @@ def polygon_options_ingest_backfill_dag():
         if not keys:
             raise AirflowSkipException("No S3 keys were processed during the options backfill.")
 
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/polygon_options_manifest_latest.txt"
+        s3 = S3Hook()  # Option B
+        manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
         s3.load_string("\n".join(keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
         print(f"Backfill manifest created with {len(keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 

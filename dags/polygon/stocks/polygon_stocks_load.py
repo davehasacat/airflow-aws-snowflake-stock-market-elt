@@ -7,7 +7,7 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
-from airflow.hooks.base import BaseHook  # <-- NEW: read extras from conn
+from airflow.hooks.base import BaseHook  # read extras from conn
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_STOCKS_RAW_DATASET
 
@@ -21,9 +21,9 @@ from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_ST
     dagrun_timeout=timedelta(hours=2),
 )
 def polygon_stocks_load_dag():
-    S3_CONN_ID = "aws_default"
+    # Option B: rely on default AWS credentials chain (no aws_conn_id)
     SNOWFLAKE_CONN_ID = "snowflake_default"
-    BUCKET_NAME = os.getenv("BUCKET_NAME")
+    BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 
     # --- Resolve Snowflake context from the Airflow connection (Secrets-backed) ---
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
@@ -60,10 +60,10 @@ def polygon_stocks_load_dag():
 
     @task
     def get_s3_keys_from_manifest() -> list[str]:
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/manifest_latest.txt"
+        s3 = S3Hook()  # no aws_conn_id → uses default ~/.aws creds
+        manifest_key = "raw/manifests/manifest_latest.txt"
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
-            raise FileNotFoundError(f"Manifest file not found: {manifest_key}")
+            raise FileNotFoundError(f"Manifest file not found at s3://{BUCKET_NAME}/{manifest_key}")
         manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME)
         s3_keys = [k for k in (manifest_content or "").strip().splitlines() if k]
         if not s3_keys:

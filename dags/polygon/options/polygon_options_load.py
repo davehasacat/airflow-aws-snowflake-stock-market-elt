@@ -8,7 +8,7 @@ from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-from airflow.hooks.base import BaseHook  # <-- NEW
+from airflow.hooks.base import BaseHook  # resolve Snowflake extras
 
 from dags.utils.polygon_datasets import (
     S3_OPTIONS_MANIFEST_DATASET,
@@ -18,7 +18,7 @@ from dags.utils.polygon_datasets import (
 # -----------------------------
 # Config
 # -----------------------------
-S3_CONN_ID = os.getenv("S3_CONN_ID", "aws_default")           # align with ingest
+# Option B: rely on default AWS creds chain (mounted ~/.aws) → no aws_conn_id
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
 
@@ -40,6 +40,10 @@ def polygon_options_load_dag():
       1) COPY raw JSON into a VARIANT staging table (no transformation in COPY)
       2) INSERT-SELECT parse into target table
       3) TRUNCATE the staging table
+
+    S3 paths expected (from ingest):
+      - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
+      - s3://<bucket>/raw/manifests/polygon_options_manifest_latest.txt
     """
 
     # --- Resolve Snowflake context from connection extras ---
@@ -101,8 +105,8 @@ def polygon_options_load_dag():
         """
         Reads the options manifest file from S3 to get the list of JSON files produced by the ingest DAG.
         """
-        s3 = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/polygon_options_manifest_latest.txt"
+        s3 = S3Hook()  # no aws_conn_id → use default AWS creds chain
+        manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
             raise AirflowSkipException(f"Manifest not found at s3://{BUCKET_NAME}/{manifest_key}")
 

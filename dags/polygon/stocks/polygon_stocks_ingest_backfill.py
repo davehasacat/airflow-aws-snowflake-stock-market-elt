@@ -8,7 +8,7 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
-from airflow.models import Variable  # <-- read from Secrets Manager via Variables
+from airflow.models import Variable  # read from Secrets Manager via Variables
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
@@ -46,9 +46,12 @@ def polygon_stocks_ingest_backfill_dag():
     """
     Backfills daily grouped OHLCV from Polygon for a date range,
     filtering to the tickers in dbt/seeds/custom_tickers.csv.
+
+    S3 writes:
+      - raw/stocks/{TICKER}/{YYYY-MM-DD}.json
+      - raw/manifests/manifest_latest.txt
     """
-    S3_CONN_ID = "aws_default"
-    BUCKET_NAME = os.getenv("BUCKET_NAME")
+    BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: 'stock-market-elt'
     DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
     @task
@@ -79,7 +82,8 @@ def polygon_stocks_ingest_backfill_dag():
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
     def process_date(target_date: str, custom_tickers: list[str]) -> list[str]:
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+        # Option B: rely on default AWS credentials chain mounted into container
+        s3_hook = S3Hook()  # no aws_conn_id → uses ~/.aws creds
         api_key = _get_polygon_stocks_key()
 
         custom_tickers_set = set(custom_tickers)
@@ -121,7 +125,8 @@ def polygon_stocks_ingest_backfill_dag():
                         "status": "OK",
                         "request_id": data.get("request_id"),
                     }
-                    s3_key = f"raw_data/{ticker}_{target_date}.json"
+                    # Write under raw/… so: s3://<bucket>/raw/stocks/<ticker>/<date>.json
+                    s3_key = f"raw/stocks/{ticker}/{target_date}.json"
                     s3_hook.load_string(
                         string_data=json.dumps(formatted_result),
                         key=s3_key,
@@ -141,10 +146,11 @@ def polygon_stocks_ingest_backfill_dag():
         if not s3_keys:
             raise AirflowSkipException("No S3 keys were processed during the backfill.")
         manifest_content = "\n".join(s3_keys)
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        manifest_key = "manifests/manifest_latest.txt"
+        # Option B: rely on default AWS credentials chain
+        s3_hook = S3Hook()
+        manifest_key = "raw/manifests/manifest_latest.txt"
         s3_hook.load_string(string_data=manifest_content, key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
-        print(f"Backfill manifest file created: {manifest_key}")
+        print(f"Backfill manifest file created: s3://{BUCKET_NAME}/{manifest_key}")
 
     # Flow
     custom_tickers = get_custom_tickers()
