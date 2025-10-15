@@ -24,7 +24,7 @@ from airflow.models import Variable  # Secrets Manager-backed Variables
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Config (env-driven; override in your runtime env)
+# Config / Constants
 # ────────────────────────────────────────────────────────────────────────────────
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
@@ -34,16 +34,14 @@ DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (manual)")
-API_POOL = os.getenv("API_POOL", "api_pool")  # must exist in Airflow → Admin → Pools
+API_POOL = os.getenv("API_POOL", "api_pool")  # ensure this pool exists (airflow_settings.yaml)
 
-# Backfill tuning knobs
-REQUEST_DELAY_SECONDS       = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.35"))  # API pacing
-CONTRACTS_BATCH_SIZE        = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "250"))     # per (ticker,date)
-MAP_CHUNK_SIZE              = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))          # cap map fan-out
-REPLACE_FILES               = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"   # default: skip existing
-DAGRUN_TIMEOUT_HOURS        = int(os.getenv("BACKFILL_DAGRUN_TIMEOUT_HOURS", "72"))      # long backfills
-CHUNK_EXEC_TIMEOUT_HOURS    = int(os.getenv("BACKFILL_CHUNK_EXEC_TIMEOUT_HOURS", "2"))   # guardrail per chunk
-BACKFILL_DAG_CONCURRENCY    = int(os.getenv("BACKFILL_DAG_CONCURRENCY", "16"))           # max active tasks in DAG
+# Rate limiting / batching
+REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
+CONTRACTS_BATCH_SIZE = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "300"))
+REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"  # default: skip existing
+# New: cap dynamic mapping fan-out by chunking specs before processing
+MAP_CHUNK_SIZE = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -144,20 +142,19 @@ def _batch(lst: List[str], n: int) -> List[List[str]]:
         "start_date": Param(default="2023-10-01", type="string", description="Backfill start date (YYYY-MM-DD)"),
         "end_date":   Param(default="2025-10-01", type="string", description="Backfill end date (YYYY-MM-DD)"),
     },
-    dagrun_timeout=pendulum.duration(hours=DAGRUN_TIMEOUT_HOURS),
+    dagrun_timeout=timedelta(hours=36),
     max_active_runs=1,
-    concurrency=BACKFILL_DAG_CONCURRENCY,  # per-DAG task cap
 )
 def polygon_options_ingest_backfill_dag():
     """
-    Backfill flow:
-      - Build flat (ticker, date) pairs → map over pairs
+    Optimized backfill:
+      - Build flat (ticker, date) pairs → map over pairs (no nested mapping)
       - Discover contracts per pair
       - Batch contracts per pair
-      - Flatten + CHUNK batch-specs to avoid Airflow's max map length
-      - Process each chunk in one task (loop internally; pooled HTTP; gzip; skip-if-exists)
-      - Emit a single manifest of all written keys
-      - Raw-in/raw-out (no parsing)
+      - Flatten + CHUNK batch-specs to avoid max map length
+      - Process each chunk in one task (loop internally)
+      - Write a single manifest of all written keys
+      - Raw-in/raw-out, no parsing
     """
 
     @task
@@ -192,12 +189,19 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def make_pairs(underlyings: List[str], trading_days: List[str]) -> List[Dict[str, str]]:
-        """Flat list of {'ticker': T, 'target_date': D} dicts."""
-        return [{"ticker": t, "target_date": d} for d in trading_days for t in underlyings]
+        """Produce a flat list of {'ticker': T, 'target_date': D} dicts."""
+        pairs: List[Dict[str, str]] = []
+        for d in trading_days:
+            for t in underlyings:
+                pairs.append({"ticker": t, "target_date": d})
+        return pairs
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
     def discover_for_pair(pair: Dict[str, str]) -> Dict[str, Any]:
-        """Discover contracts for (ticker, target_date) → {'target_date', 'contracts': [...]}."""
+        """
+        Discover contracts for (ticker, target_date).
+        Returns: {'target_date': <date>, 'contracts': [tickers...]}
+        """
         ticker = pair["ticker"]
         target_date = pair["target_date"]
         api_key = _get_polygon_options_key()
@@ -236,39 +240,40 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def batch_contracts_for_pair(discovery: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Discovery → list of batch-specs: [{'target_date': D, 'contract_batch': [...]}, ...]."""
+        """
+        Turn discovery -> list of batch-spec dicts:
+          [{'target_date': D, 'contract_batch': [c1, c2, ...]}, ...]
+        """
         target_date = discovery["target_date"]
         contracts: List[str] = discovery.get("contracts") or []
         if not contracts:
             return []
-        return [{"target_date": target_date, "contract_batch": b}
-                for b in _batch(contracts, CONTRACTS_BATCH_SIZE)]
+        batches = _batch(contracts, CONTRACTS_BATCH_SIZE)
+        return [{"target_date": target_date, "contract_batch": b} for b in batches]
 
     @task
     def flatten_batch_specs(nested: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """Flatten list[list[dict]] → list[dict]."""
+        """Flatten list[list[dict]] → list[dict] for chunking."""
         return [d for sub in (nested or []) for d in (sub or [])]
 
     @task
     def chunk_batch_specs(batch_specs: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-        """Chunk the flat list of batch-specs to keep mapped items under limits."""
+        """
+        Chunk the flat list of batch-specs to avoid exceeding Airflow's max map length.
+        """
         if not batch_specs:
             return []
         sz = MAP_CHUNK_SIZE
         return [batch_specs[i:i+sz] for i in range(0, len(batch_specs), sz)]
 
-    @task(
-        retries=3,
-        retry_delay=pendulum.duration(minutes=5),
-        pool=API_POOL,
-        execution_timeout=pendulum.duration(hours=CHUNK_EXEC_TIMEOUT_HOURS),
-    )
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
     def process_chunk(specs: List[Dict[str, Any]]) -> List[str]:
         """
-        Process a chunk of batch-specs:
-          - Fetch daily bar for each contract on its target_date
-          - Write gzip JSON to raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
-        Return list of written keys for this chunk.
+        Process a chunk of batch-specs in one task.
+        Each item: {'target_date': str, 'contract_batch': list[str]}
+        Writes gzip JSON to:
+          raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
+        Returns the list of written keys for this chunk.
         """
         if not specs:
             return []
@@ -280,7 +285,11 @@ def polygon_options_ingest_backfill_dag():
         written: List[str] = []
         for item in specs:
             target_date = item["target_date"]
-            for contract in item.get("contract_batch") or []:
+            contract_batch: List[str] = item.get("contract_batch") or []
+            if not contract_batch:
+                continue
+
+            for contract in contract_batch:
                 key = f"raw/options/{contract}/{target_date}.json.gz"
 
                 if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
@@ -325,14 +334,14 @@ def polygon_options_ingest_backfill_dag():
     # ───────────────────────────────
     underlyings = read_underlyings()
     trading_days = compute_trading_dates()
-    pairs = make_pairs(underlyings, trading_days)                                  # list[{'ticker','target_date'}]
+    pairs = make_pairs(underlyings, trading_days)  # list[{'ticker','target_date'}]
 
-    discoveries        = discover_for_pair.expand(pair=pairs)                      # mapped over pairs
+    discoveries = discover_for_pair.expand(pair=pairs)                             # mapped over pairs
     batch_specs_nested = batch_contracts_for_pair.expand(discovery=discoveries)    # mapped → list[list[dict]]
-    batch_specs_flat   = flatten_batch_specs(batch_specs_nested)                   # flatten → list[dict]
-    chunked_specs      = chunk_batch_specs(batch_specs_flat)                       # list[list[dict]] chunks
-    written_lists      = process_chunk.expand(specs=chunked_specs)                 # mapped per chunk
-    all_keys           = flatten_str_lists(written_lists)
+    batch_specs_flat = flatten_batch_specs(batch_specs_nested)                     # flatten → list[dict]
+    chunked_specs = chunk_batch_specs(batch_specs_flat)                            # list[list[dict]] chunks
+    written_lists = process_chunk.expand(specs=chunked_specs)                      # mapped per chunk
+    all_keys = flatten_str_lists(written_lists)
     write_manifest(all_keys)
 
 polygon_options_ingest_backfill_dag()
