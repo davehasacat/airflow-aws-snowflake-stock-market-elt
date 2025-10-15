@@ -39,7 +39,7 @@ API_POOL = "api_pool"  # ensure this pool exists (slots ~8)
 CONTRACT_BATCH_SIZE = int(os.getenv("OPTIONS_DAILY_CONTRACT_BATCH_SIZE", "400"))
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
 
-# NEW: Optional idempotent writes (default True = overwrite)
+# Idempotent writes (True = overwrite, False = skip if exists)
 REPLACE_FILES = os.getenv("DAILY_REPLACE", "true").lower() == "true"
 
 default_args = {
@@ -280,12 +280,29 @@ def polygon_options_ingest_daily_dag():
             url = f"{POLYGON_AGGS_URL_BASE}/{contract_ticker}/range/1/day/{target_date}/{target_date}"
             params = {"adjusted": "true", "apiKey": api_key}
             resp = _rate_limited_get(sess, url, params)
-            if resp.status_code == 404:
+
+            if resp.status_code in (401, 403):
+                # Likely entitlement or auth issue — log and skip
+                try:
+                    j = resp.json()
+                    msg = j.get("error") or j.get("message") or str(j)
+                except Exception:
+                    msg = resp.text
+                print(f"⚠️  {contract_ticker} {target_date} -> {resp.status_code}: {msg[:200]}")
+                time.sleep(REQUEST_DELAY_SECONDS)
                 continue
+
+            if resp.status_code == 404:
+                # No data for this contract/date
+                time.sleep(REQUEST_DELAY_SECONDS)
+                continue
+
             resp.raise_for_status()
             data = resp.json()
             results = data.get("results") or []
             if not results:
+                # Empty results — nothing to write
+                time.sleep(REQUEST_DELAY_SECONDS)
                 continue
 
             # gzip JSON payload to reduce size & speed COPY
@@ -296,8 +313,9 @@ def polygon_options_ingest_daily_dag():
 
             s3_key = f"raw/options/{contract_ticker}/{target_date}.json.gz"
 
-            # NEW: optionally skip overwriting existing files for idempotency
+            # Idempotency: optionally skip overwriting existing files
             if not REPLACE_FILES and s3.check_for_key(s3_key, bucket_name=BUCKET_NAME):
+                time.sleep(REQUEST_DELAY_SECONDS)
                 continue
 
             s3.load_bytes(bytes_data=gz_bytes, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
