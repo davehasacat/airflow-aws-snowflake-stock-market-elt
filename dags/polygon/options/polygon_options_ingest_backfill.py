@@ -139,8 +139,8 @@ def _batch(lst: List[str], n: int) -> List[List[str]]:
     catchup=False,
     tags=["ingestion", "polygon", "options", "backfill", "aws"],
     params={
-        "start_date": Param(default="2023-10-01", type="string", description="Backfill start date (YYYY-MM-DD)"),
-        "end_date":   Param(default="2025-10-01", type="string", description="Backfill end date (YYYY-MM-DD)"),
+        "start_date": Param(default="2025-10-09", type="string", description="Backfill start date (YYYY-MM-DD)"),
+        "end_date":   Param(default="2025-10-10", type="string", description="Backfill end date (YYYY-MM-DD)"),
     },
     dagrun_timeout=timedelta(hours=36),
     max_active_runs=1,

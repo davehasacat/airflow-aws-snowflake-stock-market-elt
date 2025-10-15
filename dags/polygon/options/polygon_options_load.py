@@ -174,7 +174,7 @@ def polygon_options_load_dag():
         """
         Insert raw payloads from staging into landing table (no regex or symbol parsing).
         Projections are from rec:results[0]; extract VARIANT -> STRING -> TRY_TO_NUMBER,
-        then cast to final numeric types to avoid VARIANT cast errors.
+        and specify scale to preserve decimals before casting to FLOAT.
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -193,14 +193,14 @@ def polygon_options_load_dag():
             )                                                                 AS trade_date,
             TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 ) AS bar_ts,
 
-            /* results[0] numeric fields — extract as string, then to number, then cast */
-            TRY_TO_NUMBER(rec:results[0]:o::STRING)::FLOAT  AS open,
-            TRY_TO_NUMBER(rec:results[0]:h::STRING)::FLOAT  AS high,
-            TRY_TO_NUMBER(rec:results[0]:l::STRING)::FLOAT  AS low,
-            TRY_TO_NUMBER(rec:results[0]:c::STRING)::FLOAT  AS close,
-            TRY_TO_NUMBER(rec:results[0]:v::STRING)::BIGINT AS volume,
-            TRY_TO_NUMBER(rec:results[0]:vw::STRING)::FLOAT AS vwap,
-            TRY_TO_NUMBER(rec:results[0]:n::STRING)::BIGINT AS transactions,
+            /* Preserve decimal precision for numeric fields */
+            TRY_TO_NUMBER(rec:results[0]:o::STRING, 38, 12)::FLOAT  AS open,
+            TRY_TO_NUMBER(rec:results[0]:h::STRING, 38, 12)::FLOAT  AS high,
+            TRY_TO_NUMBER(rec:results[0]:l::STRING, 38, 12)::FLOAT  AS low,
+            TRY_TO_NUMBER(rec:results[0]:c::STRING, 38, 12)::FLOAT  AS close,
+            TRY_TO_NUMBER(rec:results[0]:v::STRING)::BIGINT         AS volume,
+            TRY_TO_NUMBER(rec:results[0]:vw::STRING, 38, 12)::FLOAT AS vwap,
+            TRY_TO_NUMBER(rec:results[0]:n::STRING)::BIGINT         AS transactions,
 
             rec AS raw_rec
         FROM {FQ_STAGE_TABLE}
