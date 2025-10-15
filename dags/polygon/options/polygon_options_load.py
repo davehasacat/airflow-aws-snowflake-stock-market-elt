@@ -33,24 +33,14 @@ COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
 )
 def polygon_options_load_dag():
     """
-    Loads **raw** JSON options data from S3 (written by ingest DAG) into Snowflake,
-    with **no SQL parsing or custom field creation**. Downstream parsing happens in dbt.
+    Load **raw** JSON options data from S3 into Snowflake with no SQL parsing.
 
     Flow:
-      1) Ensure a single-column VARIANT landing table exists.
-      2) COPY raw JSON/.json.gz files from the external stage into the staging VARIANT table.
-      3) INSERT raw payloads from staging into the landing table with only:
-         - option_symbol (from rec:ticker, no regex)
-         - trade_date   (from first bar timestamp)
-         - raw_rec      (full JSON payload as VARIANT)
-      4) TRUNCATE staging.
-
-    S3 paths produced by ingest:
-      - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json[.gz]
-      - s3://<bucket>/raw/manifests/polygon_options_manifest_latest.txt
-
-    Assumes a Snowflake external stage pointing at s3://<bucket>/raw/
-    and a storage integration with permissions limited to /raw/.
+      1) CREATE SCHEMA/TABLES IF NOT EXISTS
+      2) Read latest manifest
+      3) COPY raw JSON/.json.gz files from external stage into VARIANT staging table
+      4) INSERT raw payloads into landing table with only (option_symbol, trade_date, raw_rec)
+      5) TRUNCATE staging
     """
 
     # --- Resolve Snowflake context from connection extras ---
@@ -73,29 +63,35 @@ def polygon_options_load_dag():
     FQ_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
     FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
 
+    # -----------------------------
+    # Tasks
+    # -----------------------------
     @task
-    def create_tables():
+    def create_tables() -> None:
         """
-        Create/ensure:
-          - Landing table with minimal columns (option_symbol, trade_date, raw_rec, inserted_at)
-          - Staging table (single VARIANT column)
+        Ensure schema & tables exist:
+          - CREATE SCHEMA IF NOT EXISTS <DB>.<SCHEMA>
+          - CREATE TABLE IF NOT EXISTS <DB>.<SCHEMA>.<landing> (option_symbol, trade_date, raw_rec, inserted_at)
+          - CREATE TABLE IF NOT EXISTS <DB>.<SCHEMA>.<staging> (rec VARIANT)
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
+        # 1) Schema (in case it was dropped in a scorched-earth reset)
+        hook.run(f"CREATE SCHEMA IF NOT EXISTS {SF_DB}.{SF_SCHEMA};")
+
+        # 2) Landing (raw) table
         ddl_target = f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             option_symbol TEXT,
             trade_date DATE,
             raw_rec VARIANT,
-            inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
+            inserted_at TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
         );
         """
-
-        ddl_stage = f"""
-        CREATE TABLE IF NOT EXISTS {FQ_STAGE_TABLE} ( rec VARIANT );
-        """
-
         hook.run(ddl_target)
+
+        # 3) Staging table
+        ddl_stage = f"CREATE TABLE IF NOT EXISTS {FQ_STAGE_TABLE} ( rec VARIANT );"
         hook.run(ddl_stage)
 
     @task
@@ -103,7 +99,7 @@ def polygon_options_load_dag():
         """
         Read manifest and convert absolute S3 keys (starting with 'raw/') to
         stage-relative paths for a stage rooted at s3://.../raw/.
-        Also filter to options-only files.
+        Filter to options files only.
         """
         s3 = S3Hook()  # rely on default AWS creds chain
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
@@ -149,7 +145,7 @@ def polygon_options_load_dag():
             COPY INTO {FQ_STAGE_TABLE} (rec)
             FROM {FQ_STAGE}
             FILES = ({files_clause})
-            FILE_FORMAT = (TYPE = 'JSON')  -- Snowflake auto-detects gzip via COMPRESSION=AUTO
+            FILE_FORMAT = (TYPE = 'JSON')  -- gzip auto-detected
             ON_ERROR = 'ABORT_STATEMENT'
             FORCE = FALSE;
             """
@@ -163,7 +159,7 @@ def polygon_options_load_dag():
         """
         Insert raw payloads from staging into landing table with no regex or derived fields.
         - option_symbol: rec:ticker (as-is)
-        - trade_date:    derived from first bar timestamp (minimal, preserved for partitioning)
+        - trade_date:    minimal partition column from first bar timestamp
         - raw_rec:       full JSON response (Variant)
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
@@ -189,11 +185,19 @@ def polygon_options_load_dag():
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         hook.run(f"TRUNCATE TABLE {FQ_STAGE_TABLE};")
 
-    # Flow
-    _ = create_tables()
+    # -----------------------------
+    # Wiring (explicit dependencies)
+    # -----------------------------
+    t_create = create_tables()
     rel_keys = get_s3_keys_from_manifest()
     rows_to_stage = copy_raw_into_staging(rel_keys)
     inserted = insert_from_staging_to_target(rows_to_stage)
-    cleanup_staging(inserted)
+    cleanup = cleanup_staging(inserted)
+
+    # Ensure create happens before the rest
+    t_create >> rel_keys
+    t_create >> rows_to_stage
+    t_create >> inserted
+    t_create >> cleanup
 
 polygon_options_load_dag()
