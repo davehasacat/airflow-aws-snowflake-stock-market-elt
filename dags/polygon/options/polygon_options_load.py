@@ -56,7 +56,7 @@ def polygon_options_load_dag():
         )
 
     STAGE_NAME = x.get("stage", "s3_stage")  # external stage rooted at s3://<bucket>/raw/
-    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")  # landing/raw table
+    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_raw")  # landing/raw table
     OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")  # VARIANT staging table
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
