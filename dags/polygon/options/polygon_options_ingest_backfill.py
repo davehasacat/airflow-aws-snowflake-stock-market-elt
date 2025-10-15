@@ -1,19 +1,23 @@
+# dags/polygon/options/polygon_options_ingest_backfill.py
 from __future__ import annotations
 
 import csv
 import json
 import os
 import time
-from typing import List
+import gzip
+from io import BytesIO
+from typing import List, Dict, Any
 
 import pendulum
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import timedelta
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
-from airflow.operators.python import get_current_context
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.models import Variable  # Secrets Manager-backed Variables
 
@@ -30,21 +34,20 @@ DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (manual)")
-API_POOL = "api_pool"  # ensure the pool exists or remove this
+API_POOL = os.getenv("API_POOL", "api_pool")  # ensure this pool exists (airflow_settings.yaml)
 
 # Rate limiting / batching
-REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.5"))
-SYMBOL_BATCH_SIZE = int(os.getenv("BACKFILL_SYMBOL_BATCH_SIZE", "500"))
+REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
+CONTRACTS_BATCH_SIZE = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "300"))
+REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"  # default: skip existing
+# New: cap dynamic mapping fan-out by chunking specs before processing
+MAP_CHUNK_SIZE = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))
 
-
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_options_key() -> str:
-    """
-    Return a clean Polygon OPTIONS API key whether the Airflow Variable is stored as:
-      - plain text: "abc123"
-      - JSON object: {"polygon_options_api_key":"abc123"}
-    Falls back to env POLYGON_OPTIONS_API_KEY.
-    """
-    # 1) Try JSON variable
+    """Fetch Polygon Options API key from Airflow Variable or env."""
     try:
         v = Variable.get("polygon_options_api_key", deserialize_json=True)
         if isinstance(v, dict):
@@ -58,7 +61,6 @@ def _get_polygon_options_key() -> str:
                     return s.strip()
     except Exception:
         pass
-    # 2) Try plain-text variable (or JSON-ish string)
     try:
         s = Variable.get("polygon_options_api_key")
         if s:
@@ -68,44 +70,53 @@ def _get_polygon_options_key() -> str:
                     obj = json.loads(s)
                     if isinstance(obj, dict):
                         for k in ("polygon_options_api_key", "api_key", "key", "value"):
-                            v = obj.get(k)
-                            if isinstance(v, str) and v.strip():
-                                return v.strip()
+                            v2 = obj.get(k)
+                            if isinstance(v2, str) and v2.strip():
+                                return v2.strip()
                         if len(obj) == 1:
-                            v = next(iter(obj.values()))
-                            if isinstance(v, str) and v.strip():
-                                return v.strip()
+                            v2 = next(iter(obj.values()))
+                            if isinstance(v2, str) and v2.strip():
+                                return v2.strip()
                 except Exception:
                     pass
             return s
     except Exception:
         pass
-    # 3) Env fallback
     env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
     if env:
         return env
     raise RuntimeError(
         "Polygon Options API key not found. Create secret 'airflow/variables/polygon_options_api_key' "
-        "in AWS Secrets Manager (plain text), or set env POLYGON_OPTIONS_API_KEY."
+        "or set env POLYGON_OPTIONS_API_KEY."
     )
 
+def _session() -> requests.Session:
+    """HTTP session with connection pooling + retries."""
+    s = requests.Session()
+    retries = Retry(
+        total=6,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
 
-def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
-    """
-    Robust GET with exponential backoff for 429/5xx.
-    Respects Retry-After when present. Raises for non-OK (except 404 which caller handles).
-    """
-    headers = {"User-Agent": USER_AGENT}
+def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
+    """GET with exponential backoff for 429/5xx; honors Retry-After."""
     backoff = 1.5
     delay = 1.0
     tries = 0
     while True:
-        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SECS)
+        resp = sess.get(url, params=params, timeout=REQUEST_TIMEOUT_SECS)
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             sleep_s = float(retry_after) if retry_after else delay
             time.sleep(sleep_s)
             delay *= backoff
+            tries += 1
         elif 500 <= resp.status_code < 600:
             if tries >= max_tries:
                 resp.raise_for_status()
@@ -115,158 +126,222 @@ def _rate_limited_get(url: str, params: dict | None, max_tries: int = 6) -> requ
         else:
             return resp
 
+def _batch(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i : i + n] for i in range(0, len(lst), n)]
 
+# ────────────────────────────────────────────────────────────────────────────────
+# DAG
+# ────────────────────────────────────────────────────────────────────────────────
 @dag(
     dag_id="polygon_options_ingest_backfill",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=None,  # manual only
     catchup=False,
-    tags=["ingestion", "polygon", "options", "backfill"],
+    tags=["ingestion", "polygon", "options", "backfill", "aws"],
     params={
-        "start_date": Param(default="2025-10-06", type="string", description="Backfill start date (YYYY-MM-DD)"),
-        "end_date":   Param(default="2025-10-09", type="string", description="Backfill end date (YYYY-MM-DD)"),
+        "start_date": Param(default="2025-10-09", type="string", description="Backfill start date (YYYY-MM-DD)"),
+        "end_date":   Param(default="2025-10-10", type="string", description="Backfill end date (YYYY-MM-DD)"),
     },
-    dagrun_timeout=timedelta(hours=24),
+    dagrun_timeout=timedelta(hours=36),
+    max_active_runs=1,
 )
 def polygon_options_ingest_backfill_dag():
     """
-    Manually backfill historical options data from Polygon:
-      1) Discover option contracts for seed underlyings (via /v3/reference/options/contracts)
-      2) Batch symbols to respect mapping limits and API rate limits
-      3) For each symbol, pull aggregates over the date range (/v2/aggs/ticker/.../range/1/day)
-      4) Write one JSON per (contract, trading day) to s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
-      5) Write manifest to trigger downstream load
+    Optimized backfill:
+      - Build flat (ticker, date) pairs → map over pairs (no nested mapping)
+      - Discover contracts per pair
+      - Batch contracts per pair
+      - Flatten + CHUNK batch-specs to avoid max map length
+      - Process each chunk in one task (loop internally)
+      - Write a single manifest of all written keys
+      - Raw-in/raw-out, no parsing
     """
 
-    @task(pool=API_POOL)
-    def get_all_option_symbols() -> List[str]:
+    @task
+    def read_underlyings() -> List[str]:
+        path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
+        tickers: List[str] = []
+        with open(path, mode="r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                t = (row.get("ticker") or "").strip().upper()
+                if t:
+                    tickers.append(t)
+        if not tickers:
+            raise AirflowSkipException("No underlyings found in seeds/custom_tickers.csv")
+        return tickers
+
+    @task
+    def compute_trading_dates(**kwargs) -> List[str]:
+        start = pendulum.parse(kwargs["params"]["start_date"])
+        end = pendulum.parse(kwargs["params"]["end_date"])
+        if start > end:
+            raise ValueError("start_date cannot be after end_date.")
+        dates: List[str] = []
+        cur = start
+        while cur <= end:
+            if cur.day_of_week not in (5, 6):  # skip Sat/Sun
+                dates.append(cur.to_date_string())
+            cur = cur.add(days=1)
+        if not dates:
+            raise AirflowSkipException("No trading dates in the given range.")
+        return dates
+
+    @task
+    def make_pairs(underlyings: List[str], trading_days: List[str]) -> List[Dict[str, str]]:
+        """Produce a flat list of {'ticker': T, 'target_date': D} dicts."""
+        pairs: List[Dict[str, str]] = []
+        for d in trading_days:
+            for t in underlyings:
+                pairs.append({"ticker": t, "target_date": d})
+        return pairs
+
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
+    def discover_for_pair(pair: Dict[str, str]) -> Dict[str, Any]:
         """
-        Read underlyings from dbt seeds and fetch all option contract symbols (paginated).
+        Discover contracts for (ticker, target_date).
+        Returns: {'target_date': <date>, 'contracts': [tickers...]}
         """
+        ticker = pair["ticker"]
+        target_date = pair["target_date"]
         api_key = _get_polygon_options_key()
+        sess = _session()
 
-        custom_tickers_path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
-        with open(custom_tickers_path, mode="r") as csvfile:
-            reader = csv.DictReader(csvfile)
-            underlyings = [
-                (row.get("ticker") or "").strip().upper()
-                for row in reader if row.get("ticker")
-            ]
+        params = {
+            "underlying_ticker": ticker,
+            "expiration_date.gte": target_date,
+            "as_of": target_date,
+            "limit": 1000,
+            "apiKey": api_key,
+        }
+        contracts: List[str] = []
 
-        all_symbols: List[str] = []
-        for ticker in underlyings:
-            params = {"underlying_ticker": ticker, "limit": 1000, "apiKey": api_key}
-            # First page
-            resp = _rate_limited_get(POLYGON_CONTRACTS_URL, params)
+        resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
+        resp.raise_for_status()
+        data = resp.json()
+        for r in data.get("results", []) or []:
+            t = r.get("ticker")
+            if t:
+                contracts.append(t)
+
+        next_url = data.get("next_url")
+        while next_url:
+            resp = _rate_limited_get(sess, next_url, {"apiKey": api_key})
             resp.raise_for_status()
             data = resp.json()
-            all_symbols.extend([c["ticker"] for c in (data.get("results") or []) if "ticker" in c])
-
-            # Pagination
+            for r in data.get("results", []) or []:
+                t = r.get("ticker")
+                if t:
+                    contracts.append(t)
             next_url = data.get("next_url")
-            while next_url:
-                resp = _rate_limited_get(next_url, {"apiKey": api_key})
-                resp.raise_for_status()
-                data = resp.json()
-                all_symbols.extend([c["ticker"] for c in (data.get("results") or []) if "ticker" in c])
-                next_url = data.get("next_url")
-                time.sleep(REQUEST_DELAY_SECONDS)
-
             time.sleep(REQUEST_DELAY_SECONDS)
 
-        # De-dup and sort for determinism
-        all_symbols = sorted(set(all_symbols))
-        if not all_symbols:
-            raise AirflowSkipException("No option symbols found for the provided underlyings.")
-        return all_symbols
+        return {"target_date": target_date, "contracts": sorted(set(contracts))}
 
     @task
-    def batch_option_symbols(symbol_list: List[str]) -> List[List[str]]:
-        """Batch symbols for parallel processing to avoid mapping limits."""
-        return [symbol_list[i : i + SYMBOL_BATCH_SIZE] for i in range(0, len(symbol_list), SYMBOL_BATCH_SIZE)]
-
-    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool=API_POOL)
-    def process_symbol_batch_backfill(symbol_batch: List[str]) -> List[str]:
+    def batch_contracts_for_pair(discovery: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Fetch historical aggregates for each symbol over the date range in params.
-        Write one JSON file per (symbol, trading day) to s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
+        Turn discovery -> list of batch-spec dicts:
+          [{'target_date': D, 'contract_batch': [c1, c2, ...]}, ...]
         """
-        ctx = get_current_context()
-        start_date = ctx["params"]["start_date"]
-        end_date = ctx["params"]["end_date"]
+        target_date = discovery["target_date"]
+        contracts: List[str] = discovery.get("contracts") or []
+        if not contracts:
+            return []
+        batches = _batch(contracts, CONTRACTS_BATCH_SIZE)
+        return [{"target_date": target_date, "contract_batch": b} for b in batches]
 
-        # Validate dates
-        try:
-            sd = pendulum.parse(start_date)
-            ed = pendulum.parse(end_date)
-        except Exception:
-            raise ValueError("Invalid start_date or end_date. Expected format YYYY-MM-DD.")
-        if sd > ed:
-            raise ValueError("start_date cannot be after end_date.")
+    @task
+    def flatten_batch_specs(nested: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Flatten list[list[dict]] → list[dict] for chunking."""
+        return [d for sub in (nested or []) for d in (sub or [])]
+
+    @task
+    def chunk_batch_specs(batch_specs: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """
+        Chunk the flat list of batch-specs to avoid exceeding Airflow's max map length.
+        """
+        if not batch_specs:
+            return []
+        sz = MAP_CHUNK_SIZE
+        return [batch_specs[i:i+sz] for i in range(0, len(batch_specs), sz)]
+
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
+    def process_chunk(specs: List[Dict[str, Any]]) -> List[str]:
+        """
+        Process a chunk of batch-specs in one task.
+        Each item: {'target_date': str, 'contract_batch': list[str]}
+        Writes gzip JSON to:
+          raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
+        Returns the list of written keys for this chunk.
+        """
+        if not specs:
+            return []
 
         api_key = _get_polygon_options_key()
-        s3 = S3Hook()  # Use default AWS creds (mounted ~/.aws)
+        sess = _session()
+        s3 = S3Hook()
 
-        processed_keys: List[str] = []
-        for option_symbol in symbol_batch:
-            url = f"{POLYGON_AGGS_URL_BASE}/{option_symbol}/range/1/day/{start_date}/{end_date}"
-            params = {"adjusted": "true", "sort": "asc", "apiKey": api_key}
+        written: List[str] = []
+        for item in specs:
+            target_date = item["target_date"]
+            contract_batch: List[str] = item.get("contract_batch") or []
+            if not contract_batch:
+                continue
 
-            try:
-                resp = _rate_limited_get(url, params)
+            for contract in contract_batch:
+                key = f"raw/options/{contract}/{target_date}.json.gz"
+
+                if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                    continue
+
+                url = f"{POLYGON_AGGS_URL_BASE}/{contract}/range/1/day/{target_date}/{target_date}"
+                params = {"adjusted": "true", "apiKey": api_key}
+                resp = _rate_limited_get(sess, url, params)
                 if resp.status_code == 404:
-                    # No data for that range — skip quietly
-                    time.sleep(REQUEST_DELAY_SECONDS)
                     continue
                 resp.raise_for_status()
-                data = resp.json()
+                obj = resp.json()
+                results = obj.get("results") or []
+                if not results:
+                    continue
 
-                results = data.get("results") or []
-                if results:
-                    for bar in results:
-                        trade_date = pendulum.from_timestamp(bar["t"] / 1000, tz="UTC").to_date_string()
-                        payload = {
-                            "ticker": data.get("ticker", option_symbol),
-                            "resultsCount": 1,
-                            "results": [bar],
-                        }
-                        # Write under raw/options/<symbol>/<YYYY-MM-DD>.json
-                        s3_key = f"raw/options/{option_symbol}/{trade_date}.json"
-                        s3.load_string(json.dumps(payload), key=s3_key, bucket_name=BUCKET_NAME, replace=True)
-                        processed_keys.append(s3_key)
+                buf = BytesIO()
+                with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
+                    gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+                s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
+                written.append(key)
 
                 time.sleep(REQUEST_DELAY_SECONDS)
-            except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response is not None else "unknown"
-                print(f"[WARN] Could not process {option_symbol}. HTTP {status}. Skipping.")
-            except Exception as e:
-                print(f"[WARN] Unexpected error for {option_symbol}: {e}")
 
-        return processed_keys
+        return written
 
     @task
-    def flatten_s3_key_list(nested_list: List[List[str]]) -> List[str]:
-        """Flatten list of lists of S3 keys into a single list."""
-        return [k for sub in (nested_list or []) for k in (sub or []) if k]
+    def flatten_str_lists(list_of_lists: List[List[str]]) -> List[str]:
+        return [k for sub in (list_of_lists or []) for k in (sub or []) if k]
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def write_manifest_to_s3(s3_keys: List[str]):
-        """Write the final manifest to S3 to trigger downstream load DAG."""
-        keys = [k for k in (s3_keys or []) if k]
-        if not keys:
-            raise AirflowSkipException("No S3 keys were processed during the options backfill.")
-
+    def write_manifest(all_keys: List[str]) -> None:
+        if not all_keys:
+            raise AirflowSkipException("No files written; skipping manifest.")
         s3 = S3Hook()
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
-        s3.load_string("\n".join(keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
-        print(f"Backfill manifest created with {len(keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
+        s3.load_string("\n".join(all_keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
+        print(f"✅ Manifest updated with {len(all_keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
-    # Flow
-    all_symbols = get_all_option_symbols()
-    symbol_batches = batch_option_symbols(all_symbols)
-    processed_keys_nested = process_symbol_batch_backfill.expand(symbol_batch=symbol_batches)
-    s3_keys_flat = flatten_s3_key_list(processed_keys_nested)
-    write_manifest_to_s3(s3_keys_flat)
+    # ───────────────────────────────
+    # Wiring
+    # ───────────────────────────────
+    underlyings = read_underlyings()
+    trading_days = compute_trading_dates()
+    pairs = make_pairs(underlyings, trading_days)  # list[{'ticker','target_date'}]
 
+    discoveries = discover_for_pair.expand(pair=pairs)                             # mapped over pairs
+    batch_specs_nested = batch_contracts_for_pair.expand(discovery=discoveries)    # mapped → list[list[dict]]
+    batch_specs_flat = flatten_batch_specs(batch_specs_nested)                     # flatten → list[dict]
+    chunked_specs = chunk_batch_specs(batch_specs_flat)                            # list[list[dict]] chunks
+    written_lists = process_chunk.expand(specs=chunked_specs)                      # mapped per chunk
+    all_keys = flatten_str_lists(written_lists)
+    write_manifest(all_keys)
 
 polygon_options_ingest_backfill_dag()

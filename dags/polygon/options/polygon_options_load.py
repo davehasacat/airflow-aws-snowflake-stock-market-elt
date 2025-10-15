@@ -1,3 +1,4 @@
+# dags/polygon/options/polygon_options_load.py
 from __future__ import annotations
 import os
 from datetime import timedelta
@@ -32,14 +33,20 @@ COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
 )
 def polygon_options_load_dag():
     """
-    Loads raw JSON options data from S3 (written by ingest DAG) into Snowflake:
-      1) COPY raw JSON into a VARIANT staging table (no transformation in COPY)
-      2) INSERT-SELECT parse into target table
-      3) TRUNCATE the staging table
+    Load raw Polygon options bars from S3 → Snowflake.
+    Raw-in/raw-out, plus selected projections of results[0] fields.
 
-    S3 paths produced by ingest:
-      - s3://<bucket>/raw/options/<symbol>/<YYYY-MM-DD>.json
-      - s3://<bucket>/raw/manifests/polygon_options_manifest_latest.txt
+    Flow:
+      1) CREATE SCHEMA/TABLES IF NOT EXISTS
+      2) Read latest manifest
+      3) COPY raw JSON/.json.gz files from external stage into VARIANT staging table
+      4) INSERT into landing table:
+           - option_symbol (from rec:ticker)
+           - trade_date (from results[0].t)
+           - bar_ts (TIMESTAMP from results[0].t)
+           - open, high, low, close, volume, vwap, transactions (from results[0])
+           - raw_rec (entire JSON)
+      5) TRUNCATE staging
     """
 
     # --- Resolve Snowflake context from connection extras ---
@@ -54,43 +61,52 @@ def polygon_options_load_dag():
             "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
         )
 
-    # Optional overrides
-    STAGE_NAME = x.get("stage", "s3_stage")  # same stage used for stocks/options
-    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_bars_daily")
-    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "stg_polygon_options_raw")
+    # External stage & table names (can be overridden via connection extras)
+    STAGE_NAME = x.get("stage", "s3_stage")  # external stage rooted at s3://<bucket>/raw/
+    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_raw")  # landing/raw table
+    OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")  # VARIANT staging table
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
     FQ_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
     FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
 
+    # -----------------------------
+    # Tasks
+    # -----------------------------
     @task
-    def create_tables():
+    def create_tables() -> None:
+        """
+        Ensure schema & tables exist:
+          - CREATE SCHEMA IF NOT EXISTS <DB>.<SCHEMA>
+          - CREATE TABLE IF NOT EXISTS <landing> with raw + projected result fields
+          - CREATE TABLE IF NOT EXISTS <staging> (rec VARIANT)
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
+        # 1) Schema (in case it was dropped)
+        hook.run(f"CREATE SCHEMA IF NOT EXISTS {SF_DB}.{SF_SCHEMA};")
+
+        # 2) Landing (raw) table with projected columns
         ddl_target = f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
-            option_symbol TEXT,
-            trade_date DATE,
-            underlying_ticker TEXT,
-            expiration_date DATE,
-            strike_price NUMERIC(19, 4),
-            option_type VARCHAR(4),
-            open NUMERIC(19, 4),
-            high NUMERIC(19, 4),
-            low NUMERIC(19, 4),
-            close NUMERIC(19, 4),
-            volume BIGINT,
-            vwap NUMERIC(19, 4),
-            transactions BIGINT,
-            inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
+            option_symbol   TEXT,
+            trade_date      DATE,
+            bar_ts          TIMESTAMP_NTZ,         -- from results[0].t (ms → seconds)
+            open            FLOAT,
+            high            FLOAT,
+            low             FLOAT,
+            close           FLOAT,
+            volume          BIGINT,
+            vwap            FLOAT,
+            transactions    BIGINT,
+            raw_rec         VARIANT,               -- full JSON payload
+            inserted_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
         );
         """
-
-        ddl_stage = f"""
-        CREATE TABLE IF NOT EXISTS {FQ_STAGE_TABLE} ( rec VARIANT );
-        """
-
         hook.run(ddl_target)
+
+        # 3) Staging table
+        ddl_stage = f"CREATE TABLE IF NOT EXISTS {FQ_STAGE_TABLE} ( rec VARIANT );"
         hook.run(ddl_stage)
 
     @task
@@ -98,8 +114,9 @@ def polygon_options_load_dag():
         """
         Read manifest and convert absolute S3 keys (starting with 'raw/') to
         stage-relative paths for a stage rooted at s3://.../raw/.
+        Filter to options files only.
         """
-        s3 = S3Hook()
+        s3 = S3Hook()  # rely on default AWS creds chain
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
             raise AirflowSkipException(f"Manifest not found at s3://{BUCKET_NAME}/{manifest_key}")
@@ -121,6 +138,10 @@ def polygon_options_load_dag():
 
     @task
     def copy_raw_into_staging(stage_relative_keys: List[str]) -> int:
+        """
+        COPY the specified files from the external stage into the VARIANT staging table.
+        Handles .json and .json.gz (COMPRESSION=AUTO).
+        """
         if not stage_relative_keys:
             raise AirflowSkipException("No S3 keys provided to loader.")
 
@@ -139,7 +160,7 @@ def polygon_options_load_dag():
             COPY INTO {FQ_STAGE_TABLE} (rec)
             FROM {FQ_STAGE}
             FILES = ({files_clause})
-            FILE_FORMAT = (TYPE = 'JSON')
+            FILE_FORMAT = (TYPE = 'JSON')  -- gzip auto-detected
             ON_ERROR = 'ABORT_STATEMENT'
             FORCE = FALSE;
             """
@@ -150,31 +171,42 @@ def polygon_options_load_dag():
 
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
+        """
+        Insert raw payloads from staging into landing table (no regex or symbol parsing).
+        Projections are from rec:results[0]; extract VARIANT -> STRING -> TRY_TO_NUMBER,
+        and specify scale to preserve decimals before casting to FLOAT.
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
         insert_sql = f"""
         INSERT INTO {FQ_TABLE} (
-            option_symbol, trade_date, underlying_ticker, expiration_date, strike_price, option_type,
-            open, high, low, close, volume, vwap, transactions
+            option_symbol, trade_date, bar_ts,
+            open, high, low, close, volume, vwap, transactions,
+            raw_rec
         )
         SELECT
-            sym                                                                 AS option_symbol,
-            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))      AS trade_date,
-            REGEXP_SUBSTR(sym, '^O:([A-Z0-9\\.\\-]+)\\d{{6}}[CP]\\d{{8}}', 1, 1, 'c', 1)  AS underlying_ticker,
-            TO_DATE(REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+(\\d{{6}})[CP]\\d{{8}}', 1, 1, 'c', 1), 'YYMMDD') AS expiration_date,
-            TRY_TO_NUMBER(REGEXP_SUBSTR(sym, '(\\d{{8}})$', 1, 1, 'c', 1)) / 1000 AS strike_price,
-            IFF(REGEXP_SUBSTR(sym, '^O:[A-Z0-9\\.\\-]+\\d{{6}}([CP])\\d{{8}}', 1, 1, 'c', 1) = 'C', 'call', 'put') AS option_type,
-            rec:results[0]:o::FLOAT AS open,
-            rec:results[0]:h::FLOAT AS high,
-            rec:results[0]:l::FLOAT AS low,
-            rec:results[0]:c::FLOAT AS close,
-            rec:results[0]:v::BIGINT AS volume,
-            rec:results[0]:vw::FLOAT AS vwap,
-            rec:results[0]:n::BIGINT AS transactions
-        FROM (
-            SELECT rec, TO_VARCHAR(rec:ticker) AS sym
-            FROM {FQ_STAGE_TABLE}
-        );
+            TO_VARCHAR(rec:ticker) AS option_symbol,
+
+            /* t is ms since epoch; extract as string -> to number -> timestamp */
+            TO_DATE(
+              TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 )
+            )                                                                 AS trade_date,
+            TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 ) AS bar_ts,
+
+            /* Preserve decimal precision for numeric fields */
+            TRY_TO_NUMBER(rec:results[0]:o::STRING, 38, 12)::FLOAT  AS open,
+            TRY_TO_NUMBER(rec:results[0]:h::STRING, 38, 12)::FLOAT  AS high,
+            TRY_TO_NUMBER(rec:results[0]:l::STRING, 38, 12)::FLOAT  AS low,
+            TRY_TO_NUMBER(rec:results[0]:c::STRING, 38, 12)::FLOAT  AS close,
+            TRY_TO_NUMBER(rec:results[0]:v::STRING)::BIGINT         AS volume,
+            TRY_TO_NUMBER(rec:results[0]:vw::STRING, 38, 12)::FLOAT AS vwap,
+            TRY_TO_NUMBER(rec:results[0]:n::STRING)::BIGINT         AS transactions,
+
+            rec AS raw_rec
+        FROM {FQ_STAGE_TABLE}
+        WHERE rec:ticker IS NOT NULL
+          AND ARRAY_SIZE(rec:results) > 0
+          AND rec:results[0]:t IS NOT NULL;
         """
         hook.run(insert_sql)
 
@@ -186,11 +218,19 @@ def polygon_options_load_dag():
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         hook.run(f"TRUNCATE TABLE {FQ_STAGE_TABLE};")
 
-    # Flow
-    _ = create_tables()
+    # -----------------------------
+    # Wiring (explicit dependencies)
+    # -----------------------------
+    t_create = create_tables()
     rel_keys = get_s3_keys_from_manifest()
     rows_to_stage = copy_raw_into_staging(rel_keys)
     inserted = insert_from_staging_to_target(rows_to_stage)
-    cleanup_staging(inserted)
+    cleanup = cleanup_staging(inserted)
+
+    # Ensure create happens before the rest
+    t_create >> rel_keys
+    t_create >> rows_to_stage
+    t_create >> inserted
+    t_create >> cleanup
 
 polygon_options_load_dag()

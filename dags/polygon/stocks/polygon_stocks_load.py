@@ -40,7 +40,7 @@ def polygon_stocks_load_dag():
 
     # Optional overrides from extras; otherwise use sane defaults
     STAGE_NAME = x.get("stage", "s3_stage")  # logical stage name in the same DB/schema
-    TABLE_NAME = x.get("stocks_table", "source_polygon_stock_bars_daily")
+    TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
 
     FULLY_QUALIFIED_TABLE_NAME = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
     FULLY_QUALIFIED_STAGE_NAME = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
