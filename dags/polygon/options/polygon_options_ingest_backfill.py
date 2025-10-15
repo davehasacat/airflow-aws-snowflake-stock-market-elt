@@ -24,7 +24,7 @@ from airflow.models import Variable  # Secrets Manager-backed Variables
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Config / Constants
+# Config (env-driven; override in your runtime env)
 # ────────────────────────────────────────────────────────────────────────────────
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
@@ -34,13 +34,16 @@ DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (manual)")
-API_POOL = os.getenv("API_POOL", "api_pool")  # ensure this pool exists (Airflow UI → Admin → Pools)
+API_POOL = os.getenv("API_POOL", "api_pool")  # must exist in Airflow → Admin → Pools
 
-# Rate limiting / batching
-REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.35"))
-CONTRACTS_BATCH_SIZE   = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "250"))
-REPLACE_FILES         = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"  # default: skip existing
-MAP_CHUNK_SIZE        = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))         # cap dynamic mapping fan-out
+# Backfill tuning knobs
+REQUEST_DELAY_SECONDS       = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.35"))  # API pacing
+CONTRACTS_BATCH_SIZE        = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "250"))     # per (ticker,date)
+MAP_CHUNK_SIZE              = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))          # cap map fan-out
+REPLACE_FILES               = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"   # default: skip existing
+DAGRUN_TIMEOUT_HOURS        = int(os.getenv("BACKFILL_DAGRUN_TIMEOUT_HOURS", "72"))      # long backfills
+CHUNK_EXEC_TIMEOUT_HOURS    = int(os.getenv("BACKFILL_CHUNK_EXEC_TIMEOUT_HOURS", "2"))   # guardrail per chunk
+BACKFILL_DAG_CONCURRENCY    = int(os.getenv("BACKFILL_DAG_CONCURRENCY", "16"))           # max active tasks in DAG
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -141,13 +144,14 @@ def _batch(lst: List[str], n: int) -> List[List[str]]:
         "start_date": Param(default="2023-10-01", type="string", description="Backfill start date (YYYY-MM-DD)"),
         "end_date":   Param(default="2025-10-01", type="string", description="Backfill end date (YYYY-MM-DD)"),
     },
-    dagrun_timeout=pendulum.duration(hours=72),  # ↑ longer window for large backfills
+    dagrun_timeout=pendulum.duration(hours=DAGRUN_TIMEOUT_HOURS),
     max_active_runs=1,
+    concurrency=BACKFILL_DAG_CONCURRENCY,  # per-DAG task cap
 )
 def polygon_options_ingest_backfill_dag():
     """
-    Backfill pattern:
-      - Build flat (ticker, date) pairs → map over pairs (no nested mapping)
+    Backfill flow:
+      - Build flat (ticker, date) pairs → map over pairs
       - Discover contracts per pair
       - Batch contracts per pair
       - Flatten + CHUNK batch-specs to avoid Airflow's max map length
@@ -188,7 +192,7 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def make_pairs(underlyings: List[str], trading_days: List[str]) -> List[Dict[str, str]]:
-        """Produce a flat list of {'ticker': T, 'target_date': D} dicts."""
+        """Flat list of {'ticker': T, 'target_date': D} dicts."""
         return [{"ticker": t, "target_date": d} for d in trading_days for t in underlyings]
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
@@ -247,7 +251,7 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def chunk_batch_specs(batch_specs: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-        """Chunk the flat list of batch-specs to keep mapped items under platform limits."""
+        """Chunk the flat list of batch-specs to keep mapped items under limits."""
         if not batch_specs:
             return []
         sz = MAP_CHUNK_SIZE
@@ -257,12 +261,12 @@ def polygon_options_ingest_backfill_dag():
         retries=3,
         retry_delay=pendulum.duration(minutes=5),
         pool=API_POOL,
-        execution_timeout=pendulum.duration(hours=2),  # guardrail per chunk
+        execution_timeout=pendulum.duration(hours=CHUNK_EXEC_TIMEOUT_HOURS),
     )
     def process_chunk(specs: List[Dict[str, Any]]) -> List[str]:
         """
-        Process a chunk of batch-specs in one task:
-          - Fetch daily bar for each contract in each spec on its target_date
+        Process a chunk of batch-specs:
+          - Fetch daily bar for each contract on its target_date
           - Write gzip JSON to raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
         Return list of written keys for this chunk.
         """
