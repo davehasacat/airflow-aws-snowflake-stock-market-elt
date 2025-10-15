@@ -7,7 +7,7 @@ import os
 import time
 import gzip
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Dict, Any
 
 import pendulum
 import requests
@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import timedelta
 
-from airflow.decorators import dag, task, task_group
+from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -38,19 +38,13 @@ API_POOL = os.getenv("API_POOL", "api_pool")  # ensure this pool exists (airflow
 
 # Rate limiting / batching
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
-CONTRACTS_BATCH_SIZE = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "300"))  # tune for parallelism
-REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"       # default: skip if exists
+CONTRACTS_BATCH_SIZE = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "300"))
+REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"  # default: skip existing
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_options_key() -> str:
-    """
-    Return a clean Polygon OPTIONS API key whether the Airflow Variable is stored as:
-      - raw: "abc123"
-      - JSON object: {"polygon_options_api_key":"abc123"} (console sometimes does this)
-    Falls back to env POLYGON_OPTIONS_API_KEY.
-    """
     # 1) JSON variable
     try:
         v = Variable.get("polygon_options_api_key", deserialize_json=True)
@@ -65,7 +59,7 @@ def _get_polygon_options_key() -> str:
                     return s.strip()
     except Exception:
         pass
-    # 2) Plain-text (or JSON-ish string)
+    # 2) Plain or JSON-ish string
     try:
         s = Variable.get("polygon_options_api_key")
         if s:
@@ -97,7 +91,6 @@ def _get_polygon_options_key() -> str:
     )
 
 def _session() -> requests.Session:
-    """HTTP session with connection pooling + retries for resilience and speed."""
     s = requests.Session()
     retries = Retry(
         total=6,
@@ -111,7 +104,6 @@ def _session() -> requests.Session:
     return s
 
 def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
-    """Robust GET with exponential backoff for 429/5xx; respects Retry-After."""
     backoff = 1.5
     delay = 1.0
     tries = 0
@@ -145,7 +137,6 @@ def _batch(lst: List[str], n: int) -> List[List[str]]:
     catchup=False,
     tags=["ingestion", "polygon", "options", "backfill", "aws"],
     params={
-        # For 2y backfill, you can pass params when triggering (e.g., 2023-10-01 → 2025-10-01)
         "start_date": Param(default="2023-10-01", type="string", description="Backfill start date (YYYY-MM-DD)"),
         "end_date":   Param(default="2025-10-01", type="string", description="Backfill end date (YYYY-MM-DD)"),
     },
@@ -154,17 +145,15 @@ def _batch(lst: List[str], n: int) -> List[List[str]]:
 )
 def polygon_options_ingest_backfill_dag():
     """
-    Optimized backfill:
-      - Parallel discovery per ticker/day
-      - Parallel fetch per batch
-      - Gzip payloads to S3
-      - Optional skip-if-exists to avoid rework
-      - No parsing: raw payloads only
+    Optimized backfill without nested mapping:
+      - Build flat (ticker, date) pairs → map over pairs
+      - Discover contracts per pair
+      - Batch contracts per pair
+      - Fetch gzip bars per contract per date
+      - Write a single manifest of all written keys
+      - Raw-in/raw-out, no parsing
     """
 
-    # ───────────────────────────────
-    # Inputs
-    # ───────────────────────────────
     @task
     def read_underlyings() -> List[str]:
         path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
@@ -195,136 +184,141 @@ def polygon_options_ingest_backfill_dag():
             raise AirflowSkipException("No trading dates in the given range.")
         return dates
 
-    # ───────────────────────────────
-    # Per-day pipeline
-    # ───────────────────────────────
-    @task_group(group_id="per_day")
-    def per_day_group(target_date: str, underlyings: List[str]):
+    @task
+    def make_pairs(underlyings: List[str], trading_days: List[str]) -> List[Dict[str, str]]:
+        """
+        Produce a flat list of {'ticker': T, 'target_date': D} dicts to avoid nested mapping.
+        """
+        pairs: List[Dict[str, str]] = []
+        for d in trading_days:
+            for t in underlyings:
+                pairs.append({"ticker": t, "target_date": d})
+        return pairs
 
-        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
-        def discover_for_ticker(ticker: str, target_date: str) -> List[str]:
-            """Discover contracts for a single ticker on the target date."""
-            api_key = _get_polygon_options_key()
-            sess = _session()
-            params = {
-                "underlying_ticker": ticker,
-                "expiration_date.gte": target_date,
-                "as_of": target_date,
-                "limit": 1000,
-                "apiKey": api_key,
-            }
-            contracts: List[str] = []
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
+    def discover_for_pair(pair: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Discover contracts for (ticker, target_date).
+        Returns: {'target_date': <date>, 'contracts': [tickers...]}
+        """
+        ticker = pair["ticker"]
+        target_date = pair["target_date"]
+        api_key = _get_polygon_options_key()
+        sess = _session()
 
-            resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
+        params = {
+            "underlying_ticker": ticker,
+            "expiration_date.gte": target_date,
+            "as_of": target_date,
+            "limit": 1000,
+            "apiKey": api_key,
+        }
+        contracts: List[str] = []
+
+        resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
+        resp.raise_for_status()
+        data = resp.json()
+        for r in data.get("results", []) or []:
+            t = r.get("ticker")
+            if t:
+                contracts.append(t)
+
+        next_url = data.get("next_url")
+        while next_url:
+            resp = _rate_limited_get(sess, next_url, {"apiKey": api_key})
             resp.raise_for_status()
             data = resp.json()
             for r in data.get("results", []) or []:
                 t = r.get("ticker")
                 if t:
                     contracts.append(t)
-
             next_url = data.get("next_url")
-            while next_url:
-                resp = _rate_limited_get(sess, next_url, {"apiKey": api_key})
-                resp.raise_for_status()
-                data = resp.json()
-                for r in data.get("results", []) or []:
-                    t = r.get("ticker")
-                    if t:
-                        contracts.append(t)
-                next_url = data.get("next_url")
-                time.sleep(REQUEST_DELAY_SECONDS)
+            time.sleep(REQUEST_DELAY_SECONDS)
 
-            return sorted(set(contracts))
-
-        @task
-        def flatten_contracts(nested: List[List[str]]) -> List[str]:
-            return sorted(set([c for sub in (nested or []) for c in (sub or [])]))
-
-        @task
-        def batch_contracts(contracts: List[str]) -> List[List[str]]:
-            if not contracts:
-                return []
-            return _batch(contracts, CONTRACTS_BATCH_SIZE)
-
-        @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
-        def process_contract_batch(contract_batch: List[str], target_date: str) -> List[str]:
-            """
-            Fetch daily bars for target_date for each contract and write gzip JSON:
-              s3://<bucket>/raw/options/<CONTRACT>/<DATE>.json.gz
-            Return list of written keys.
-            """
-            if not contract_batch:
-                return []
-
-            api_key = _get_polygon_options_key()
-            sess = _session()
-            s3 = S3Hook()
-
-            written: List[str] = []
-            for contract in contract_batch:
-                key = f"raw/options/{contract}/{target_date}.json.gz"
-
-                if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
-                    # Skip existing file to speed up large backfills
-                    continue
-
-                url = f"{POLYGON_AGGS_URL_BASE}/{contract}/range/1/day/{target_date}/{target_date}"
-                params = {"adjusted": "true", "apiKey": api_key}
-                resp = _rate_limited_get(sess, url, params)
-                if resp.status_code == 404:
-                    continue
-                resp.raise_for_status()
-                obj = resp.json()
-                results = obj.get("results") or []
-                if not results:
-                    continue
-
-                # gzip the JSON payload
-                buf = BytesIO()
-                with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
-                    gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
-                s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
-                written.append(key)
-
-                time.sleep(REQUEST_DELAY_SECONDS)
-
-            return written
-
-        @task
-        def flatten_keys(nested: List[List[str]]) -> List[str]:
-            return [k for sub in (nested or []) for k in (sub or []) if k]
-
-        # Wire the per-day group:
-        discovered = discover_for_ticker.partial(target_date=target_date).expand(ticker=underlyings)
-        all_contracts = flatten_contracts(discovered)
-        batches = batch_contracts(all_contracts)
-        batch_keys = process_contract_batch.partial(target_date=target_date).expand(contract_batch=batches)
-        day_keys = flatten_keys(batch_keys)
-        return day_keys
-
-    # ───────────────────────────────
-    # Wiring (map per day)
-    # ───────────────────────────────
-    underlyings = read_underlyings()
-    trading_days = compute_trading_dates()
-    keys_per_day = per_day_group.partial(underlyings=underlyings).expand(target_date=trading_days)
+        return {"target_date": target_date, "contracts": sorted(set(contracts))}
 
     @task
-    def flatten_all(days_keys: List[List[str]]) -> List[str]:
-        return [k for sub in (days_keys or []) for k in (sub or []) if k]
+    def batch_contracts_for_pair(discovery: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Turn discovery -> list of batch dicts:
+          [{'target_date': D, 'batch': [c1, c2, ...]}, ...]
+        """
+        target_date = discovery["target_date"]
+        contracts: List[str] = discovery.get("contracts") or []
+        if not contracts:
+            return []
+        batches = _batch(contracts, CONTRACTS_BATCH_SIZE)
+        return [{"target_date": target_date, "batch": b} for b in batches]
 
-    all_keys = flatten_all(keys_per_day)
+    @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
+    def process_contract_batch(batch_info: Dict[str, Any]) -> List[str]:
+        """
+        Fetch daily bars for each contract in batch_info['batch'] for batch_info['target_date'].
+        Write gzip JSON to:
+          raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
+        Return list of written keys.
+        """
+        target_date = batch_info["target_date"]
+        contract_batch: List[str] = batch_info.get("batch") or []
+        if not contract_batch:
+            return []
+
+        api_key = _get_polygon_options_key()
+        sess = _session()
+        s3 = S3Hook()
+
+        written: List[str] = []
+        for contract in contract_batch:
+            key = f"raw/options/{contract}/{target_date}.json.gz"
+
+            if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                continue
+
+            url = f"{POLYGON_AGGS_URL_BASE}/{contract}/range/1/day/{target_date}/{target_date}"
+            params = {"adjusted": "true", "apiKey": api_key}
+            resp = _rate_limited_get(sess, url, params)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            obj = resp.json()
+            results = obj.get("results") or []
+            if not results:
+                continue
+
+            buf = BytesIO()
+            with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
+                gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+            s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
+            written.append(key)
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        return written
+
+    @task
+    def flatten_str_lists(list_of_lists: List[List[str]]) -> List[str]:
+        return [k for sub in (list_of_lists or []) for k in (sub or []) if k]
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def write_manifest(all_written_keys: List[str]) -> None:
-        if not all_written_keys:
+    def write_manifest(all_keys: List[str]) -> None:
+        if not all_keys:
             raise AirflowSkipException("No files written; skipping manifest.")
         s3 = S3Hook()
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
-        s3.load_string("\n".join(all_written_keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
-        print(f"✅ Manifest updated with {len(all_written_keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
+        s3.load_string("\n".join(all_keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
+        print(f"✅ Manifest updated with {len(all_keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
 
+    # ───────────────────────────────
+    # Wiring (no nested mapping)
+    # ───────────────────────────────
+    underlyings = read_underlyings()
+    trading_days = compute_trading_dates()
+    pairs = make_pairs(underlyings, trading_days)                          # list[dict{ticker, target_date}]
+
+    discoveries = discover_for_pair.expand(pair=pairs)                     # mapped over pairs
+    batch_specs = batch_contracts_for_pair.expand(discovery=discoveries)   # mapped over discoveries
+    written_lists = process_contract_batch.expand(batch_info=batch_specs)  # mapped over batch specs
+    all_keys = flatten_str_lists(written_lists)
     write_manifest(all_keys)
 
 polygon_options_ingest_backfill_dag()
