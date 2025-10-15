@@ -1,3 +1,4 @@
+# dags/polygon/options/polygon_options_ingest_daily.py
 from __future__ import annotations
 
 import csv
@@ -38,11 +39,18 @@ API_POOL = "api_pool"  # ensure this pool exists (slots ~8)
 CONTRACT_BATCH_SIZE = int(os.getenv("OPTIONS_DAILY_CONTRACT_BATCH_SIZE", "400"))
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
 
+# NEW: Optional idempotent writes (default True = overwrite)
+REPLACE_FILES = os.getenv("DAILY_REPLACE", "true").lower() == "true"
+
 default_args = {
     "owner": "data-platform",
     "retries": 3,
     "retry_delay": pendulum.duration(minutes=5),
 }
+
+# Guardrail: ensure BUCKET_NAME is configured
+if not BUCKET_NAME:
+    raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -178,11 +186,14 @@ def polygon_options_ingest_daily_dag():
     @task
     def compute_target_date() -> str:
         """
-        Use logical_date so daily schedule loads the **previous calendar day**.
+        Use logical_date so the daily schedule loads the previous **business** day.
+        If the prior day is Sat/Sun, roll back to Friday.
         """
         ctx = get_current_context()
-        logical_date = ctx["logical_date"]
-        return logical_date.subtract(days=1).to_date_string()
+        d = ctx["logical_date"].subtract(days=1)  # prior calendar day
+        while d.day_of_week in (5, 6):  # 5=Sat, 6=Sun
+            d = d.subtract(days=1)
+        return d.to_date_string()
 
     # ───────────────────────────────
     # Contract Discovery
@@ -284,6 +295,11 @@ def polygon_options_ingest_daily_dag():
             gz_bytes = buf.getvalue()
 
             s3_key = f"raw/options/{contract_ticker}/{target_date}.json.gz"
+
+            # NEW: optionally skip overwriting existing files for idempotency
+            if not REPLACE_FILES and s3.check_for_key(s3_key, bucket_name=BUCKET_NAME):
+                continue
+
             s3.load_bytes(bytes_data=gz_bytes, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
             written_keys.append(s3_key)
 
