@@ -1,18 +1,46 @@
 from __future__ import annotations
-import pendulum
 import os
-import requests
 import json
 import csv
+import time
+from typing import List
+
+import pendulum
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import timedelta
+
 from airflow.decorators import dag, task
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.models import Variable  # read from Secrets Manager via Variables
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Config / Constants
+# ────────────────────────────────────────────────────────────────────────────────
+POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: 'stock-market-elt'
+DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
+
+# Networking & rate limits
+REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
+REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-stocks-backfill (manual)")
+API_POOL = os.getenv("API_POOL", "api_pool")  # ensure this pool exists (airflow_settings.yaml)
+
+# Toggle idempotent overwrites (for true backfills you usually want overwrite)
+REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "true").lower() == "true"
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_stocks_key() -> str:
     """
     Return a clean Polygon Stocks API key whether the Airflow Variable is stored as:
@@ -71,16 +99,61 @@ def _get_polygon_stocks_key() -> str:
     )
 
 
+def _session() -> requests.Session:
+    """HTTP session with connection pooling + retries for resilience and speed."""
+    s = requests.Session()
+    retries = Retry(
+        total=6,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+
+def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
+    """
+    Robust GET with exponential backoff for 429/5xx and 'Retry-After' support.
+    """
+    backoff = 1.5
+    delay = 1.0
+    tries = 0
+    while True:
+        resp = sess.get(url, params=params, timeout=REQUEST_TIMEOUT_SECS)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            sleep_s = float(retry_after) if retry_after else delay
+            time.sleep(sleep_s)
+            delay *= backoff
+            tries += 1
+        elif 500 <= resp.status_code < 600:
+            if tries >= max_tries:
+                resp.raise_for_status()
+            time.sleep(delay)
+            delay *= backoff
+            tries += 1
+        else:
+            return resp
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# DAG
+# ────────────────────────────────────────────────────────────────────────────────
 @dag(
     dag_id="polygon_stocks_ingest_backfill",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=None,
     catchup=False,
-    tags=["ingestion", "polygon", "backfill", "aws"],
+    tags=["ingestion", "polygon", "stocks", "backfill", "aws"],
     params={
-        "start_date": Param(default="2025-10-06", type="string", description="The start date for the backfill (YYYY-MM-DD)."),
-        "end_date": Param(default="2025-10-11", type="string", description="The end date for the backfill (YYYY-MM-DD)."),
+        "start_date": Param(default="2025-10-06", type="string", description="Backfill start date (YYYY-MM-DD)."),
+        "end_date":   Param(default="2025-10-11", type="string", description="Backfill end date (YYYY-MM-DD)."),
     },
+    dagrun_timeout=timedelta(hours=12),
+    max_active_runs=1,
 )
 def polygon_stocks_ingest_backfill_dag():
     """
@@ -89,11 +162,12 @@ def polygon_stocks_ingest_backfill_dag():
 
     S3 writes:
       - raw/stocks/{TICKER}/{YYYY-MM-DD}.json
-      - raw/manifests/manifest_latest.txt
+      - raw/manifests/manifest_latest.txt   (kept for compatibility)
     """
-    BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: 'stock-market-elt'
-    DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
-    USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-stocks-backfill (manual)")
+
+    # Guardrail: ensure bucket configured
+    if not BUCKET_NAME:
+        raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
     @task
     def get_custom_tickers() -> list[str]:
@@ -105,13 +179,16 @@ def polygon_stocks_ingest_backfill_dag():
                 t = (row.get("ticker") or "").strip().upper()
                 if t:
                     tickers.append(t)
+        if not tickers:
+            raise AirflowSkipException("No tickers found in dbt/seeds/custom_tickers.csv.")
         return tickers
 
     @task
     def generate_date_range(**kwargs) -> list[str]:
         start = pendulum.parse(kwargs["params"]["start_date"])
         end = pendulum.parse(kwargs["params"]["end_date"])
-
+        if start > end:
+            raise ValueError("start_date cannot be after end_date.")
         trading_dates: list[str] = []
         cur = start
         while cur <= end:
@@ -119,69 +196,80 @@ def polygon_stocks_ingest_backfill_dag():
             if cur.day_of_week not in (5, 6):
                 trading_dates.append(cur.to_date_string())
             cur = cur.add(days=1)
+        if not trading_dates:
+            raise AirflowSkipException("No trading dates in the given range.")
         return trading_dates
 
-    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool="api_pool")
+    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool=API_POOL)
     def process_date(target_date: str, custom_tickers: list[str]) -> list[str]:
-        # Use default AWS credentials chain (mounted ~/.aws)
+        """
+        Fetch grouped bars for the date, filter to your custom tickers, and write per-ticker JSON.
+        Uses pooled session + polite backoff. Skips market holidays (404).
+        """
         s3_hook = S3Hook()
         api_key = _get_polygon_stocks_key()
-
         custom_tickers_set = set(custom_tickers)
-        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{target_date}"
+
+        sess = _session()
+        url = POLYGON_GROUPED_URL.format(date=target_date)
         params = {"adjusted": "true", "apiKey": api_key}
-        headers = {"User-Agent": USER_AGENT}
 
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=90)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                print(f"No data found for {target_date} (likely a market holiday). Skipping.")
-                return []
-            raise
-        except requests.exceptions.RequestException as e:
-            raise e
+        resp = _rate_limited_get(sess, url, params)
+        if resp.status_code == 404:
+            # Likely a market holiday/closure
+            return []
+        if resp.status_code in (401, 403):
+            # Entitlement/auth issue — surface helpful context but don't kill the whole run
+            try:
+                j = resp.json()
+                msg = j.get("error") or j.get("message") or str(j)
+            except Exception:
+                msg = resp.text
+            print(f"⚠️  {target_date} -> {resp.status_code}: {msg[:200]}")
+            return []
+        resp.raise_for_status()
 
+        data = resp.json()
         processed_s3_keys: list[str] = []
-        if data.get("resultsCount", 0) > 0 and data.get("results"):
-            for result in data["results"]:
-                ticker = (result.get("T") or "").upper()
-                if ticker in custom_tickers_set:
-                    formatted_result = {
-                        "ticker": ticker,
-                        "queryCount": 1,
-                        "resultsCount": 1,
-                        "adjusted": True,
-                        "results": [{
-                            "v": result.get("v"),
-                            "vw": result.get("vw"),
-                            "o": result.get("o"),
-                            "c": result.get("c"),
-                            "h": result.get("h"),
-                            "l": result.get("l"),
-                            "t": result.get("t"),
-                            "n": result.get("n"),
-                        }],
-                        "status": "OK",
-                        "request_id": data.get("request_id"),
-                    }
-                    # s3://<bucket>/raw/stocks/<ticker>/<YYYY-MM-DD>.json
-                    s3_key = f"raw/stocks/{ticker}/{target_date}.json"
-                    s3_hook.load_string(
-                        string_data=json.dumps(formatted_result),
-                        key=s3_key,
-                        bucket_name=BUCKET_NAME,
-                        replace=True,
-                    )
-                    processed_s3_keys.append(s3_key)
+        for result in (data.get("results") or []):
+            ticker = (result.get("T") or "").upper()
+            if ticker and ticker in custom_tickers_set:
+                formatted_result = {
+                    "ticker": ticker,
+                    "queryCount": 1,
+                    "resultsCount": 1,
+                    "adjusted": True,
+                    "results": [{
+                        "v": result.get("v"),
+                        "vw": result.get("vw"),
+                        "o": result.get("o"),
+                        "c": result.get("c"),
+                        "h": result.get("h"),
+                        "l": result.get("l"),
+                        "t": result.get("t"),
+                        "n": result.get("n"),
+                    }],
+                    "status": "OK",
+                    "request_id": data.get("request_id"),
+                }
+                s3_key = f"raw/stocks/{ticker}/{target_date}.json"
+                if not REPLACE_FILES and s3_hook.check_for_key(s3_key, bucket_name=BUCKET_NAME):
+                    continue
+                s3_hook.load_string(
+                    string_data=json.dumps(formatted_result, separators=(",", ":")),
+                    key=s3_key,
+                    bucket_name=BUCKET_NAME,
+                    replace=True,
+                )
+                processed_s3_keys.append(s3_key)
+
+                time.sleep(REQUEST_DELAY_SECONDS)
 
         return processed_s3_keys
 
     @task
     def flatten_s3_key_list(nested_list: list[list[str]]) -> list[str]:
-        return [key for sub in nested_list for key in sub if key]
+        return [key for sub in (nested_list or []) for key in (sub or []) if key]
 
     @task(outlets=[S3_STOCKS_MANIFEST_DATASET])
     def write_manifest_to_s3(s3_keys: list[str]):
@@ -189,9 +277,10 @@ def polygon_stocks_ingest_backfill_dag():
             raise AirflowSkipException("No S3 keys were processed during the backfill.")
         manifest_content = "\n".join(s3_keys)
         s3_hook = S3Hook()
+        # Kept the original manifest path for compatibility with your downstream loader.
         manifest_key = "raw/manifests/manifest_latest.txt"
         s3_hook.load_string(string_data=manifest_content, key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
-        print(f"Backfill manifest file created: s3://{BUCKET_NAME}/{manifest_key}")
+        print(f"✅ Backfill manifest file created: s3://{BUCKET_NAME}/{manifest_key} (files: {len(s3_keys)})")
 
     # Flow
     custom_tickers = get_custom_tickers()
