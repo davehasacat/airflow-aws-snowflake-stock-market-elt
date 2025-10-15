@@ -173,7 +173,8 @@ def polygon_options_load_dag():
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
         """
         Insert raw payloads from staging into landing table (no regex or symbol parsing).
-        Projections are from rec:results[0], with TRY_* casts and null-safe indexing.
+        Projections are from rec:results[0]; extract VARIANT -> STRING -> TRY_TO_NUMBER,
+        then cast to final numeric types to avoid VARIANT cast errors.
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -186,22 +187,26 @@ def polygon_options_load_dag():
         SELECT
             TO_VARCHAR(rec:ticker) AS option_symbol,
 
-            /* trade_date and bar_ts from ms epoch in the first result bar */
-            TO_DATE(TO_TIMESTAMP_NTZ( (rec:results[0]:t)::NUMBER / 1000 ))                         AS trade_date,
-            TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t) / 1000 )                             AS bar_ts,
+            /* t is ms since epoch; extract as string -> to number -> timestamp */
+            TO_DATE(
+              TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 )
+            )                                                                 AS trade_date,
+            TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 ) AS bar_ts,
 
-            /* results[0] numeric fields */
-            TRY_TO_NUMBER(rec:results[0]:o)::FLOAT                                                 AS open,
-            TRY_TO_NUMBER(rec:results[0]:h)::FLOAT                                                 AS high,
-            TRY_TO_NUMBER(rec:results[0]:l)::FLOAT                                                 AS low,
-            TRY_TO_NUMBER(rec:results[0]:c)::FLOAT                                                 AS close,
-            TRY_TO_NUMBER(rec:results[0]:v)::BIGINT                                                AS volume,
-            TRY_TO_NUMBER(rec:results[0]:vw)::FLOAT                                                AS vwap,
-            TRY_TO_NUMBER(rec:results[0]:n)::BIGINT                                                AS transactions,
+            /* results[0] numeric fields — extract as string, then to number, then cast */
+            TRY_TO_NUMBER(rec:results[0]:o::STRING)::FLOAT  AS open,
+            TRY_TO_NUMBER(rec:results[0]:h::STRING)::FLOAT  AS high,
+            TRY_TO_NUMBER(rec:results[0]:l::STRING)::FLOAT  AS low,
+            TRY_TO_NUMBER(rec:results[0]:c::STRING)::FLOAT  AS close,
+            TRY_TO_NUMBER(rec:results[0]:v::STRING)::BIGINT AS volume,
+            TRY_TO_NUMBER(rec:results[0]:vw::STRING)::FLOAT AS vwap,
+            TRY_TO_NUMBER(rec:results[0]:n::STRING)::BIGINT AS transactions,
 
-            rec                                                                                    AS raw_rec
+            rec AS raw_rec
         FROM {FQ_STAGE_TABLE}
-        WHERE rec:ticker IS NOT NULL;
+        WHERE rec:ticker IS NOT NULL
+          AND ARRAY_SIZE(rec:results) > 0
+          AND rec:results[0]:t IS NOT NULL;
         """
         hook.run(insert_sql)
 
