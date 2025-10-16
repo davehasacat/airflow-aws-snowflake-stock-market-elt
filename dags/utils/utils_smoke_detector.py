@@ -157,9 +157,17 @@ def utils_smoke_detector():
         try:
             hook.run(f"DESC STAGE {fq_stage_no_at}")
             print(f"[SF] ✅ Stage exists: {fq_stage_no_at}")
-            # Touch the stage with a LIST to ensure external location is reachable
-            hook.run(f"LIST @{fq_stage_no_at} PATTERN='.*' LIMIT=1;")
-            print(f"[SF] ✅ Stage LIST ok (reachable)")
+
+            # Touch the stage with a LIST to ensure external location is reachable.
+            hook.run(f"LIST @{fq_stage_no_at} PATTERN='.*'")
+
+            # Don't assume column names from LIST output; use a positional grab.
+            row = hook.get_first("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) LIMIT 1")
+            if row:
+                print(f"[SF] ✅ Stage LIST ok (reachable), sample row: {row}")
+            else:
+                print(f"[SF] ⚠️ Stage LIST returned no rows (stage reachable but empty?)")
+
         except Exception as e:
             raise RuntimeError(f"[SF] ❌ Stage not accessible: {fq_stage_no_at} — {e}") from e
 
