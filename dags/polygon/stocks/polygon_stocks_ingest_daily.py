@@ -115,7 +115,7 @@ def _previous_trading_day(iso_date_str: str) -> str:
 # ────────────────────────────────────────────────────────────────────────────────
 @dag(
     dag_id="polygon_stocks_ingest_daily",
-    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+    start_date=pendulum.now(tz="UTC"),
     schedule="0 0 * * 1-5",  # Mon–Fri at 00:00 UTC; targets previous trading day
     catchup=True,
     tags=["ingestion", "polygon", "daily", "aws", "stocks"],

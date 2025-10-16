@@ -54,7 +54,8 @@ def polygon_stocks_load_dag():
     TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"       # for COPY
+    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"  # for DESC/SHOW
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -83,24 +84,26 @@ def polygon_stocks_load_dag():
 
     @task
     def check_stage_exists():
-        """Nice-to-have guard: make sure stage name matches what Snowflake has."""
+        """Ensure the external stage exists and is accessible."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         try:
-            hook.run(f"DESC STAGE {FQ_STAGE}")
+            hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
         except Exception as e:
             raise RuntimeError(
-                f"Stage {FQ_STAGE} not found or not accessible. "
-                f"Make sure your Snowflake external stage exists and privileges are set. Original error: {e}"
+                f"Stage {FQ_STAGE_NO_AT} not found or not accessible. "
+                f"Verify the stage exists and privileges are set. Original error: {e}"
             )
 
     @task
     def get_stage_relative_keys_from_manifest() -> list[str]:
         """
         Read the S3 manifest and normalize keys into stage-relative paths.
-        Handles BOTH:
+
+        Supports:
           a) Flat manifest: each line is 'raw/stocks/.../*.json'
           b) Pointer manifest: first non-empty line 'POINTER=<s3_key>' (same bucket)
-             which points to a flat manifest created by the writer (e.g., backfill).
+             which points to a flat manifest created by the writer (daily/backfill).
+
         Only includes stocks files, de-duped, order preserved.
         """
         s3 = S3Hook()
@@ -112,7 +115,6 @@ def polygon_stocks_load_dag():
             return [ln.strip() for ln in content.splitlines() if ln.strip()]
 
         lines = _read_lines(MANIFEST_KEY)
-        # Pointer mode? First non-empty line like "POINTER=raw/manifests/stocks/manifest_2025-10-15T18-22-09.txt"
         first = lines[0] if lines else ""
         if first.startswith("POINTER="):
             pointed_key = first.split("=", 1)[1].strip()
@@ -123,13 +125,13 @@ def polygon_stocks_load_dag():
         if not lines:
             raise AirflowSkipException("Manifest is empty; nothing to load.")
 
-        # Normalize to stage-relative: strip the leading 'raw/' prefix, filter to stocks/
+        # Normalize to stage-relative: strip 'raw/' prefix, filter to stocks/
         rel = [(k[4:] if k.startswith("raw/") else k) for k in lines]
         rel = [k for k in rel if k.startswith("stocks/")]
 
-        # De-dupe while preserving order
+        # De-dupe (preserve order)
         seen = set()
-        deduped = []
+        deduped: list[str] = []
         for k in rel:
             if k not in seen:
                 seen.add(k)
