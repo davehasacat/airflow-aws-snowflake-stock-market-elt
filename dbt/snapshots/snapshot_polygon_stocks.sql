@@ -9,17 +9,6 @@
     )
 }}
 
-select
-  ticker,
-  trade_date,
-  cast(inserted_at as timestamp) as inserted_at,
-  open,
-  high,
-  low,
-  close,
-  vwap,
-  volume,
-  transactions
-from {{ source('public', 'source_polygon_stock_bars_daily') }}
+select * from {{ source('public', 'source_polygon_stocks_raw') }}
 
 {% endsnapshot %}
