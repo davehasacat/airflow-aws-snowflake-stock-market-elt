@@ -2,9 +2,10 @@ from __future__ import annotations
 import os
 import json
 from datetime import timedelta
+from typing import Dict, Any, List
 
 import pendulum
-from airflow.decorators import dag
+from airflow.decorators import dag, task
 from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 from cosmos.profiles import SnowflakeUserPasswordProfileMapping
 from dags.utils.utils import send_failure_email
@@ -45,9 +46,6 @@ MANIFEST_PATH = _env_str("DBT_MANIFEST_PATH", os.path.join(DBT_TARGET_PATH, "man
 USE_MANIFEST = os.path.exists(MANIFEST_PATH)
 
 
-# ───────────────────────────────────────────────
-# DAG Definition
-# ───────────────────────────────────────────────
 @dag(
     dag_id="dbt_build",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
@@ -57,11 +55,8 @@ USE_MANIFEST = os.path.exists(MANIFEST_PATH)
     tags=["dbt", "build"],
     default_args={"on_failure_callback": send_failure_email},
     doc_md="""
-    **dbt_build DAG**
-
-    Runs `dbt build` using Cosmos with a runtime profile
-    derived from the `snowflake_default` Airflow connection
-    (stored in AWS Secrets Manager).
+    **dbt_build DAG** — Runs `dbt build` with a Snowflake runtime profile from `snowflake_default`,
+    then prints a concise summary from `run_results.json`.
     """,
 )
 def dbt_build_dag():
@@ -74,9 +69,7 @@ def dbt_build_dag():
     profile_cfg = ProfileConfig(
         profile_name="stock_market_elt",
         target_name="dev",
-        profile_mapping=SnowflakeUserPasswordProfileMapping(
-            conn_id="snowflake_default",
-        ),
+        profile_mapping=SnowflakeUserPasswordProfileMapping(conn_id="snowflake_default"),
     )
 
     exec_cfg = ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH)
@@ -94,7 +87,7 @@ def dbt_build_dag():
         return " ".join(parts)
 
     dbt_build = DbtTaskGroup(
-        group_id="dbt_build",
+        group_id="dbt_build_only",
         project_config=project_cfg,
         profile_config=profile_cfg,
         execution_config=exec_cfg,
@@ -106,7 +99,63 @@ def dbt_build_dag():
         },
     )
 
-    dbt_build
+    @task(task_id="summarize_dbt_results")
+    def summarize_dbt_results() -> None:
+        # Prefer explicit DBT_TARGET_PATH, fallback to <project>/target
+        candidates: List[str] = [
+            os.path.join(DBT_TARGET_PATH, "run_results.json"),
+            os.path.join(DBT_PROJECT_DIR, "target", "run_results.json"),
+        ]
+        rr_path = next((p for p in candidates if os.path.exists(p)), None)
+        if not rr_path:
+            print("run_results.json not found in expected locations:")
+            for p in candidates:
+                print(f" - {p}")
+            # Don't fail the DAG: dbt may have failed earlier and raised already
+            return
+
+        with open(rr_path, "r") as f:
+            rr: Dict[str, Any] = json.load(f)
+
+        results = rr.get("results", [])
+        if not results:
+            print("No results found in run_results.json.")
+            return
+
+        # Count by status
+        by_status: Dict[str, int] = {}
+        for r in results:
+            status = (r.get("status") or "unknown").lower()
+            by_status[status] = by_status.get(status, 0) + 1
+
+        total = len(results)
+        print("\n=== dbt build summary ===")
+        print(f"Total steps: {total}")
+        for s in sorted(by_status.keys()):
+            print(f"  {s}: {by_status[s]}")
+
+        # Print top failures if any
+        failures = [
+            r for r in results
+            if (r.get("status") or "").lower() in {"error", "fail", "failed"}
+        ]
+        if failures:
+            print("\nTop failing nodes (up to 20):")
+            for r in failures[:20]:
+                unique_id = r.get("unique_id", "<unknown>")
+                status = r.get("status", "<status?>")
+                message = (r.get("message") or "").strip()
+                timing = r.get("timing") or []
+                elapsed = None
+                if timing:
+                    # last timing entry usually has 'completed_at' and 'started_at'
+                    last = timing[-1]
+                    elapsed = last.get("completed_at") or last.get("name")
+                print(f"- {unique_id} [{status}] {('- ' + message) if message else ''} {('(completed ' + str(elapsed) + ')') if elapsed else ''}")
+
+        # Exit code stays success; dbt operator already controls fail/abort behavior.
+
+    dbt_build >> summarize_dbt_results()
 
 
 dbt_build_dag()
