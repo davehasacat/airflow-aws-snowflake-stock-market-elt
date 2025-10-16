@@ -14,8 +14,8 @@ renamed_and_casted as (
 select
   -- Create a unique identifier for each option bar
   option_symbol || '_' || trade_date as option_bar_id,
+  bar_ts as polygon_bar_timestamp,
   option_symbol,
-  underlying_ticker,
   trade_date,
   expiration_date,
   strike_price,
@@ -28,6 +28,7 @@ select
   vwap as volume_weighted_average_price,
   transactions,
   inserted_at as loaded_at
+  raw_rec as raw_json_record
 from source
 )
 

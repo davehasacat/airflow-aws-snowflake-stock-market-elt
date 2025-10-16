@@ -12,8 +12,8 @@ stocks as (select * from {{ ref('int_polygon__stock_bars_enriched') }}),
 joined as (
 select
   t1.option_bar_id,
+  t1.polygon_bar_timestamp,
   t1.option_symbol,
-  t1.underlying_ticker,
   t1.trade_date,
   t1.expiration_date,
   t1.strike_price,

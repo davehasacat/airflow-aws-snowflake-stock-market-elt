@@ -80,8 +80,6 @@ models:
           - not_null
       - name: option_symbol
         description: "The unique symbol for the option contract."
-      - name: underlying_ticker
-        description: "The ticker symbol of the underlying stock."
       - name: trade_date
         description: "The date of the option bar."
       - name: expiration_date

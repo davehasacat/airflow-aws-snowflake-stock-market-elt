@@ -1,10 +1,10 @@
 version: 2
 
 models:
-  - name: fct_polygon__stock_bars_performance
+  - name: mrt_polygon__stocks_options_joined
     description: "Final analytics-ready model showing daily stock performance metrics. This is the primary model for BI tools and analysis."
     columns:
-      - name: stock_bar_id
+      - name: option_bar_id
         description: "The unique identifier for a single day's stock bar (ticker + trade_date)."
         tests:
           - unique

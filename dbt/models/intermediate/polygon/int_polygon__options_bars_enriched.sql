@@ -17,8 +17,8 @@ with source as (
 add_calculated_metrics as (
 select
   option_bar_id,
+  polygon_bar_timestamp
   option_symbol,
-  underlying_ticker,
   trade_date,
   expiration_date,
   (expiration_date::date - trade_date::date) as days_to_expiration,
