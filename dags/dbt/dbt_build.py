@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 from pathlib import Path
+from textwrap import dedent
 
 import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-# Common locations inside the Astronomer/Airflow container where your dbt project may live
 DBT_DEFAULT_PATHS = [
     "/usr/local/airflow",          # repo root (most common)
     "/usr/local/airflow/dbt",
@@ -30,44 +32,166 @@ def _resolve_dbt_exe() -> str:
     return resolved
 
 def _resolve_project_dir() -> str:
-    # Prefer an explicit env override if you set one
     override = os.getenv("DBT_PROJECT_DIR")
     if override:
         if (Path(override) / "dbt_project.yml").exists():
             return str(Path(override).resolve())
         raise RuntimeError(f"[DBT] DBT_PROJECT_DIR set to '{override}' but dbt_project.yml not found there.")
-
-    # Otherwise, find a dbt_project.yml in common spots
     for base in DBT_DEFAULT_PATHS:
         candidate = Path(base) / "dbt_project.yml"
         if candidate.exists():
             return str(Path(base).resolve())
-    # fallback to CWD if it contains dbt_project.yml
     if Path("dbt_project.yml").exists():
         return str(Path(".").resolve())
     raise RuntimeError(
         "[DBT] Could not locate 'dbt_project.yml'. "
-        "Place your dbt project at /usr/local/airflow (recommended) or set DBT_PROJECT_DIR."
+        "Place your dbt project at /usr/local/airflow or set DBT_PROJECT_DIR."
     )
 
-def _run(cmd: list[str], cwd: str):
-    # 20-minute cap should be plenty for moderate projects; tune as needed
-    out = subprocess.check_output(cmd, cwd=cwd, text=True, stderr=subprocess.STDOUT, timeout=1200)
-    print(out.strip())
-    return out
+def _normalize_target_value(val) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        for k in ("dbt_target", "target", "value"):
+            v = val.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                return _normalize_target_value(obj)
+            except Exception:
+                return None
+        return s
+    return str(val).strip() or None
+
+def _resolve_target() -> str:
+    env_target = os.getenv("DBT_TARGET")
+    if env_target and env_target.strip():
+        return env_target.strip()
+    var_val = None
+    try:
+        var_val = Variable.get("dbt_target", deserialize_json=True)
+    except Exception:
+        try:
+            var_val = Variable.get("dbt_target")
+        except Exception:
+            var_val = None
+    tgt = _normalize_target_value(var_val)
+    if tgt:
+        return tgt
+    return "ci"  # fallback—your current profile showed only 'ci' earlier
+
+def _git_available() -> bool:
+    return shutil.which("git") is not None
+
+def _run(cmd: list[str], cwd: str, extra_env: dict | None = None):
+    env = os.environ.copy()
+    if extra_env:
+        env.update({k: v for k, v in extra_env.items() if v is not None})
+    try:
+        out = subprocess.check_output(
+            cmd, cwd=cwd, text=True, stderr=subprocess.STDOUT, timeout=1200, env=env
+        )
+        print(out.strip())
+        return out
+    except subprocess.CalledProcessError as e:
+        print("── dbt command failed ──")
+        print("Command:", " ".join(cmd))
+        print("Output:\n", e.output)
+        raise
+
+def _render_profiles_yml_from_airflow_conn(profiles_dir: Path, target: str) -> Path:
+    """
+    Create a minimal dbt profiles.yml for Snowflake using the Airflow connection 'snowflake_default'.
+    This avoids hardcoding secrets into the image. File is written to profiles_dir/profiles.yml.
+    """
+    conn = BaseHook.get_connection("snowflake_default")
+    extras = conn.extra_dejson or {}
+    user = conn.login or extras.get("user")
+    password = conn.password or extras.get("password")
+    account = extras.get("account")  # expected in Snowflake conn extras
+    role = extras.get("role") or extras.get("extra__snowflake__role")
+    warehouse = extras.get("warehouse") or extras.get("extra__snowflake__warehouse")
+    database = extras.get("database") or extras.get("extra__snowflake__database")
+    schema = extras.get("schema") or extras.get("extra__snowflake__schema") or "PUBLIC"
+    authenticator = extras.get("authenticator")  # optional: externalbrowser / oauth / etc.
+
+    # Basic validation
+    missing = [k for k, v in {
+        "user": user, "password": password, "account": account,
+        "role": role, "warehouse": warehouse, "database": database, "schema": schema
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"[DBT] snowflake_default missing required fields: {missing}. "
+                           "Fill the Airflow connection extras (account/warehouse/database/role/schema) and password.")
+
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    profiles_yml = profiles_dir / "profiles.yml"
+
+    # Build YAML (keep it tiny; dbt 1.10 defaults are fine)
+    content = {
+        "stock_market_elt": {  # must match your dbt_project.yml 'profile:'
+            "target": target,
+            "outputs": {
+                target: {
+                    "type": "snowflake",
+                    "account": account,
+                    "user": user,
+                    "password": password,
+                    "role": role,
+                    "database": database,
+                    "warehouse": warehouse,
+                    "schema": schema,
+                    "threads": int(os.getenv("DBT_THREADS", "4")),
+                    # Optional extras below
+                    **({"authenticator": authenticator} if authenticator else {}),
+                    "client_session_keep_alive": False,
+                }
+            }
+        }
+    }
+
+    # Manual YAML dump (simple & dependency-free)
+    def _dump_yaml(d, indent=0):
+        lines = []
+        for k, v in d.items():
+            if isinstance(v, dict):
+                lines.append("  " * indent + f"{k}:")
+                lines.extend(_dump_yaml(v, indent + 1))
+            else:
+                if isinstance(v, bool):
+                    sval = "true" if v else "false"
+                else:
+                    sval = str(v)
+                lines.append("  " * indent + f"{k}: {sval}")
+        return lines
+
+    text = "\n".join(_dump_yaml(content)) + "\n"
+    profiles_yml.write_text(text, encoding="utf-8")
+
+    # Do NOT print the file content (contains password). Just confirm path.
+    print(f"[DBT] Wrote profiles.yml to {profiles_yml} (using Airflow connection 'snowflake_default').")
+    return profiles_yml
 
 @dag(
     dag_id="dbt_build",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule=None,            # run on-demand
+    schedule=None,
     catchup=False,
     max_active_runs=1,
     tags=["dbt", "build"],
     default_args={"retries": 0},
     doc_md="""
     # dbt build
-    Runs `dbt debug` → `dbt deps` → (optional) `dbt source freshness` → `dbt build`,
-    then uploads artifacts (`manifest.json`, `run_results.json`) to S3.
+    Renders a secure dbt `profiles.yml` from Airflow's `snowflake_default`, then runs:
+    `dbt debug` → `dbt deps` → (optional) `dbt source freshness` → `dbt build`,
+    and uploads `manifest.json` + `run_results.json` to S3.
     """,
 )
 def dbt_build():
@@ -76,20 +200,34 @@ def dbt_build():
     def prepare():
         exe = _resolve_dbt_exe()
         project_dir = _resolve_project_dir()
-        target = Variable.get("dbt_target", default_var="dev")
+        target = _resolve_target()
         bucket = os.getenv("BUCKET_NAME")
         if not bucket:
             raise RuntimeError("BUCKET_NAME env var is required.")
         print(f"[DBT] exe={exe}")
         print(f"[DBT] project_dir={project_dir}")
-        print(f"[DBT] target={target}")
+        print(f"[DBT] target(resolved)={target}")
         print(f"[DBT] threads={os.getenv('DBT_THREADS') or '(dbt default)'}")
         print(f"[S3] bucket={bucket}")
-        return {"exe": exe, "project_dir": project_dir, "target": target, "bucket": bucket}
+        return {
+            "exe": exe,
+            "project_dir": project_dir,
+            "target": target,
+            "bucket": bucket,
+            "git_ok": _git_available(),
+        }
+
+    @task
+    def render_profiles(cfg: dict):
+        # Create a private profiles dir and set DBT_PROFILES_DIR for subsequent commands
+        profiles_dir = Path("/tmp/dbt_profiles")
+        _ = _render_profiles_yml_from_airflow_conn(profiles_dir, cfg["target"])
+        print(f"[DBT] Using DBT_PROFILES_DIR={profiles_dir}")
+        return {**cfg, "profiles_dir": str(profiles_dir)}
 
     @task
     def resume_warehouse():
-        # Optional but helpful: ensure WH is awake before dbt to avoid cold-start latency
+        # Optional: wake the WH
         hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
         try:
             wh = hook.get_first("select current_warehouse()")[0]
@@ -101,42 +239,48 @@ def dbt_build():
 
     @task_group
     def dbt_steps(cfg: dict):
-        exe = cfg["exe"]
-        project_dir = cfg["project_dir"]
-        target = cfg["target"]
+
+        def _env(cfg: dict) -> dict:
+            return {
+                "DBT_PROFILES_DIR": cfg["profiles_dir"],
+                "DBT_TARGET": cfg["target"],  # helpful if you run dbt without --target elsewhere
+            }
 
         @task
-        def debug():
-            cmd = [exe, "debug", "--target", target, "--no-use-colors", "--quiet"]
-            _run(cmd, project_dir)
+        def debug(cfg: dict):
+            exe = cfg["exe"]; project_dir = cfg["project_dir"]; target = cfg["target"]
+            cmd = [exe, "debug", "--target", target, "--no-use-colors"]
+            _run(cmd, project_dir, extra_env=_env(cfg))
 
         @task
-        def deps():
+        def deps(cfg: dict):
+            exe = cfg["exe"]; project_dir = cfg["project_dir"]
+            if not cfg.get("git_ok", False):
+                print("[DBT] Skipping `dbt deps` because `git` is not available in PATH.")
+                return
             cmd = [exe, "deps"]
-            _run(cmd, project_dir)
+            _run(cmd, project_dir, extra_env=_env(cfg))
 
         @task
-        def freshness():
-            # Non-fatal: continue even if freshness not configured for sources yet
+        def freshness(cfg: dict):
+            exe = cfg["exe"]; project_dir = cfg["project_dir"]; target = cfg["target"]
             try:
                 cmd = [exe, "source", "freshness", "--target", target, "--no-use-colors"]
-                _run(cmd, project_dir)
-            except subprocess.CalledProcessError as e:
-                print("[DBT] source freshness failed (continuing). Output:\n" + e.output)
+                _run(cmd, project_dir, extra_env=_env(cfg))
+            except subprocess.CalledProcessError:
+                print("[DBT] source freshness failed (continuing). See logs above for details.")
 
         @task
-        def build():
-            # dbt will read DBT_THREADS from env automatically if set
-            # You can add selection, e.g., ['--select', 'tag:core']
+        def build(cfg: dict):
+            exe = cfg["exe"]; project_dir = cfg["project_dir"]; target = cfg["target"]
             cmd = [exe, "build", "--target", target, "--no-use-colors"]
-            _run(cmd, project_dir)
+            _run(cmd, project_dir, extra_env=_env(cfg))
 
-        debug() >> deps() >> freshness() >> build()
+        debug(cfg) >> deps(cfg) >> freshness(cfg) >> build(cfg)
 
     @task
     def publish_artifacts(cfg: dict):
-        project_dir = cfg["project_dir"]
-        bucket = cfg["bucket"]
+        project_dir = cfg["project_dir"]; bucket = cfg["bucket"]
         target_dir = Path(project_dir) / "target"
         manifest = target_dir / "manifest.json"
         run_results = target_dir / "run_results.json"
@@ -146,19 +290,15 @@ def dbt_build():
             print(f"[DBT] Artifacts missing (skipping upload): {missing}")
             return
 
-        s3 = S3Hook()  # uses your AWS creds (same profile env as the rest of the stack)
+        s3 = S3Hook()
         base_key = f"dbt/artifacts/{pendulum.now('UTC').format('YYYYMMDD_HHmmss')}/"
         for f in [manifest, run_results]:
             key = base_key + f.name
-            s3.load_file(
-                filename=str(f),
-                key=key,
-                bucket_name=bucket,
-                replace=True,
-            )
+            s3.load_file(filename=str(f), key=key, bucket_name=bucket, replace=True)
             print(f"[S3] Uploaded s3://{bucket}/{key}")
 
     cfg = prepare()
-    resume_warehouse() >> dbt_steps(cfg) >> publish_artifacts(cfg)
+    cfg2 = render_profiles(cfg)
+    resume_warehouse() >> dbt_steps(cfg2) >> publish_artifacts(cfg2)
 
 dbt_build()
