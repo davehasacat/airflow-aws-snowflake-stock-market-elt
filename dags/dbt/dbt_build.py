@@ -7,7 +7,6 @@ import pendulum
 from airflow.decorators import dag
 from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 from cosmos.profiles import SnowflakeUserPasswordProfileMapping
-from cosmos.config import RenderConfig
 from dags.utils.utils import send_failure_email
 
 
@@ -40,14 +39,13 @@ DBT_SELECT = _env_str("DBT_BUILD_SELECT", "")
 DBT_EXCLUDE = _env_str("DBT_BUILD_EXCLUDE", "")
 DBT_FULL_REFRESH = _env_str("DBT_FULL_REFRESH", "").lower() in {"1", "true", "yes"}
 
-DBT_VARS = {
-    # Add project vars here if needed, they will be passed via --vars
-    # "stocks": {"source_table": "source_polygon_stocks_raw"},
+DBT_VARS: dict = {
+    # optional: project vars passed via --vars JSON
 }
 
+# (Optional) prebuilt manifest path — safe to keep, Cosmos will ignore it if not using manifest mode
 MANIFEST_PATH = _env_str("DBT_MANIFEST_PATH", os.path.join(DBT_TARGET_PATH, "manifest.json"))
 USE_MANIFEST = os.path.exists(MANIFEST_PATH)
-LOAD_METHOD = "manifest" if USE_MANIFEST else "project"  # ← key fix (no 'auto')
 
 
 @dag(
@@ -59,34 +57,28 @@ LOAD_METHOD = "manifest" if USE_MANIFEST else "project"  # ← key fix (no 'auto
     tags=["dbt", "build"],
     default_args={"on_failure_callback": send_failure_email},
     doc_md="""
-    Runs seeds → run → snapshots → tests using Cosmos, with runtime profile
-    from the `snowflake_default` Airflow connection. Uses a prebuilt manifest
-    when present to avoid scheduler import-time parsing.
+    Runs seeds → run → snapshots → tests using Cosmos with a runtime profile
+    from `snowflake_default` (AWS Secrets Manager).
     """,
 )
 def dbt_build_dag():
 
-    # Render via manifest if available, else parse project
-    render_cfg = RenderConfig(load_method=LOAD_METHOD)
-
     project_cfg = ProjectConfig(
         dbt_project_path=DBT_PROJECT_DIR,
         env_vars={"DBT_TARGET_PATH": DBT_TARGET_PATH},
+        # manifest_path can stay; it’s ignored if Cosmos isn’t in manifest mode
         manifest_path=MANIFEST_PATH if USE_MANIFEST else None,
     )
 
     profile_cfg = ProfileConfig(
-        profile_name="stock_market_elt",  # keep in sync with dbt_project.yml
+        profile_name="stock_market_elt",
         target_name="dev",
         profile_mapping=SnowflakeUserPasswordProfileMapping(
             conn_id="snowflake_default",
-            # profile_args={ ... }  # optional overrides if your conn extras are incomplete
         ),
     )
 
-    base_exec_cfg = ExecutionConfig(
-        dbt_executable_path=DBT_EXECUTABLE_PATH,
-    )
+    base_exec_cfg = ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH)
 
     def _cmd(base: str, include_full_refresh: bool = False) -> str:
         parts = [base]
@@ -105,7 +97,6 @@ def dbt_build_dag():
         project_config=project_cfg,
         profile_config=profile_cfg,
         execution_config=base_exec_cfg,
-        render_config=render_cfg,
         operator_args={
             "dbt_cmd": _cmd("seed"),
             "retries": 2,
@@ -119,7 +110,6 @@ def dbt_build_dag():
         project_config=project_cfg,
         profile_config=profile_cfg,
         execution_config=base_exec_cfg,
-        render_config=render_cfg,
         operator_args={
             "dbt_cmd": _cmd("run", include_full_refresh=True),
             "retries": 2,
@@ -133,7 +123,6 @@ def dbt_build_dag():
         project_config=project_cfg,
         profile_config=profile_cfg,
         execution_config=base_exec_cfg,
-        render_config=render_cfg,
         operator_args={
             "dbt_cmd": _cmd("snapshot"),
             "retries": 2,
@@ -147,7 +136,6 @@ def dbt_build_dag():
         project_config=project_cfg,
         profile_config=profile_cfg,
         execution_config=base_exec_cfg,
-        render_config=render_cfg,
         operator_args={
             "dbt_cmd": _cmd("test"),
             "retries": 2,

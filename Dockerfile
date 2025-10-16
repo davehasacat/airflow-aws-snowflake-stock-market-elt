@@ -15,10 +15,10 @@ RUN python -m venv /usr/local/airflow/dbt_venv
 
 # Pin to a combo that is present on the Astronomer index and resolves cleanly
 # - dbt-core 1.10.4
-# - dbt-snowflake 1.10.1
+# - dbt-snowflake 1.10.0
 RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir \
     "dbt-core==1.10.4" \
-    "dbt-snowflake==1.10.1"
+    "dbt-snowflake==1.10.0"
 
 # Put dbt on PATH for convenience during build/runtime
 ENV PATH="/usr/local/airflow/dbt_venv/bin:${PATH}"
