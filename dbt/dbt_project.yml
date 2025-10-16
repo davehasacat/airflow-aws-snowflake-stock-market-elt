@@ -1,17 +1,13 @@
 # dbt/dbt_project.yml
 
-# This file configures the dbt project.
-# For more information on configuring this file, see the dbt documentation:
-# https://docs.getdbt.com/docs/build/dbt-project-yml
-
-name: 'stock_market_elt'
-version: '1.0.0'
+name: "stock_market_elt"
+version: "1.0.0"
 config-version: 2
 
-# This is the profile that dbt will use to connect to your data warehouse.
-profile: 'stock_market_elt'
+# dbt profile name (Cosmos maps this to the Airflow connection)
+profile: "stock_market_elt"
 
-# These are configurations that will be applied to all models in your project.
+# Project paths
 model-paths: ["models"]
 analysis-paths: ["analyses"]
 test-paths: ["tests"]
@@ -19,9 +15,26 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
-clean-targets:         # directories to be removed by `dbt clean`
+# Where to write artifacts (env-overridable for Airflow)
+target-path: "{{ env_var('DBT_TARGET_PATH', 'target') }}"
+log-path: "{{ env_var('DBT_LOG_PATH', 'logs') }}"
+
+clean-targets:
   - "target"
   - "dbt_packages"
+
+# Snowflake-friendly quoting (avoid unnecessary double quotes)
+quoting:
+  database: false
+  schema: false
+  identifier: false
+
+# Persist model & column docs to the warehouse for snapshots & models
+# (You can also set this per-folder below.)
+models:
+  +persist_docs:
+    relation: true
+    columns: true
 
 snapshots:
   stock_market_elt:
@@ -29,17 +42,40 @@ snapshots:
       relation: true
       columns: true
     +tags: ["snapshot"]
-    # +schema: snapshots   # uncomment if you want a separate schema
+    # +schema: snapshots   # uncomment to isolate snapshots to their own schema
 
+# Optional: configure seeds (types, quoting, schema)
+# Useful if you add more seeds later or want to enforce types.
+seeds:
+  stock_market_elt:
+    +quote_columns: false
+    # +schema: seeds
+    # custom_tickers.csv:
+    #   +column_types:
+    #     ticker: varchar
+
+# Layered model config
 models:
   stock_market_elt:
-    # Applies to all models in the project
+    # Global defaults for all models in the project
+    +persist_docs:
+      relation: true
+      columns: true
+
+    # Staging views; optionally keep in a dedicated schema
     staging:
-      # Applies to all models in the 'staging' subdirectory
       +materialized: view
+      # +schema: stg
+      +tags: ["staging"]
+
+    # Intermediate tables
     intermediate:
-      # Applies to all models in the 'intermediate' subdirectory
       +materialized: table
+      # +schema: int
+      +tags: ["intermediate"]
+
+    # Marts / final tables
     marts:
-      # Applies to all models in the 'marts' subdirectory
       +materialized: table
+      # +schema: marts
+      +tags: ["marts"]
