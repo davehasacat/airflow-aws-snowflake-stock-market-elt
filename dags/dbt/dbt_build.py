@@ -1,161 +1,164 @@
+# dags/dbt/dbt_build.py
 from __future__ import annotations
+
 import os
-import json
-from datetime import timedelta
-from typing import Dict, Any, List
+import shutil
+import subprocess
+from pathlib import Path
 
 import pendulum
-from airflow.decorators import dag, task
-from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
-from cosmos.profiles import SnowflakeUserPasswordProfileMapping
-from dags.utils.utils import send_failure_email
+from airflow.decorators import dag, task, task_group
+from airflow.models import Variable
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
+# Common locations inside the Astronomer/Airflow container where your dbt project may live
+DBT_DEFAULT_PATHS = [
+    "/usr/local/airflow",          # repo root (most common)
+    "/usr/local/airflow/dbt",
+    "/usr/local/airflow/dags/dbt",
+]
 
-# ───────────────────────────────────────────────
-# Helper functions for env vars
-# ───────────────────────────────────────────────
-def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return default if v is None or not str(v).strip() else str(v).strip()
+def _resolve_dbt_exe() -> str:
+    exe = os.getenv("DBT_EXECUTABLE_PATH") or "/usr/local/airflow/dbt_venv/bin/dbt"
+    if not os.path.isabs(exe):
+        resolved = shutil.which(exe)
+    else:
+        resolved = exe if os.path.exists(exe) else None
+    if not resolved:
+        raise RuntimeError(f"[DBT] dbt executable not found at '{exe}' (and not in PATH).")
+    return resolved
 
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    try:
-        return int(str(v).strip()) if str(v).strip() else default
-    except ValueError:
-        return default
+def _resolve_project_dir() -> str:
+    # Prefer an explicit env override if you set one
+    override = os.getenv("DBT_PROJECT_DIR")
+    if override:
+        if (Path(override) / "dbt_project.yml").exists():
+            return str(Path(override).resolve())
+        raise RuntimeError(f"[DBT] DBT_PROJECT_DIR set to '{override}' but dbt_project.yml not found there.")
 
+    # Otherwise, find a dbt_project.yml in common spots
+    for base in DBT_DEFAULT_PATHS:
+        candidate = Path(base) / "dbt_project.yml"
+        if candidate.exists():
+            return str(Path(base).resolve())
+    # fallback to CWD if it contains dbt_project.yml
+    if Path("dbt_project.yml").exists():
+        return str(Path(".").resolve())
+    raise RuntimeError(
+        "[DBT] Could not locate 'dbt_project.yml'. "
+        "Place your dbt project at /usr/local/airflow (recommended) or set DBT_PROJECT_DIR."
+    )
 
-# ───────────────────────────────────────────────
-# Config
-# ───────────────────────────────────────────────
-DBT_PROJECT_DIR = _env_str("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
-DBT_EXECUTABLE_PATH = _env_str("DBT_EXECUTABLE_PATH", "/usr/local/airflow/dbt_venv/bin/dbt")
-DBT_THREADS = _env_int("DBT_THREADS", 4)
-DBT_TARGET_PATH = _env_str("DBT_TARGET_PATH", "/usr/local/airflow/dbt_target")
-
-DBT_SELECT = _env_str("DBT_BUILD_SELECT", "")
-DBT_EXCLUDE = _env_str("DBT_BUILD_EXCLUDE", "")
-DBT_FULL_REFRESH = _env_str("DBT_FULL_REFRESH", "").lower() in {"1", "true", "yes"}
-
-DBT_VARS: dict = {}  # optional --vars payload
-
-MANIFEST_PATH = _env_str("DBT_MANIFEST_PATH", os.path.join(DBT_TARGET_PATH, "manifest.json"))
-USE_MANIFEST = os.path.exists(MANIFEST_PATH)
-
+def _run(cmd: list[str], cwd: str):
+    # 20-minute cap should be plenty for moderate projects; tune as needed
+    out = subprocess.check_output(cmd, cwd=cwd, text=True, stderr=subprocess.STDOUT, timeout=1200)
+    print(out.strip())
+    return out
 
 @dag(
     dag_id="dbt_build",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule="0 3 * * 1-5",
+    schedule=None,            # run on-demand
     catchup=False,
     max_active_runs=1,
     tags=["dbt", "build"],
-    default_args={"on_failure_callback": send_failure_email},
+    default_args={"retries": 0},
     doc_md="""
-    **dbt_build DAG** — Runs `dbt build` with a Snowflake runtime profile from `snowflake_default`,
-    then prints a concise summary from `run_results.json`.
+    # dbt build
+    Runs `dbt debug` → `dbt deps` → (optional) `dbt source freshness` → `dbt build`,
+    then uploads artifacts (`manifest.json`, `run_results.json`) to S3.
     """,
 )
-def dbt_build_dag():
-    project_cfg = ProjectConfig(
-        dbt_project_path=DBT_PROJECT_DIR,
-        env_vars={"DBT_TARGET_PATH": DBT_TARGET_PATH},
-        manifest_path=MANIFEST_PATH if USE_MANIFEST else None,
-    )
+def dbt_build():
 
-    profile_cfg = ProfileConfig(
-        profile_name="stock_market_elt",
-        target_name="dev",
-        profile_mapping=SnowflakeUserPasswordProfileMapping(conn_id="snowflake_default"),
-    )
+    @task
+    def prepare():
+        exe = _resolve_dbt_exe()
+        project_dir = _resolve_project_dir()
+        target = Variable.get("dbt_target", default_var="dev")
+        bucket = os.getenv("BUCKET_NAME")
+        if not bucket:
+            raise RuntimeError("BUCKET_NAME env var is required.")
+        print(f"[DBT] exe={exe}")
+        print(f"[DBT] project_dir={project_dir}")
+        print(f"[DBT] target={target}")
+        print(f"[DBT] threads={os.getenv('DBT_THREADS') or '(dbt default)'}")
+        print(f"[S3] bucket={bucket}")
+        return {"exe": exe, "project_dir": project_dir, "target": target, "bucket": bucket}
 
-    exec_cfg = ExecutionConfig(dbt_executable_path=DBT_EXECUTABLE_PATH)
+    @task
+    def resume_warehouse():
+        # Optional but helpful: ensure WH is awake before dbt to avoid cold-start latency
+        hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
+        try:
+            wh = hook.get_first("select current_warehouse()")[0]
+            if wh:
+                hook.run(f"alter warehouse {wh} resume if suspended")
+                print(f"[SF] Warehouse resumed (if suspended): {wh}")
+        except Exception as e:
+            print(f"[SF] Skipping warehouse resume: {e}")
 
-    def _cmd() -> str:
-        parts = ["build"]
-        if DBT_SELECT:
-            parts += ["--select", DBT_SELECT]
-        if DBT_EXCLUDE:
-            parts += ["--exclude", DBT_EXCLUDE]
-        if DBT_VARS:
-            parts += ["--vars", json.dumps(DBT_VARS)]
-        if DBT_FULL_REFRESH:
-            parts.append("--full-refresh")
-        return " ".join(parts)
+    @task_group
+    def dbt_steps(cfg: dict):
+        exe = cfg["exe"]
+        project_dir = cfg["project_dir"]
+        target = cfg["target"]
 
-    dbt_build = DbtTaskGroup(
-        group_id="dbt_build_only",
-        project_config=project_cfg,
-        profile_config=profile_cfg,
-        execution_config=exec_cfg,
-        operator_args={
-            "dbt_cmd": _cmd(),
-            "retries": 2,
-            "retry_delay": timedelta(minutes=5),
-            "append_env": {"DBT_THREADS": str(DBT_THREADS)},
-        },
-    )
+        @task
+        def debug():
+            cmd = [exe, "debug", "--target", target, "--no-use-colors", "--quiet"]
+            _run(cmd, project_dir)
 
-    @task(task_id="summarize_dbt_results")
-    def summarize_dbt_results() -> None:
-        # Prefer explicit DBT_TARGET_PATH, fallback to <project>/target
-        candidates: List[str] = [
-            os.path.join(DBT_TARGET_PATH, "run_results.json"),
-            os.path.join(DBT_PROJECT_DIR, "target", "run_results.json"),
-        ]
-        rr_path = next((p for p in candidates if os.path.exists(p)), None)
-        if not rr_path:
-            print("run_results.json not found in expected locations:")
-            for p in candidates:
-                print(f" - {p}")
-            # Don't fail the DAG: dbt may have failed earlier and raised already
+        @task
+        def deps():
+            cmd = [exe, "deps"]
+            _run(cmd, project_dir)
+
+        @task
+        def freshness():
+            # Non-fatal: continue even if freshness not configured for sources yet
+            try:
+                cmd = [exe, "source", "freshness", "--target", target, "--no-use-colors"]
+                _run(cmd, project_dir)
+            except subprocess.CalledProcessError as e:
+                print("[DBT] source freshness failed (continuing). Output:\n" + e.output)
+
+        @task
+        def build():
+            # dbt will read DBT_THREADS from env automatically if set
+            # You can add selection, e.g., ['--select', 'tag:core']
+            cmd = [exe, "build", "--target", target, "--no-use-colors"]
+            _run(cmd, project_dir)
+
+        debug() >> deps() >> freshness() >> build()
+
+    @task
+    def publish_artifacts(cfg: dict):
+        project_dir = cfg["project_dir"]
+        bucket = cfg["bucket"]
+        target_dir = Path(project_dir) / "target"
+        manifest = target_dir / "manifest.json"
+        run_results = target_dir / "run_results.json"
+
+        missing = [p.name for p in [manifest, run_results] if not p.exists()]
+        if missing:
+            print(f"[DBT] Artifacts missing (skipping upload): {missing}")
             return
 
-        with open(rr_path, "r") as f:
-            rr: Dict[str, Any] = json.load(f)
+        s3 = S3Hook()  # uses your AWS creds (same profile env as the rest of the stack)
+        base_key = f"dbt/artifacts/{pendulum.now('UTC').format('YYYYMMDD_HHmmss')}/"
+        for f in [manifest, run_results]:
+            key = base_key + f.name
+            s3.load_file(
+                filename=str(f),
+                key=key,
+                bucket_name=bucket,
+                replace=True,
+            )
+            print(f"[S3] Uploaded s3://{bucket}/{key}")
 
-        results = rr.get("results", [])
-        if not results:
-            print("No results found in run_results.json.")
-            return
+    cfg = prepare()
+    resume_warehouse() >> dbt_steps(cfg) >> publish_artifacts(cfg)
 
-        # Count by status
-        by_status: Dict[str, int] = {}
-        for r in results:
-            status = (r.get("status") or "unknown").lower()
-            by_status[status] = by_status.get(status, 0) + 1
-
-        total = len(results)
-        print("\n=== dbt build summary ===")
-        print(f"Total steps: {total}")
-        for s in sorted(by_status.keys()):
-            print(f"  {s}: {by_status[s]}")
-
-        # Print top failures if any
-        failures = [
-            r for r in results
-            if (r.get("status") or "").lower() in {"error", "fail", "failed"}
-        ]
-        if failures:
-            print("\nTop failing nodes (up to 20):")
-            for r in failures[:20]:
-                unique_id = r.get("unique_id", "<unknown>")
-                status = r.get("status", "<status?>")
-                message = (r.get("message") or "").strip()
-                timing = r.get("timing") or []
-                elapsed = None
-                if timing:
-                    # last timing entry usually has 'completed_at' and 'started_at'
-                    last = timing[-1]
-                    elapsed = last.get("completed_at") or last.get("name")
-                print(f"- {unique_id} [{status}] {('- ' + message) if message else ''} {('(completed ' + str(elapsed) + ')') if elapsed else ''}")
-
-        # Exit code stays success; dbt operator already controls fail/abort behavior.
-
-    dbt_build >> summarize_dbt_results()
-
-
-dbt_build_dag()
+dbt_build()
