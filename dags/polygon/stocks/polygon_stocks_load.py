@@ -1,15 +1,29 @@
 from __future__ import annotations
-import pendulum
-from datetime import timedelta
 import os
+from datetime import timedelta
+
+import pendulum
 
 from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
-from airflow.hooks.base import BaseHook  # read extras from conn
+from airflow.hooks.base import BaseHook
 
-from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_STOCKS_RAW_DATASET
+from dags.utils.polygon_datasets import (
+    S3_STOCKS_MANIFEST_DATASET,
+    SNOWFLAKE_STOCKS_RAW_DATASET,
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────────────────────────────────────
+MANIFEST_KEY = os.getenv("STOCKS_MANIFEST_KEY", "raw/manifests/manifest_latest.txt")
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
+SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
+BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "500"))  # FILES list batch size
+ON_ERROR = os.getenv("SNOWFLAKE_COPY_ON_ERROR", "ABORT_STATEMENT")  # or 'CONTINUE'
+FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()  # 'TRUE' to force reloads
 
 
 @dag(
@@ -17,39 +31,43 @@ from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET, SNOWFLAKE_ST
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     schedule=[S3_STOCKS_MANIFEST_DATASET],
     catchup=False,
-    tags=["load", "polygon", "snowflake"],
+    tags=["load", "polygon", "snowflake", "stocks"],
     dagrun_timeout=timedelta(hours=2),
+    max_active_runs=1,
 )
 def polygon_stocks_load_dag():
-    # Use default AWS credentials chain (no aws_conn_id)
-    SNOWFLAKE_CONN_ID = "snowflake_default"
-    BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 
-    # --- Resolve Snowflake context from the Airflow connection (Secrets-backed) ---
+    # ────────────────────────────────────────────────────────────────────────────
+    # Resolve Snowflake context (from connection extras)
+    # ────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
 
-    # Required
     SF_DB = x.get("database")
     SF_SCHEMA = x.get("schema")
     if not SF_DB or not SF_SCHEMA:
         raise ValueError(
             "Snowflake connection extras must include 'database' and 'schema'. "
-            "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
+            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
         )
-
-    # Optional overrides from extras; otherwise use sane defaults
-    STAGE_NAME = x.get("stage", "s3_stage")  # logical stage name in the same DB/schema
+    STAGE_NAME = x.get("stage", "s3_stage")  # external stage already configured
     TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
 
-    FULLY_QUALIFIED_TABLE_NAME = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FULLY_QUALIFIED_STAGE_NAME = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
+    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"       # for COPY
+    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"  # for DESC/SHOW
 
+    if not BUCKET_NAME:
+        raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Tasks
+    # ────────────────────────────────────────────────────────────────────────────
     @task
     def create_snowflake_table():
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {FULLY_QUALIFIED_TABLE_NAME} (
+        sql = f"""
+        CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             ticker TEXT,
             trade_date DATE,
             open NUMERIC(19, 4),
@@ -59,45 +77,89 @@ def polygon_stocks_load_dag():
             volume BIGINT,
             vwap NUMERIC(19, 4),
             transactions BIGINT,
-            inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP()
+            inserted_at TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
         );
         """
-        hook.run(create_table_sql)
+        hook.run(sql)
 
     @task
-    def get_s3_keys_from_manifest() -> list[str]:
+    def check_stage_exists():
+        """Ensure the external stage exists and is accessible."""
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        try:
+            hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Stage {FQ_STAGE_NO_AT} not found or not accessible. "
+                f"Verify the stage exists and privileges are set. Original error: {e}"
+            )
+
+    @task
+    def get_stage_relative_keys_from_manifest() -> list[str]:
         """
-        Fetch manifest and convert absolute keys (starting with 'raw/') to
-        stage-relative paths for @.../raw/ (i.e., strip leading 'raw/').
+        Read the S3 manifest and normalize keys into stage-relative paths.
+
+        Supports:
+          a) Flat manifest: each line is 'raw/stocks/.../*.json'
+          b) Pointer manifest: first non-empty line 'POINTER=<s3_key>' (same bucket)
+             which points to a flat manifest created by the writer (daily/backfill).
+
+        Only includes stocks files, de-duped, order preserved.
         """
         s3 = S3Hook()
-        manifest_key = "raw/manifests/manifest_latest.txt"
-        if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
-            raise FileNotFoundError(f"Manifest file not found at s3://{BUCKET_NAME}/{manifest_key}")
 
-        manifest_content = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME) or ""
-        raw_keys = [k.strip() for k in manifest_content.splitlines() if k.strip()]
+        def _read_lines(key: str) -> list[str]:
+            if not s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                raise FileNotFoundError(f"Manifest not found: s3://{BUCKET_NAME}/{key}")
+            content = s3.read_key(key=key, bucket_name=BUCKET_NAME) or ""
+            return [ln.strip() for ln in content.splitlines() if ln.strip()]
 
-        if not raw_keys:
-            raise AirflowSkipException("Manifest is empty. No new files to process.")
+        lines = _read_lines(MANIFEST_KEY)
+        first = lines[0] if lines else ""
+        if first.startswith("POINTER="):
+            pointed_key = first.split("=", 1)[1].strip()
+            if not pointed_key:
+                raise ValueError(f"Pointer manifest has empty target in {MANIFEST_KEY}")
+            lines = _read_lines(pointed_key)
 
-        # Convert to stage-relative paths (stage URL is s3://.../raw/)
-        rel_keys = [k[4:] if k.startswith("raw/") else k for k in raw_keys]
+        if not lines:
+            raise AirflowSkipException("Manifest is empty; nothing to load.")
 
-        # Optional: ensure we're only loading stocks files
-        rel_keys = [k for k in rel_keys if k.startswith("stocks/")]
+        # Normalize to stage-relative: strip 'raw/' prefix, filter to stocks/
+        rel = [(k[4:] if k.startswith("raw/") else k) for k in lines]
+        rel = [k for k in rel if k.startswith("stocks/")]
 
-        if not rel_keys:
-            raise AirflowSkipException("No eligible stocks files found in manifest after normalization.")
-        return rel_keys
+        # De-dupe (preserve order)
+        seen = set()
+        deduped: list[str] = []
+        for k in rel:
+            if k not in seen:
+                seen.add(k)
+                deduped.append(k)
 
-    @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET])
-    def load_data_to_snowflake(stage_relative_keys: list[str]):
-        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        files_clause = ", ".join(f"'{k}'" for k in stage_relative_keys)
+        if not deduped:
+            raise AirflowSkipException("No eligible stocks files in manifest after filtering.")
+
+        print(f"Manifest files (stocks/*): {len(deduped)} (from {len(lines)} raw entries)")
+        return deduped
+
+    @task
+    def chunk_keys(keys: list[str]) -> list[list[str]]:
+        """Split keys into batches for the Snowflake FILES clause."""
+        return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
+
+    @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET], retries=2)
+    def copy_batch_to_snowflake(batch: list[str]) -> int:
+        """
+        COPY a single batch using FILES=(). FORCE=FALSE leverages load history:
+        previously ingested files (same stage path) are skipped automatically.
+        """
+        if not batch:
+            return 0
+        files_clause = ", ".join(f"'{k}'" for k in batch)
 
         copy_sql = f"""
-        COPY INTO {FULLY_QUALIFIED_TABLE_NAME}
+        COPY INTO {FQ_TABLE}
           (ticker, trade_date, volume, vwap, open, close, high, low, transactions)
         FROM (
             SELECT
@@ -110,20 +172,33 @@ def polygon_stocks_load_dag():
                 $1:results[0]:h::FLOAT,
                 $1:results[0]:l::FLOAT,
                 $1:results[0]:n::BIGINT
-            FROM {FULLY_QUALIFIED_STAGE_NAME}
+            FROM {FQ_STAGE}
         )
         FILES = ({files_clause})
         FILE_FORMAT = (TYPE = 'JSON')
-        ON_ERROR = 'ABORT_STATEMENT'
-        FORCE = FALSE;
+        ON_ERROR = '{ON_ERROR}'
+        FORCE = {FORCE};
         """
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         hook.run(copy_sql)
-        print(f"Loaded {len(stage_relative_keys)} files into {FULLY_QUALIFIED_TABLE_NAME}.")
+        print(f"Loaded batch of {len(batch)} files into {FQ_TABLE}.")
+        return len(batch)
 
-    table_created = create_snowflake_table()
-    rel_keys = get_s3_keys_from_manifest()
-    load_op = load_data_to_snowflake(rel_keys)
-    table_created >> load_op
+    @task
+    def sum_loaded(counts: list[int]) -> int:
+        total = sum(counts or [])
+        print(f"Total files targeted for load: {total}")
+        return total
+
+    # Flow
+    tbl = create_snowflake_table()
+    stage_ok = check_stage_exists()
+    rel_keys = get_stage_relative_keys_from_manifest()
+    batches = chunk_keys(rel_keys)
+    loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
+    total = sum_loaded(loaded_counts)
+
+    tbl >> stage_ok >> batches >> loaded_counts >> total
 
 
 polygon_stocks_load_dag()
