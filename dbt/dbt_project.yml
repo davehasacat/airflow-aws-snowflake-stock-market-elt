@@ -23,6 +23,14 @@ clean-targets:         # directories to be removed by `dbt clean`
   - "target"
   - "dbt_packages"
 
+snapshots:
+  stock_market_elt:
+    +persist_docs:
+      relation: true
+      columns: true
+    +tags: ["snapshot"]
+    # +schema: snapshots   # uncomment if you want a separate schema
+
 models:
   stock_market_elt:
     # Applies to all models in the project

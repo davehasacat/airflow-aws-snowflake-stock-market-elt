@@ -13,30 +13,58 @@ RUN apt-get update && apt-get install -y curl unzip && \
 # Create a virtual environment for dbt at a stable path
 RUN python -m venv /usr/local/airflow/dbt_venv
 
-# Install dbt and the Snowflake adapter inside the virtual environment
-RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir dbt-snowflake==1.10.0
+# Pin to a combo that is present on the Astronomer index and resolves cleanly
+# - dbt-core 1.10.4
+# - dbt-snowflake 1.10.0
+RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir \
+    "dbt-core==1.10.4" \
+    "dbt-snowflake==1.10.0"
 
-# (Optional) Put dbt on PATH for convenience during build/runtime
+# Put dbt on PATH for convenience during build/runtime
 ENV PATH="/usr/local/airflow/dbt_venv/bin:${PATH}"
 
 # Create the target dbt directory
 RUN mkdir -p /usr/local/airflow/dbt
 
-# Copy only the files needed to install dependencies
+# Copy only dependency files first for better caching
 COPY dbt/packages.yml /usr/local/airflow/dbt/packages.yml
 COPY dbt/dbt_project.yml /usr/local/airflow/dbt/dbt_project.yml
 
-# Install dbt packages
-RUN dbt deps --project-dir /usr/local/airflow/dbt
+# IMPORTANT: ensure packages.yml pins dbt_date to a version compatible with dbt-core 1.10.4
+# packages.yml should include:
+#   - package: godatadriven/dbt_date
+#     version: "0.14.2"
 
-# Copy the rest of the dbt project files
+# Clean stale lock (if any) and install dbt packages
+RUN rm -f /usr/local/airflow/dbt/packages.lock && \
+    dbt deps --project-dir /usr/local/airflow/dbt
+
+
+# Copy the rest of the dbt project
 COPY dbt /usr/local/airflow/dbt
 
-# Parse the project to generate manifest.json without a database connection.
-# If profiles.yml references env vars, this will still work.
-RUN dbt parse \
-    --project-dir /usr/local/airflow/dbt \
-    --profiles-dir /usr/local/airflow/dbt \
-    --target ci || true
+# Keep these envs so your DAG code can find a manifest later if you choose to generate one at runtime
+ENV DBT_TARGET_PATH=/usr/local/airflow/dbt_target
+ENV DBT_MANIFEST_PATH=${DBT_TARGET_PATH}/manifest.json
+
+# Minimal profiles.yml just for convenience if you run dbt manually in the container (no parse here)
+RUN mkdir -p /home/astro/.dbt /usr/local/airflow/dbt_target && \
+    cat > /home/astro/.dbt/profiles.yml <<'YAML' && \
+    chown -R astro:astro /home/astro/.dbt /usr/local/airflow/dbt_target /usr/local/airflow/dbt
+stock_market_elt:
+  target: ci
+  outputs:
+    ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'dummy') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'dummy') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', 'dummy') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'DUMMY_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'DUMMY_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'DUMMY_DB') }}"
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'PUBLIC') }}"
+      threads: 1
+      client_session_keep_alive: false
+YAML
 
 USER astro
