@@ -5,12 +5,19 @@ services:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
-      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
+      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AWS_SDK_LOAD_CONFIG=1
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
+      - DBT_EXECUTABLE_PATH=/usr/local/airflow/dbt_venv/bin/dbt
+      - DBT_THREADS=${DBT_THREADS}
+      - DBT_TARGET_PATH=${DBT_TARGET_PATH}
+      - HTTP_REQUEST_TIMEOUT_SECS=${HTTP_REQUEST_TIMEOUT_SECS}
+      - POLYGON_REQUEST_DELAY_SECONDS=${POLYGON_REQUEST_DELAY_SECONDS}
+      - API_POOL=${API_POOL}
     networks:
       - default
       - stocks-elt_default
@@ -20,12 +27,19 @@ services:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
-      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
+      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AWS_SDK_LOAD_CONFIG=1
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
+      - DBT_EXECUTABLE_PATH=/usr/local/airflow/dbt_venv/bin/dbt
+      - DBT_THREADS=${DBT_THREADS}
+      - DBT_TARGET_PATH=${DBT_TARGET_PATH}
+      - HTTP_REQUEST_TIMEOUT_SECS=${HTTP_REQUEST_TIMEOUT_SECS}
+      - POLYGON_REQUEST_DELAY_SECONDS=${POLYGON_REQUEST_DELAY_SECONDS}
+      - API_POOL=${API_POOL}
     networks:
       - default
       - stocks-elt_default
@@ -35,12 +49,19 @@ services:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
-      - ${USERPROFILE}\.aws:/home/astro/.aws:ro
+      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AWS_SDK_LOAD_CONFIG=1
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
+      - DBT_EXECUTABLE_PATH=/usr/local/airflow/dbt_venv/bin/dbt
+      - DBT_THREADS=${DBT_THREADS}
+      - DBT_TARGET_PATH=${DBT_TARGET_PATH}
+      - HTTP_REQUEST_TIMEOUT_SECS=${HTTP_REQUEST_TIMEOUT_SECS}
+      - POLYGON_REQUEST_DELAY_SECONDS=${POLYGON_REQUEST_DELAY_SECONDS}
+      - API_POOL=${API_POOL}
     networks:
       - default
       - stocks-elt_default
@@ -54,7 +75,7 @@ services:
     # Mount your local AWS profile so the app can read Secrets Manager
     volumes:
       # Many containers run as root; this path is robust.
-      - ${USERPROFILE}\.aws:/root/.aws:ro
+      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
     environment:
       # let the dashboard use the same local profile + region
       - AWS_PROFILE=${AWS_PROFILE}

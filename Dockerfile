@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y curl unzip && \
 RUN python -m venv /usr/local/airflow/dbt_venv
 
 # Install dbt and the Snowflake adapter inside the virtual environment
-RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir dbt-snowflake==1.10.0
+RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir "dbt-core==1.10.4" "dbt-snowflake==1.10.0"
 
 # (Optional) Put dbt on PATH for convenience during build/runtime
 ENV PATH="/usr/local/airflow/dbt_venv/bin:${PATH}"
@@ -33,10 +33,6 @@ RUN dbt deps --project-dir /usr/local/airflow/dbt
 COPY dbt /usr/local/airflow/dbt
 
 # Parse the project to generate manifest.json without a database connection.
-# If profiles.yml references env vars, this will still work.
-RUN dbt parse \
-    --project-dir /usr/local/airflow/dbt \
-    --profiles-dir /usr/local/airflow/dbt \
-    --target ci || true
+RUN dbt parse --project-dir /usr/local/airflow/dbt || true
 
 USER astro
