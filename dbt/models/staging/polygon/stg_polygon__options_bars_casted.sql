@@ -14,10 +14,8 @@ renamed_and_casted as (
 select
   -- Create a unique identifier for each option bar
   option_symbol || '_' || trade_date as option_bar_id,
-  bar_ts as polygon_bar_timestamp,
   option_symbol,
   trade_date,
-  expiration_date,
   strike_price,
   option_type,
   open as open_price,
