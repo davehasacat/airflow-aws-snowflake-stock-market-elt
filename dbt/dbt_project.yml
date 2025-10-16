@@ -31,7 +31,6 @@ snapshots:
     +tags: ["snapshot"]
     # +schema: snapshots   # uncomment if you want a separate schema
 
-
 models:
   stock_market_elt:
     # Applies to all models in the project
