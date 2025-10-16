@@ -15,26 +15,9 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
-# Where to write artifacts (env-overridable for Airflow)
-target-path: "{{ env_var('DBT_TARGET_PATH', 'target') }}"
-log-path: "{{ env_var('DBT_LOG_PATH', 'logs') }}"
-
 clean-targets:
   - "target"
   - "dbt_packages"
-
-# Snowflake-friendly quoting (avoid unnecessary double quotes)
-quoting:
-  database: false
-  schema: false
-  identifier: false
-
-# Persist model & column docs to the warehouse for snapshots & models
-# (You can also set this per-folder below.)
-models:
-  +persist_docs:
-    relation: true
-    columns: true
 
 snapshots:
   stock_market_elt:
@@ -43,16 +26,6 @@ snapshots:
       columns: true
     +tags: ["snapshot"]
     # +schema: snapshots   # uncomment to isolate snapshots to their own schema
-
-# Optional: configure seeds (types, quoting, schema)
-# Useful if you add more seeds later or want to enforce types.
-seeds:
-  stock_market_elt:
-    +quote_columns: false
-    # +schema: seeds
-    # custom_tickers.csv:
-    #   +column_types:
-    #     ticker: varchar
 
 # Layered model config
 models:
