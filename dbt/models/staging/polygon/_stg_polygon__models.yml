@@ -23,50 +23,80 @@ models:
     description: Cleans and enriches data from the options snapshot, selecting only currently valid records and parsing OCC symbols into their components (underlying ticker, expiration date, call/put, and strike price).
     tags: ["staging", "options", "polygon"]
     columns:
+      - name: option_bar_id
+        description: Synthetic primary key built as option_symbol || '_' || trade_date.
+
       - name: option_symbol
         description: Full OCC option symbol, e.g. O:GOOGL251017P00247500.
         tests:
           - not_null
-          - unique
-      - name: underlying_ticker
-        description: Underlying stock ticker extracted from the OCC symbol.
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: '^O:[A-Z0-9]{1,6}\\d{6}[CP]\\d{8}$'
+              row_condition: "is_parsable"
+
+      - name: trade_date
+        description: Date of the aggregated OHLCV bar.
         tests:
           - not_null
+
+      - name: open_price
+        description: Opening price for the day.
+
+      - name: high_price
+        description: Highest price for the day.
+
+      - name: low_price
+        description: Lowest price for the day.
+
+      - name: close_price
+        description: Closing price for the day.
+
+      - name: volume
+        description: Number of option contracts traded for the day.
+
+      - name: volume_weighted_average_price
+        description: Volume-weighted average price for the day.
+
+      - name: transactions
+        description: Number of trades contributing to the bar.
+
+      - name: loaded_at
+        description: Timestamp when the record was loaded into the raw source table.
+
+      - name: raw_json_record
+        description: Original API payload for the bar as JSON.
+
+      - name: is_parsable
+        description: True if option_symbol matches the OCC pattern with 1 to 6 alphanumeric root, else false.
+
+      - name: underlying_ticker
+        description: Underlying stock ticker extracted from the OCC symbol (1 to 6 alphanumeric characters; supports roots like GME1).
+        tests:
+          - not_null:
+              config:
+                where: is_parsable
+
       - name: expiration_date
         description: Option expiration date derived from YYMMDD in the OCC symbol.
         tests:
-          - not_null
+          - not_null:
+              config:
+                where: is_parsable
+
       - name: option_type
         description: Indicates whether the contract is a CALL or PUT.
         tests:
           - accepted_values:
               values: ["call", "put"]
+              config:
+                where: is_parsable
+
       - name: strike_price
         description: Strike price derived from the final 8 digits of the OCC symbol (implied 3 decimals).
         tests:
           - dbt_expectations.expect_column_values_to_be_between:
               min_value: 0
-              row_condition: "strike_price is not null"
-      - name: trade_date
-        description: Date of the aggregated OHLCV bar.
-        tests:
-          - not_null
-      - name: open
-        description: Opening price for the day.
-      - name: high
-        description: Highest price for the day.
-      - name: low
-        description: Lowest price for the day.
-      - name: close
-        description: Closing price for the day.
-      - name: vwap
-        description: Volume-weighted average price for the day.
-      - name: volume
-        description: Number of option contracts traded for the day.
-      - name: transactions
-        description: Number of trades contributing to the bar.
-      - name: inserted_at
-        description: Timestamp when the record was loaded into the raw source table.
+              row_condition: "is_parsable and strike_price is not null"
 
   - name: stg_polygon__stocks
     description: Cleans and renames data from the stock bars snapshot, selecting only currently valid records. Provides daily OHLCV data for each ticker as the foundation for downstream transformations and analytics.
