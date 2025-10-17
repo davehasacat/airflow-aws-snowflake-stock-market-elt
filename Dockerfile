@@ -31,13 +31,17 @@ COPY dbt/dbt_project.yml /usr/local/airflow/dbt/dbt_project.yml
 # Install dbt packages
 RUN dbt deps --project-dir /usr/local/airflow/dbt
 
+# NEW: provide a build-time profiles.yml for parse
+COPY dbt/profiles.ci.yml /usr/local/airflow/dbt/profiles.yml
+
 # Copy the rest of the dbt project
 COPY dbt /usr/local/airflow/dbt
 
-# Parse the project to generate manifest.json without a database connection.
-# If profiles.yml references env vars, this will still work.
+# Parse (explicit target to avoid surprises)
 RUN dbt parse \
-    --project-dir /usr/local/airflow/dbt \
-    --profiles-dir /usr/local/airflow/dbt
+  --project-dir /usr/local/airflow/dbt \
+  --profiles-dir /usr/local/airflow/dbt \
+  --target ci
+
 
 USER astro
