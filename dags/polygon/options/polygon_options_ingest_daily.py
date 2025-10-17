@@ -1,4 +1,25 @@
 # dags/polygon/options/polygon_options_ingest_daily.py
+# =============================================================================
+# Polygon Options Ingest (Daily)
+# -----------------------------------------------------------------------------
+# Goal:
+#   On each weekday run, discover option contracts per underlying *as of*
+#   the prior business day, fetch per-contract daily aggregates from Polygon.io,
+#   write raw JSON.gz payloads to S3, and publish a canonical manifest file.
+#
+# Key ideas:
+#   - Use Airflow logical_date to load the *previous business day*
+#   - Discover contracts per underlying (pagination + retries)
+#   - Batch contracts to control API pressure (configurable size)
+#   - Write per-batch manifests -> merged into a single "latest" manifest
+#   - Output manifest is registered as a Dataset for downstream triggers
+#
+# Safety:
+#   - Secrets via Airflow Variables backed by AWS Secrets Manager
+#   - Robust HTTP session with retry + rate limiting
+#   - Idempotent S3 writes with optional overwrite
+# =============================================================================
+
 from __future__ import annotations
 
 import csv
@@ -23,23 +44,25 @@ from airflow.models import Variable  # Secrets Manager-backed Variables
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Config / Constants
+# Config / Constants (env-driven where appropriate)
 # ────────────────────────────────────────────────────────────────────────────────
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
-BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # required: e.g., "stock-market-elt"
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-daily (auto)")
-API_POOL = "api_pool"  # ensure this pool exists (slots ~8)
+API_POOL = "api_pool"  # protect Polygon APIs via Airflow Pool (configured in airflow_settings.yaml)
 
-# Batching knobs
+# Batching & throttling knobs
 CONTRACT_BATCH_SIZE = int(os.getenv("OPTIONS_DAILY_CONTRACT_BATCH_SIZE", "400"))
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
 
-# Idempotent writes (True = overwrite, False = skip if exists)
+# Idempotency control
+#   - true  -> overwrite S3 keys (simple, consistent "latest" truth)
+#   - false -> leave existing keys alone (useful for re-runs)
 REPLACE_FILES = os.getenv("DAILY_REPLACE", "true").lower() == "true"
 
 default_args = {
@@ -48,7 +71,7 @@ default_args = {
     "retry_delay": pendulum.duration(minutes=5),
 }
 
-# Guardrail: ensure BUCKET_NAME is configured
+# Guardrail: BUCKET_NAME must be present for writes
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
@@ -57,12 +80,11 @@ if not BUCKET_NAME:
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_options_key() -> str:
     """
-    Return a clean Polygon Options API key whether the Airflow Variable is stored as:
-      - plain text: "abc123"
-      - JSON object: {"polygon_options_api_key":"abc123"} (console/SM can do this)
-    Falls back to env POLYGON_OPTIONS_API_KEY.
+    Resolve the Polygon Options API key from:
+      1) Airflow Variable 'polygon_options_api_key' (JSON or raw string)
+      2) Env POLYGON_OPTIONS_API_KEY
     """
-    # 1) Try JSON variable
+    # 1) JSON-style Airflow Variable
     try:
         v = Variable.get("polygon_options_api_key", deserialize_json=True)
         if isinstance(v, dict):
@@ -77,7 +99,7 @@ def _get_polygon_options_key() -> str:
     except Exception:
         pass
 
-    # 2) Try plain-text variable (could itself be a JSON string)
+    # 2) Plain-text Variable (could itself be JSON string)
     try:
         s = Variable.get("polygon_options_api_key")
         if s:
@@ -95,13 +117,13 @@ def _get_polygon_options_key() -> str:
                             if isinstance(v2, str) and v2.strip():
                                 return v2.strip()
                 except Exception:
-                    # fall through to return s as-is
+                    # If parsing fails, we'll just return the raw string below
                     pass
             return s
     except Exception:
         pass
 
-    # 3) Env fallback
+    # 3) Env fallback for local/dev
     env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
     if env:
         return env
@@ -113,7 +135,12 @@ def _get_polygon_options_key() -> str:
     )
 
 def _session() -> requests.Session:
-    """HTTP session with connection pooling + retries for resilience and speed."""
+    """
+    HTTP session with connection pooling + retry policy suitable for Polygon:
+      - Retries 429/5xx with exponential backoff
+      - Honors 'Retry-After'
+      - Connection pool sized for moderate parallelism
+    """
     s = requests.Session()
     retries = Retry(
         total=6,
@@ -128,7 +155,10 @@ def _session() -> requests.Session:
 
 def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
     """
-    Robust GET with exponential backoff for 429/5xx and 'Retry-After' support.
+    Robust GET with support for:
+      - 429 'Retry-After' backoff
+      - Exponential backoff on 5xx
+      - REQUEST_TIMEOUT_SECS timeout enforcement
     """
     backoff = 1.5
     delay = 1.0
@@ -156,13 +186,13 @@ def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max
 @dag(
     dag_id="polygon_options_ingest_daily",
     description="Discover option contracts by underlying, fetch daily aggregates per contract, write to S3 (gz), and build a manifest.",
-    start_date=pendulum.now(tz="UTC"),
-    schedule="0 0 * * 1-5",  # weekdays at 00:00 UTC
-    catchup=True,
+    start_date=pendulum.now(tz="UTC"),           # enable historical backfills via catchup
+    schedule="0 0 * * 1-5",                      # run Mon–Fri at 00:00 UTC
+    catchup=True,                                # allow automatic catchup runs if paused/unavailable
     default_args=default_args,
-    dagrun_timeout=pendulum.duration(hours=12),
+    dagrun_timeout=pendulum.duration(hours=12),  # guardrail for long runs
     tags=["ingestion", "polygon", "options", "daily", "aws"],
-    max_active_runs=1,
+    max_active_runs=1,                           # serialized runs for API friendliness
 )
 def polygon_options_ingest_daily_dag():
 
@@ -171,6 +201,10 @@ def polygon_options_ingest_daily_dag():
     # ───────────────────────────────
     @task
     def get_custom_tickers() -> List[str]:
+        """
+        Read `dbt/seeds/custom_tickers.csv` to define the universe of underlyings.
+        Version-controlled input keeps the control-plane simple and auditable.
+        """
         path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers: List[str] = []
         with open(path, mode="r") as csvfile:
@@ -186,12 +220,13 @@ def polygon_options_ingest_daily_dag():
     @task
     def compute_target_date() -> str:
         """
-        Use logical_date so the daily schedule loads the previous **business** day.
-        If the prior day is Sat/Sun, roll back to Friday.
+        Use Airflow logical_date to target the *previous business day*:
+          - Start from prior calendar day
+          - Roll back through weekend (Sat=5, Sun=6) to Friday when needed
         """
         ctx = get_current_context()
         d = ctx["logical_date"].subtract(days=1)  # prior calendar day
-        while d.day_of_week in (5, 6):  # 5=Sat, 6=Sun
+        while d.day_of_week in (5, 6):           # roll back to last weekday
             d = d.subtract(days=1)
         return d.to_date_string()
 
@@ -203,6 +238,11 @@ def polygon_options_ingest_daily_dag():
 
         @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
         def discover_for_ticker(ticker: str, target_date: str) -> List[str]:
+            """
+            Discover contracts for a given underlying *as of* target_date:
+              - Pagination via next_url
+              - De-dup & sort for stable downstream batching
+            """
             api_key = _get_polygon_options_key()
             sess = _session()
             params = {
@@ -228,12 +268,13 @@ def polygon_options_ingest_daily_dag():
                 data = resp.json()
                 contracts.extend([c["ticker"] for c in (data.get("results") or []) if "ticker" in c])
                 next_url = data.get("next_url")
-                time.sleep(REQUEST_DELAY_SECONDS)
+                time.sleep(REQUEST_DELAY_SECONDS)  # be polite
 
             return sorted(set(contracts))
 
         @task
         def flatten(nested: List[List[str]]) -> List[str]:
+            """Flatten list[list[str]] → list[str]."""
             return [c for sub in (nested or []) for c in (sub or [])]
 
         discovered = (
@@ -249,6 +290,9 @@ def polygon_options_ingest_daily_dag():
     # ───────────────────────────────
     @task
     def batch_contracts(contracts: List[str]) -> List[List[str]]:
+        """
+        Batch discovered contracts to control API throughput and memory footprint.
+        """
         if not contracts:
             raise AirflowSkipException("No contracts discovered for provided tickers.")
         sz = CONTRACT_BATCH_SIZE
@@ -262,17 +306,21 @@ def polygon_options_ingest_daily_dag():
         """
         For each contract in the batch:
           - Fetch daily bar for target_date
-          - Write one gzip JSON to S3: raw/options/<contract>/<YYYY-MM-DD>.json.gz
+          - Write one gzip JSON to S3:
+              raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
+
         Then write a per-batch manifest:
-          - raw/manifests/runs/<dag_run_id>/batch_<idx>.txt
-        Returns the per-batch manifest key (tiny XCom).
+          raw/manifests/runs/<dag_run_id>/batch_<idx>.txt
+
+        Returns:
+          - The per-batch manifest key (tiny XCom) or None if no files written.
         """
         ctx = get_current_context()
         dag_run_id = ctx["dag_run"].run_id.replace(":", "_").replace("/", "_")
         batch_idx = ctx["ti"].map_index if ctx.get("ti") else 0
 
         api_key = _get_polygon_options_key()
-        s3 = S3Hook()  # default AWS creds chain
+        s3 = S3Hook()     # default AWS creds chain
         sess = _session()
 
         written_keys: List[str] = []
@@ -281,8 +329,8 @@ def polygon_options_ingest_daily_dag():
             params = {"adjusted": "true", "apiKey": api_key}
             resp = _rate_limited_get(sess, url, params)
 
+            # Soft-fail noisy cases; keep progressing
             if resp.status_code in (401, 403):
-                # Likely entitlement or auth issue — log and skip
                 try:
                     j = resp.json()
                     msg = j.get("error") or j.get("message") or str(j)
@@ -293,7 +341,7 @@ def polygon_options_ingest_daily_dag():
                 continue
 
             if resp.status_code == 404:
-                # No data for this contract/date
+                # No data for this contract/date (common for illiquid contracts)
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
 
@@ -301,11 +349,10 @@ def polygon_options_ingest_daily_dag():
             data = resp.json()
             results = data.get("results") or []
             if not results:
-                # Empty results — nothing to write
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
 
-            # gzip JSON payload to reduce size & speed COPY
+            # gzip JSON payload: smaller, cheaper to move, faster to COPY into Snowflake
             buf = BytesIO()
             with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
                 gz.write(json.dumps(data, separators=(",", ":")).encode("utf-8"))
@@ -313,7 +360,7 @@ def polygon_options_ingest_daily_dag():
 
             s3_key = f"raw/options/{contract_ticker}/{target_date}.json.gz"
 
-            # Idempotency: optionally skip overwriting existing files
+            # Idempotency control
             if not REPLACE_FILES and s3.check_for_key(s3_key, bucket_name=BUCKET_NAME):
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
@@ -335,6 +382,10 @@ def polygon_options_ingest_daily_dag():
     # ───────────────────────────────
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
     def merge_manifests(batch_manifest_keys: List[Optional[str]]) -> str:
+        """
+        Merge all per-batch manifests into the canonical "latest" manifest.
+        This serves as the downstream Dataset signal (and a simple file list).
+        """
         s3 = S3Hook()
         keys = [k for k in (batch_manifest_keys or []) if k]
         if not keys:
@@ -355,7 +406,7 @@ def polygon_options_ingest_daily_dag():
         return final_key
 
     # ───────────────────────────────
-    # Wiring
+    # Wiring / Dataflow
     # ───────────────────────────────
     custom_tickers = get_custom_tickers()
     target_date = compute_target_date()
@@ -365,4 +416,5 @@ def polygon_options_ingest_daily_dag():
     _final_manifest = merge_manifests(batch_manifest_keys)
 
 
+# Instantiate DAG
 polygon_options_ingest_daily_dag()
