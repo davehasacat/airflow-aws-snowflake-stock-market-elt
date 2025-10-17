@@ -13,7 +13,7 @@ renamed_and_casted as (
 select
   ticker || '_' || trade_date as stock_bar_id,    -- use as primary key
   ticker,
-  trade_date,
+  polygon_trade_date,
   inserted_at as loaded_at,
   open as open_price,
   high as high_price,
