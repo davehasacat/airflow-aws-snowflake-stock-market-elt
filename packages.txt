@@ -1,3 +1,31 @@
+# =====================================================================
+# System Packages (apt-get)
+# ---------------------------------------------------------------------
+# File: packages.txt
+# Purpose:
+#   Additional OS-level dependencies to be installed into the Airflow
+#   container at build time.
+#
+# Usage:
+#   These are appended during the Astro Runtime image build step:
+#     apt-get install -y <each line in this file>
+#
+# Reference:
+#   https://www.astronomer.io/docs/astro/runtime-image-build#apt-packages
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 🧱 Core Build Tools
+# ---------------------------------------------------------------------
+# Required for compiling Python packages that include C extensions
+# (used by libraries like cryptography, pandas, pyarrow, etc.)
 build-essential
+
+# ---------------------------------------------------------------------
+# 🔐 Cryptography + SSL Development Headers
+# ---------------------------------------------------------------------
+# libffi-dev → Required by Python’s cffi module (used in cryptography)
+# libssl-dev → Required for OpenSSL integration and secure connections
+#               (used by Snowflake connector, requests, boto3, etc.)
 libffi-dev
 libssl-dev
