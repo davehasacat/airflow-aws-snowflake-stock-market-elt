@@ -1,19 +1,35 @@
-# This file allows you to configure Airflow Connections, Pools, and Variables in a single place for local development only.
-# NOTE: json dicts can be added to the conn_extra field as yaml key value pairs. See the example below.
-
-# For more information, refer to our docs: https://www.astronomer.io/docs/astro/cli/develop-project#configure-airflow_settingsyaml-local-development-only
-# For questions, reach out to: https://support.astronomer.io
-# For issues create an issue ticket here: https://github.com/astronomer/astro-cli/issues
-
-# NOTE: YOUR .GITIGNORE FOLDER WILL INCLUDE THIS FILE AFTER RUNNING `astro dev init`.
-# I EXCLUDED IT FROM MINE FOR DEMONSTRATION PURPOSES ONLY
-# LEAVE YOUR `airflow_settings.yaml` IN YOUR .GITIGNORE FOLDER AS IT CAN CONTAIN SENSITIVE INFO, DEPENDING ON THE PROJECT
+# =====================================================================
+# Airflow Settings - Pools Configuration
+# ---------------------------------------------------------------------
+# Purpose:
+#   Define task concurrency limits for Airflow DAGs and operators.
+#   Pools control how many parallel tasks can run within each category.
+#
+# Usage:
+#   - Place this file in your Astro project root.
+#   - Load via: astro dev settings import airflow_settings.yaml
+#   - To view pools: astro dev settings list
+#
+# Reference:
+#   https://www.astronomer.io/docs/astro/runtime-configuration#airflow-pools
+# =====================================================================
 
 airflow:
   pools:
+    # --------------------------------------------------
+    # API Pool - limits outbound API concurrency
+    # --------------------------------------------------
+    # Used by DAGs that make heavy external API calls
+    # (e.g., Polygon.io or other rate-limited vendors).
+    # Adjust slots based on vendor throughput & API key limits.
     - pool_name: "api_pool"
       pool_slot: 8
       pool_description: "Pool for controlling API-heavy tasks"
-    - pool_name: default_pool
+
+    # --------------------------------------------------
+    # Default Pool - fallback for all tasks without a pool
+    # --------------------------------------------------
+    # Do not set this too low; it controls global concurrency.
+    - pool_name: "default_pool"
       pool_slot: 128
-      pool_description: Default pool
+      pool_description: "Default Airflow pool for general-purpose tasks"
