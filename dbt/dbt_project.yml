@@ -19,14 +19,6 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-snapshots:
-  stock_market_elt:
-    +persist_docs:
-      relation: true
-      columns: true
-    +tags: ["snapshot"]
-    # +schema: snapshots   # uncomment to isolate snapshots to their own schema
-
 # Layered model config
 models:
   stock_market_elt:

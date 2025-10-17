@@ -38,7 +38,6 @@ COPY dbt /usr/local/airflow/dbt
 # If profiles.yml references env vars, this will still work.
 RUN dbt parse \
     --project-dir /usr/local/airflow/dbt \
-    --profiles-dir /usr/local/airflow/dbt \
-    --target ci || true
+    --profiles-dir /usr/local/airflow/dbt
 
 USER astro
