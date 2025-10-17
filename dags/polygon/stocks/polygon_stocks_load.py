@@ -59,14 +59,6 @@ def polygon_stocks_load_dag():
 
     # ────────────────────────────────────────────────────────────────────────────
     # Resolve Snowflake context (from Secrets-backed connection extras)
-    # Expected extras (example):
-    #   {
-    #     "database": "STOCKS_ELT_DB",
-    #     "schema": "PUBLIC",
-    #     "warehouse": "STOCKS_ELT_WH",
-    #     "stage": "s3_stage",
-    #     "stocks_table": "source_polygon_stocks_raw"
-    #   }
     # ────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
@@ -102,7 +94,7 @@ def polygon_stocks_load_dag():
         sql = f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             ticker TEXT,
-            trade_date DATE,
+            polygon_trade_date DATE,
             open NUMERIC(19, 4),
             high NUMERIC(19, 4),
             low NUMERIC(19, 4),
@@ -110,7 +102,7 @@ def polygon_stocks_load_dag():
             volume BIGINT,
             vwap NUMERIC(19, 4),
             transactions BIGINT,
-            inserted_at TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+            inserted_at TIMESTAMP_NTZ DEFAULT (CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
         );
         """
         hook.run(sql)
@@ -151,7 +143,6 @@ def polygon_stocks_load_dag():
         lines = _read_lines(MANIFEST_KEY)
         first = lines[0] if lines else ""
         if first.startswith("POINTER="):
-            # Indirect manifest: follow the pointer
             pointed_key = first.split("=", 1)[1].strip()
             if not pointed_key:
                 raise ValueError(f"Pointer manifest has empty target in {MANIFEST_KEY}")
@@ -198,18 +189,23 @@ def polygon_stocks_load_dag():
 
         copy_sql = f"""
         COPY INTO {FQ_TABLE}
-          (ticker, trade_date, volume, vwap, open, close, high, low, transactions)
+          (ticker, polygon_trade_date, volume, vwap, open, close, high, low, transactions)
         FROM (
             SELECT
-                $1:ticker::TEXT,
-                TO_DATE(REGEXP_SUBSTR(METADATA$FILENAME, '([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})')),
-                $1:results[0]:v::BIGINT,
-                $1:results[0]:vw::FLOAT,
-                $1:results[0]:o::FLOAT,
-                $1:results[0]:c::FLOAT,
-                $1:results[0]:h::FLOAT,
-                $1:results[0]:l::FLOAT,
-                $1:results[0]:n::BIGINT
+                $1:ticker::TEXT                                                      AS ticker,
+
+                /* Extract trade date directly from event timestamp (ms → TIMESTAMP_NTZ → DATE) */
+                TO_DATE(
+                  TO_TIMESTAMP_NTZ( TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000 )
+                )                                                                     AS polygon_trade_date,
+
+                TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                        AS volume,
+                TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)        AS vwap,
+                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS open,
+                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS close,
+                TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
+                TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
+                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                         AS transactions
             FROM {FQ_STAGE}
         )
         FILES = ({files_clause})
