@@ -8,4 +8,4 @@ packages:
 
   # Data quality & expectations (like Great Expectations but dbt-native)
   - package: metaplane/dbt_expectations
-    version: "0.10.0"
+    version: "0.10.9"
