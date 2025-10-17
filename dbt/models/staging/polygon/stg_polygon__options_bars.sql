@@ -14,7 +14,6 @@ select
   option_symbol || '_' || trade_date as option_bar_id,    -- use as primary key
   option_symbol,
   trade_date,
-  option_type,
   open as open_price,
   high as high_price,
   low as low_price,
