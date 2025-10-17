@@ -1,97 +1,107 @@
-# customize airflow services
+# docker-compose.override.yml
+# Purpose: Local overrides for Airflow + a custom dashboard
+# Notes:
+# - Secrets come from AWS Secrets Manager (via Airflow backend); do NOT hardcode secrets here.
+# - Windows users: ensure COMPOSE_CONVERT_WINDOWS_PATHS=1 in your .env so ${USERPROFILE} works.
+# - macOS/Linux users: replace ${USERPROFILE}/.aws with ${HOME}/.aws if needed (see commented lines).
+
 services:
+  # -------------------------
+  # Airflow core services
+  # -------------------------
   scheduler:
     env_file:
       - .env
     volumes:
+      # Mount the dbt project for live edits
       - ./dbt:/usr/local/airflow/dbt
-      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
+      # Mount local AWS credentials (read-only) so Airflow/boto3 can reach Secrets Manager and S3
+      - ${USERPROFILE}/.aws:/home/astro/.aws:ro
+      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
     environment:
+      # Pass-throughs (most already defined in .env); keeping explicit for clarity
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
-      - AWS_SDK_LOAD_CONFIG=1
+      - AWS_SDK_LOAD_CONFIG=${AWS_SDK_LOAD_CONFIG}
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
-      - DBT_EXECUTABLE_PATH=/usr/local/airflow/dbt_venv/bin/dbt
-      - DBT_THREADS=${DBT_THREADS}
-      - DBT_TARGET_PATH=${DBT_TARGET_PATH}
-      - HTTP_REQUEST_TIMEOUT_SECS=${HTTP_REQUEST_TIMEOUT_SECS}
-      - POLYGON_REQUEST_DELAY_SECONDS=${POLYGON_REQUEST_DELAY_SECONDS}
-      - API_POOL=${API_POOL}
     networks:
       - default
       - stocks-elt_default
+    restart: unless-stopped
 
   webserver:
     env_file:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
-      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
+      - ${USERPROFILE}/.aws:/home/astro/.aws:ro
+      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
-      - AWS_SDK_LOAD_CONFIG=1
+      - AWS_SDK_LOAD_CONFIG=${AWS_SDK_LOAD_CONFIG}
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
-      - DBT_EXECUTABLE_PATH=/usr/local/airflow/dbt_venv/bin/dbt
-      - DBT_THREADS=${DBT_THREADS}
-      - DBT_TARGET_PATH=${DBT_TARGET_PATH}
-      - HTTP_REQUEST_TIMEOUT_SECS=${HTTP_REQUEST_TIMEOUT_SECS}
-      - POLYGON_REQUEST_DELAY_SECONDS=${POLYGON_REQUEST_DELAY_SECONDS}
-      - API_POOL=${API_POOL}
     networks:
       - default
       - stocks-elt_default
+    restart: unless-stopped
 
   triggerer:
     env_file:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
-      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
+      - ${USERPROFILE}/.aws:/home/astro/.aws:ro
+      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
-      - AWS_SDK_LOAD_CONFIG=1
+      - AWS_SDK_LOAD_CONFIG=${AWS_SDK_LOAD_CONFIG}
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
-      - DBT_EXECUTABLE_PATH=/usr/local/airflow/dbt_venv/bin/dbt
-      - DBT_THREADS=${DBT_THREADS}
-      - DBT_TARGET_PATH=${DBT_TARGET_PATH}
-      - HTTP_REQUEST_TIMEOUT_SECS=${HTTP_REQUEST_TIMEOUT_SECS}
-      - POLYGON_REQUEST_DELAY_SECONDS=${POLYGON_REQUEST_DELAY_SECONDS}
-      - API_POOL=${API_POOL}
     networks:
       - default
       - stocks-elt_default
+    restart: unless-stopped
 
-  # create custom services
+  # -------------------------
+  # Custom dashboard service
+  # -------------------------
   dashboard:
     image: dashboard-app
     container_name: dashboard
     ports:
       - "8501:8501"
-    # Mount your local AWS profile so the app can read Secrets Manager
+    # Mount local AWS creds so the app can read from Secrets Manager
     volumes:
-      # Many containers run as root; this path is robust.
-      - ${HOME:-${USERPROFILE}}/.aws:/home/astro/.aws:ro
+      - ${USERPROFILE}/.aws:/home/astro/.aws:ro
+      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
     environment:
-      # let the dashboard use the same local profile + region
+      # Let the dashboard use the same local profile + region
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
-      # in case the app runs as a non-root user, force AWS SDK to these files
-      - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
-      - AWS_CONFIG_FILE=/root/.aws/config
 
-      # tell the app which secret to fetch (Airflow connection URI stored in SM)
+      # If the app runs non-root, point AWS SDK explicitly to the mounted files
+      - AWS_SHARED_CREDENTIALS_FILE=/home/astro/.aws/credentials
+      - AWS_CONFIG_FILE=/home/astro/.aws/config
+
+      # The name of the Airflow Snowflake connection secret in AWS SM
       - SNOWFLAKE_CONN_SECRET_NAME=airflow/connections/snowflake_default
 
-      # optional: a smaller WH just for dashboard queries (app should honor this override)
-      - SNOWFLAKE_OVERRIDE_WAREHOUSE=STOCKS_DASHBOARD_WH
+      # Optional: a smaller WH just for dashboard queries (app should honor this override)
+      - SNOWFLAKE_OVERRIDE_WAREHOUSE=${SNOWFLAKE_OVERRIDE_WAREHOUSE}
     networks:
       - stocks-elt_default
+    restart: unless-stopped
+    # depends_on:                                   # Uncomment if your dashboard requires Airflow up first
+    #   - scheduler
+    #   - webserver
 
+# -------------------------
+# Shared network
+# -------------------------
 networks:
   stocks-elt_default:
     name: stocks-elt_default

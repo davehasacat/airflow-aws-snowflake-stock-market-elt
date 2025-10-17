@@ -1,5 +1,42 @@
-# Astro Runtime includes the following pre-installed providers packages: https://www.astronomer.io/docs/astro/runtime-image-architecture#provider-packages
+# =====================================================================
+# Python Dependencies (requirements.txt)
+# ---------------------------------------------------------------------
+# Purpose:
+#   Declare Python-level dependencies installed via pip at image build time.
+#   These packages extend Airflow with dbt integration and data platform hooks.
+#
+# Context:
+#   - The Astro Runtime base image already includes Airflow + most providers.
+#   - Only list additional packages (or version pins) your project explicitly needs.
+#
+# Reference:
+#   Astro Runtime preinstalled providers:
+#   https://www.astronomer.io/docs/astro/runtime-image-architecture#provider-packages
+# =====================================================================
 
+# ---------------------------------------------------------------------
+# 🔗 Astronomer Cosmos
+# ---------------------------------------------------------------------
+# Provides first-class integration between Airflow and dbt Core.
+# Used by DAGs such as dbt_build.py for running dbt models natively
+# within Airflow tasks (via @task or Cosmos project operators).
 astronomer-cosmos==1.10.2
+
+# ---------------------------------------------------------------------
+# ☁️ AWS Provider
+# ---------------------------------------------------------------------
+# Includes hooks/operators for:
+#   - S3 (file transfer, manifests)
+#   - Secrets Manager (Airflow backend)
+#   - STS (credential probes)
+# Matches your version of Airflow Runtime 13.2.0.
 apache-airflow-providers-amazon==9.3.0
+
+# ---------------------------------------------------------------------
+# ❄️ Snowflake Provider
+# ---------------------------------------------------------------------
+# Enables SnowflakeHook and SnowflakeOperator.
+# Used by:
+#   - dbt_build DAG (for warehouse resume)
+#   - utils_smoke_detector (for Snowflake stage probe)
 apache-airflow-providers-snowflake==5.8.0
