@@ -32,7 +32,8 @@ models:
           - not_null
           - dbt_expectations.expect_column_values_to_match_regex:
               regex: '^O:[A-Z0-9]{1,6}\\d{6}[CP]\\d{8}$'
-              row_condition: "is_parsable"
+              config:
+                where: is_parsable
 
       - name: trade_date
         description: Date of the aggregated OHLCV bar.
@@ -96,7 +97,8 @@ models:
         tests:
           - dbt_expectations.expect_column_values_to_be_between:
               min_value: 0
-              row_condition: "is_parsable and strike_price is not null"
+              config:
+                where: is_parsable and strike_price is not null
 
   - name: stg_polygon__stocks
     description: Cleans and renames data from the stock bars snapshot, selecting only currently valid records. Provides daily OHLCV data for each ticker as the foundation for downstream transformations and analytics.
