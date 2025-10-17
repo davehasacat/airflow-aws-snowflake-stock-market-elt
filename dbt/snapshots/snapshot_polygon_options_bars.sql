@@ -1,4 +1,4 @@
-{% snapshot snapshot_polygon_options %}
+{% snapshot snapshot_polygon_options_bars %}
 
 {{
     config(
