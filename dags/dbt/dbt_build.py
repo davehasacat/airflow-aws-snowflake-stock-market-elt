@@ -207,24 +207,50 @@ def _render_profiles_yml_from_airflow_conn(profiles_dir: Path, target: str) -> P
 # ────────────────────────────────────────────────────────────────────────────────
 def _latest_manifest_to_state_dir(bucket: str) -> Optional[Path]:
     """
-    Find latest s3://bucket/dbt/artifacts/<timestamp>/manifest.json, download to a local state dir,
+    Find latest s3://bucket/dbt/artifacts/<timestamp>/manifest.json, download it into a local state dir,
     and return that dir path (dbt expects manifest.json at the root of --state).
+    NOTE: S3Hook.download_file expects local_path to be a DIRECTORY, not a file path.
     """
     s3 = S3Hook()
     keys = s3.list_keys(bucket_name=bucket, prefix=f"{ARTIFACTS_PREFIX}/")
     if not keys:
         print("[S3] No prior artifacts found; skipping state.")
         return None
+
     manifest_keys = [k for k in keys if k.endswith("/manifest.json")]
     if not manifest_keys:
         print("[S3] No manifest.json found under artifacts; skipping state.")
         return None
-    # Max lexicographic timestamp folder is our "latest"
+
     latest_key = sorted(manifest_keys)[-1]
     state_dir = Path("/tmp/dbt_state")
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download into the directory; hook returns the local file path in newer providers.
+    tmp_downloaded = s3.download_file(
+        key=latest_key,
+        bucket_name=bucket,
+        local_path=str(state_dir)  # ← DIRECTORY (not a file path)
+    )
+
+    # Determine the downloaded file path.
+    # - Newer providers return a full path (string).
+    # - Older providers return None; in that case, pick the newest temp file.
+    if tmp_downloaded and isinstance(tmp_downloaded, str):
+        downloaded_path = Path(tmp_downloaded)
+    else:
+        candidates = sorted(
+            state_dir.glob("airflow_tmp_*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise RuntimeError("[S3] Download did not produce a file in state_dir.")
+        downloaded_path = candidates[0]
+
     dest = state_dir / "manifest.json"
-    s3.download_file(key=latest_key, bucket_name=bucket, local_path=str(dest))
+    downloaded_path.replace(dest)
+
     print(f"[S3] Downloaded prior manifest to {dest} from s3://{bucket}/{latest_key}")
     return state_dir
 
