@@ -19,8 +19,80 @@ sources:
             warn_after: {count: 1, period: day}
 
 models:
-  - name: stg_polygon__options_bars
-    description: "Cleans and renames data from the options snapshot, selecting only currently valid records."
+  - name: stg_polygon__options
+    description: Cleans and enriches data from the options snapshot, selecting only currently valid records and parsing OCC symbols into their components (underlying ticker, expiration date, call/put, and strike price).
+    tags: ["staging", "options", "polygon"]
+    columns:
+      - name: option_symbol
+        description: Full OCC option symbol, e.g. O:GOOGL251017P00247500.
+        tests:
+          - not_null
+          - unique
+      - name: underlying_ticker
+        description: Underlying stock ticker extracted from the OCC symbol.
+        tests:
+          - not_null
+      - name: expiration_date
+        description: Option expiration date derived from YYMMDD in the OCC symbol.
+        tests:
+          - not_null
+      - name: option_type
+        description: Indicates whether the contract is a CALL or PUT.
+        tests:
+          - accepted_values:
+              values: ["call", "put"]
+      - name: strike_price
+        description: Strike price derived from the final 8 digits of the OCC symbol (implied 3 decimals).
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              row_condition: "strike_price is not null"
+      - name: trade_date
+        description: Date of the aggregated OHLCV bar.
+        tests:
+          - not_null
+      - name: open
+        description: Opening price for the day.
+      - name: high
+        description: Highest price for the day.
+      - name: low
+        description: Lowest price for the day.
+      - name: close
+        description: Closing price for the day.
+      - name: vwap
+        description: Volume-weighted average price for the day.
+      - name: volume
+        description: Number of option contracts traded for the day.
+      - name: transactions
+        description: Number of trades contributing to the bar.
+      - name: inserted_at
+        description: Timestamp when the record was loaded into the raw source table.
 
-  - name: stg_polygon__stocks_bars
-    description: "Cleans and renames data from the stock_bars snapshot, selecting only the currently valid records. This model serves as the foundation for all downstream transformations."
+  - name: stg_polygon__stocks
+    description: Cleans and renames data from the stock bars snapshot, selecting only currently valid records. Provides daily OHLCV data for each ticker as the foundation for downstream transformations and analytics.
+    tags: ["staging", "stocks", "polygon"]
+    columns:
+      - name: ticker
+        description: Stock ticker symbol.
+        tests:
+          - not_null
+      - name: trade_date
+        description: Date of the aggregated OHLCV bar.
+        tests:
+          - not_null
+      - name: open
+        description: Opening price for the day.
+      - name: high
+        description: Highest price for the day.
+      - name: low
+        description: Lowest price for the day.
+      - name: close
+        description: Closing price for the day.
+      - name: vwap
+        description: Volume-weighted average price for the day.
+      - name: volume
+        description: Total shares traded for the day.
+      - name: transactions
+        description: Number of trades contributing to the bar.
+      - name: inserted_at
+        description: Timestamp when the record was first ingested.
