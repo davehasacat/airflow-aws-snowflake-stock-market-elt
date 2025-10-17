@@ -1,3 +1,22 @@
+# dags/polygon/stocks/polygon_stocks_load.py
+# =============================================================================
+# Polygon Stocks → Snowflake (Loader)
+# -----------------------------------------------------------------------------
+# Purpose:
+#   Load raw JSON(.gz) written by the stocks ingest DAG from S3 (via a Snowflake
+#   external stage rooted at s3://<bucket>/raw/) directly into a typed landing table.
+#
+# Trigger:
+#   Dataset-triggered by the “latest” stocks manifest in S3, supporting both:
+#     - flat manifest (one key per line), or
+#     - pointer manifest (first line: POINTER=<s3 key>).
+#
+# Notes:
+#   - Uses FILES=() to COPY specific files (idempotent via Snowflake load history).
+#   - Stage-relative paths (strip leading 'raw/'), filtered to 'stocks/'.
+#   - DB/schema + stage/table names sourced from Snowflake connection extras.
+# =============================================================================
+
 from __future__ import annotations
 import os
 from datetime import timedelta
@@ -16,20 +35,21 @@ from dags.utils.polygon_datasets import (
 )
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Config
+# Config (env-first; sensible defaults)
 # ────────────────────────────────────────────────────────────────────────────────
 MANIFEST_KEY = os.getenv("STOCKS_MANIFEST_KEY", "raw/manifests/manifest_latest.txt")
 BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
-BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "500"))  # FILES list batch size
-ON_ERROR = os.getenv("SNOWFLAKE_COPY_ON_ERROR", "ABORT_STATEMENT")  # or 'CONTINUE'
-FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()  # 'TRUE' to force reloads
 
+# COPY tuning
+BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "500"))      # FILES list size per COPY
+ON_ERROR = os.getenv("SNOWFLAKE_COPY_ON_ERROR", "ABORT_STATEMENT")   # or 'CONTINUE'
+FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()           # TRUE to bypass load history
 
 @dag(
     dag_id="polygon_stocks_load",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule=[S3_STOCKS_MANIFEST_DATASET],
+    schedule=[S3_STOCKS_MANIFEST_DATASET],   # ← fires when stocks manifest updates
     catchup=False,
     tags=["load", "polygon", "snowflake", "stocks"],
     dagrun_timeout=timedelta(hours=2),
@@ -38,7 +58,15 @@ FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()  # 'TRUE' to force re
 def polygon_stocks_load_dag():
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Resolve Snowflake context (from connection extras)
+    # Resolve Snowflake context (from Secrets-backed connection extras)
+    # Expected extras (example):
+    #   {
+    #     "database": "STOCKS_ELT_DB",
+    #     "schema": "PUBLIC",
+    #     "warehouse": "STOCKS_ELT_WH",
+    #     "stage": "s3_stage",
+    #     "stocks_table": "source_polygon_stocks_raw"
+    #   }
     # ────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
@@ -50,12 +78,13 @@ def polygon_stocks_load_dag():
             "Snowflake connection extras must include 'database' and 'schema'. "
             "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
         )
-    STAGE_NAME = x.get("stage", "s3_stage")  # external stage already configured
+
+    STAGE_NAME = x.get("stage", "s3_stage")                      # external stage already configured
     TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"       # for COPY
-    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"  # for DESC/SHOW
+    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"              # for COPY
+    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"         # for DESC/SHOW
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -65,6 +94,10 @@ def polygon_stocks_load_dag():
     # ────────────────────────────────────────────────────────────────────────────
     @task
     def create_snowflake_table():
+        """
+        Create the typed landing table if missing.
+        We keep this table denormalized for simple downstream use + dbt layering.
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         sql = f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
@@ -84,27 +117,28 @@ def polygon_stocks_load_dag():
 
     @task
     def check_stage_exists():
-        """Ensure the external stage exists and is accessible."""
+        """
+        Ensure the external stage exists and is accessible for the Airflow role.
+        This surfaces missing grants or typos early.
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         try:
             hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
         except Exception as e:
             raise RuntimeError(
                 f"Stage {FQ_STAGE_NO_AT} not found or not accessible. "
-                f"Verify the stage exists and privileges are set. Original error: {e}"
+                f"Verify existence and privileges. Original error: {e}"
             )
 
     @task
     def get_stage_relative_keys_from_manifest() -> list[str]:
         """
         Read the S3 manifest and normalize keys into stage-relative paths.
-
         Supports:
-          a) Flat manifest: each line is 'raw/stocks/.../*.json'
-          b) Pointer manifest: first non-empty line 'POINTER=<s3_key>' (same bucket)
-             which points to a flat manifest created by the writer (daily/backfill).
-
-        Only includes stocks files, de-duped, order preserved.
+          a) Flat manifest — one 'raw/stocks/.../*.json' key per line.
+          b) Pointer manifest — first non-empty line 'POINTER=<s3_key>' which
+             points to a flat manifest created by the writer.
+        Only includes 'stocks/' keys, de-duped while preserving order.
         """
         s3 = S3Hook()
 
@@ -117,6 +151,7 @@ def polygon_stocks_load_dag():
         lines = _read_lines(MANIFEST_KEY)
         first = lines[0] if lines else ""
         if first.startswith("POINTER="):
+            # Indirect manifest: follow the pointer
             pointed_key = first.split("=", 1)[1].strip()
             if not pointed_key:
                 raise ValueError(f"Pointer manifest has empty target in {MANIFEST_KEY}")
@@ -129,7 +164,7 @@ def polygon_stocks_load_dag():
         rel = [(k[4:] if k.startswith("raw/") else k) for k in lines]
         rel = [k for k in rel if k.startswith("stocks/")]
 
-        # De-dupe (preserve order)
+        # De-dupe while preserving order
         seen = set()
         deduped: list[str] = []
         for k in rel:
@@ -145,14 +180,17 @@ def polygon_stocks_load_dag():
 
     @task
     def chunk_keys(keys: list[str]) -> list[list[str]]:
-        """Split keys into batches for the Snowflake FILES clause."""
+        """
+        Split keys into FILES=() batches to keep COPY statements small & predictable.
+        """
         return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
 
     @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET], retries=2)
     def copy_batch_to_snowflake(batch: list[str]) -> int:
         """
-        COPY a single batch using FILES=(). FORCE=FALSE leverages load history:
-        previously ingested files (same stage path) are skipped automatically.
+        COPY a single batch using FILES=().
+        - FORCE=FALSE + Snowflake load history → auto skip already ingested files.
+        - ON_ERROR configurable (ABORT_STATEMENT or CONTINUE).
         """
         if not batch:
             return 0
@@ -186,11 +224,17 @@ def polygon_stocks_load_dag():
 
     @task
     def sum_loaded(counts: list[int]) -> int:
+        """
+        Simple visibility: how many files were targeted across all COPY batches.
+        (Snowflake may internally skip already-loaded files when FORCE=FALSE.)
+        """
         total = sum(counts or [])
         print(f"Total files targeted for load: {total}")
         return total
 
-    # Flow
+    # ────────────────────────────────────────────────────────────────────────────
+    # Flow (explicit ordering for clarity)
+    # ────────────────────────────────────────────────────────────────────────────
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
     rel_keys = get_stage_relative_keys_from_manifest()
@@ -198,7 +242,9 @@ def polygon_stocks_load_dag():
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
     total = sum_loaded(loaded_counts)
 
+    # Ensure objects exist before any downstream step
     tbl >> stage_ok >> batches >> loaded_counts >> total
 
 
+# Instantiate the DAG
 polygon_stocks_load_dag()

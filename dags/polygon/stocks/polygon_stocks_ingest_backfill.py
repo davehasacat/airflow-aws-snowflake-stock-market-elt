@@ -1,3 +1,22 @@
+# dags/polygon/stocks/polygon_stocks_ingest_backfill.py
+# =============================================================================
+# Polygon Stocks → S3 (Backfill)
+# -----------------------------------------------------------------------------
+# Purpose:
+#   Backfill daily grouped OHLCV bars for a date range from Polygon, filtered
+#   to tickers in dbt/seeds/custom_tickers.csv, and write one JSON per
+#   (ticker, date) under s3://<bucket>/raw/stocks/<TICKER>/<YYYY-MM-DD>.json.
+#
+# Outputs:
+#   - raw/stocks/<TICKER>/<YYYY-MM-DD>.json
+#   - raw/manifests/manifest_latest.txt   (flat manifest used by stocks load DAG)
+#
+# Notes:
+#   - Uses pooled HTTP session + retry/backoff + gentle rate limiting.
+#   - Skips weekends automatically; 404s (market holidays) are treated as empty.
+#   - API key resolved from Airflow Variable (AWS Secrets-backed) with env fallback.
+# =============================================================================
+
 from __future__ import annotations
 import os
 import json
@@ -21,7 +40,7 @@ from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Config / Constants
+# Config / Constants (env-first with safe defaults)
 # ────────────────────────────────────────────────────────────────────────────────
 POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
 
@@ -34,19 +53,19 @@ REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25")
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-stocks-backfill (manual)")
 API_POOL = os.getenv("API_POOL", "api_pool")  # ensure this pool exists (airflow_settings.yaml)
 
-# Toggle idempotent overwrites (for true backfills you usually want overwrite)
+# Idempotency: overwrite during backfills unless explicitly disabled
 REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "true").lower() == "true"
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers (API key resolution, session, resilient GET)
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_stocks_key() -> str:
     """
-    Return a clean Polygon Stocks API key whether the Airflow Variable is stored as:
-      - plain text: "abc123"
-      - JSON object: {"polygon_stocks_api_key":"abc123"} (console defaults sometimes do this)
-    Falls back to env POLYGON_STOCKS_API_KEY.
+    Resolve Polygon Stocks API key from:
+      1) Airflow Variable 'polygon_stocks_api_key' (can be plain string OR JSON).
+      2) Env POLYGON_STOCKS_API_KEY (fallback).
+    This is robust to console/SecretsManager storing a JSON object by accident.
     """
     # 1) Try JSON variable
     try:
@@ -63,7 +82,7 @@ def _get_polygon_stocks_key() -> str:
     except Exception:
         pass
 
-    # 2) Try plain-text variable (or JSON-ish string)
+    # 2) Try plain-text variable (which might itself be a JSON string)
     try:
         s = Variable.get("polygon_stocks_api_key")
         if s:
@@ -145,10 +164,11 @@ def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max
 @dag(
     dag_id="polygon_stocks_ingest_backfill",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=None,
+    schedule=None,          # manual backfills only
     catchup=False,
     tags=["ingestion", "polygon", "stocks", "backfill", "aws"],
     params={
+        # Inclusive date range for backfill; weekends are skipped inside the DAG.
         "start_date": Param(default="2025-10-06", type="string", description="Backfill start date (YYYY-MM-DD)."),
         "end_date":   Param(default="2025-10-11", type="string", description="Backfill end date (YYYY-MM-DD)."),
     },
@@ -162,7 +182,7 @@ def polygon_stocks_ingest_backfill_dag():
 
     S3 writes:
       - raw/stocks/{TICKER}/{YYYY-MM-DD}.json
-      - raw/manifests/manifest_latest.txt   (kept for compatibility)
+      - raw/manifests/manifest_latest.txt   (legacy path kept for your loader)
     """
 
     # Guardrail: ensure bucket configured
@@ -171,6 +191,9 @@ def polygon_stocks_ingest_backfill_dag():
 
     @task
     def get_custom_tickers() -> list[str]:
+        """
+        Load filter list from dbt seed (keeps ingest focused + small).
+        """
         path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers: list[str] = []
         with open(path, mode="r", newline="") as csvfile:
@@ -185,6 +208,10 @@ def polygon_stocks_ingest_backfill_dag():
 
     @task
     def generate_date_range(**kwargs) -> list[str]:
+        """
+        Inclusive [start, end]; skips weekends (Sat/Sun). Market holidays are
+        handled later via 404 from the Polygon grouped endpoint.
+        """
         start = pendulum.parse(kwargs["params"]["start_date"])
         end = pendulum.parse(kwargs["params"]["end_date"])
         if start > end:
@@ -192,8 +219,7 @@ def polygon_stocks_ingest_backfill_dag():
         trading_dates: list[str] = []
         cur = start
         while cur <= end:
-            # Skip weekends (Sat=5, Sun=6)
-            if cur.day_of_week not in (5, 6):
+            if cur.day_of_week not in (5, 6):  # Sat=5, Sun=6
                 trading_dates.append(cur.to_date_string())
             cur = cur.add(days=1)
         if not trading_dates:
@@ -203,8 +229,12 @@ def polygon_stocks_ingest_backfill_dag():
     @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool=API_POOL)
     def process_date(target_date: str, custom_tickers: list[str]) -> list[str]:
         """
-        Fetch grouped bars for the date, filter to your custom tickers, and write per-ticker JSON.
-        Uses pooled session + polite backoff. Skips market holidays (404).
+        For a given date:
+          - Fetch grouped daily bars (all U.S. stocks),
+          - Filter to your custom tickers,
+          - Transform to the per-ticker JSON shape your loaders expect,
+          - Write to s3://<bucket>/raw/stocks/<TICKER>/<YYYY-MM-DD>.json.
+        Returns written S3 keys for this date.
         """
         s3_hook = S3Hook()
         api_key = _get_polygon_stocks_key()
@@ -216,10 +246,10 @@ def polygon_stocks_ingest_backfill_dag():
 
         resp = _rate_limited_get(sess, url, params)
         if resp.status_code == 404:
-            # Likely a market holiday/closure
+            # Market holiday/closure → nothing to do
             return []
         if resp.status_code in (401, 403):
-            # Entitlement/auth issue — surface helpful context but don't kill the whole run
+            # Auth/entitlement. Log context; continue to next date.
             try:
                 j = resp.json()
                 msg = j.get("error") or j.get("message") or str(j)
@@ -234,6 +264,7 @@ def polygon_stocks_ingest_backfill_dag():
         for result in (data.get("results") or []):
             ticker = (result.get("T") or "").upper()
             if ticker and ticker in custom_tickers_set:
+                # Normalize shape to match what the loader expects (one result in 'results[0]')
                 formatted_result = {
                     "ticker": ticker,
                     "queryCount": 1,
@@ -246,15 +277,19 @@ def polygon_stocks_ingest_backfill_dag():
                         "c": result.get("c"),
                         "h": result.get("h"),
                         "l": result.get("l"),
-                        "t": result.get("t"),
+                        "t": result.get("t"),  # ms since epoch
                         "n": result.get("n"),
                     }],
                     "status": "OK",
                     "request_id": data.get("request_id"),
                 }
+
                 s3_key = f"raw/stocks/{ticker}/{target_date}.json"
+
+                # Idempotency: skip if already exists unless REPLACE_FILES=true
                 if not REPLACE_FILES and s3_hook.check_for_key(s3_key, bucket_name=BUCKET_NAME):
                     continue
+
                 s3_hook.load_string(
                     string_data=json.dumps(formatted_result, separators=(",", ":")),
                     key=s3_key,
@@ -263,26 +298,35 @@ def polygon_stocks_ingest_backfill_dag():
                 )
                 processed_s3_keys.append(s3_key)
 
+                # Gentle pacing even with retry/backoff in place
                 time.sleep(REQUEST_DELAY_SECONDS)
 
         return processed_s3_keys
 
     @task
     def flatten_s3_key_list(nested_list: list[list[str]]) -> list[str]:
+        """Flatten [[...], [...]] → [...] while ignoring empties."""
         return [key for sub in (nested_list or []) for key in (sub or []) if key]
 
     @task(outlets=[S3_STOCKS_MANIFEST_DATASET])
     def write_manifest_to_s3(s3_keys: list[str]):
+        """
+        Write a SIMPLE FLAT MANIFEST (one key per line). This keeps your existing
+        loader compatible. If you later adopt pointer manifests, you can write a
+        tiny file with 'POINTER=<key>' and adjust the loader (already supported).
+        """
         if not s3_keys:
             raise AirflowSkipException("No S3 keys were processed during the backfill.")
         manifest_content = "\n".join(s3_keys)
         s3_hook = S3Hook()
-        # Kept the original manifest path for compatibility with your downstream loader.
-        manifest_key = "raw/manifests/manifest_latest.txt"
+
+        manifest_key = "raw/manifests/manifest_latest.txt"  # legacy path expected by loader
         s3_hook.load_string(string_data=manifest_content, key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
         print(f"✅ Backfill manifest file created: s3://{BUCKET_NAME}/{manifest_key} (files: {len(s3_keys)})")
 
-    # Flow
+    # ────────────────────────────────────────────────────────────────────────────
+    # Wiring (explicit for readability)
+    # ────────────────────────────────────────────────────────────────────────────
     custom_tickers = get_custom_tickers()
     date_range = generate_date_range()
     processed_nested = process_date.partial(custom_tickers=custom_tickers).expand(target_date=date_range)
@@ -290,4 +334,5 @@ def polygon_stocks_ingest_backfill_dag():
     write_manifest_to_s3(s3_keys_flat)
 
 
+# Instantiate the DAG
 polygon_stocks_ingest_backfill_dag()

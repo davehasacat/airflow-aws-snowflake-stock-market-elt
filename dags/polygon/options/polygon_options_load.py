@@ -1,4 +1,23 @@
 # dags/polygon/options/polygon_options_load.py
+# =============================================================================
+# Polygon Options → Snowflake (Loader)
+# -----------------------------------------------------------------------------
+# Purpose:
+#   Load raw JSON(.gz) written by the options ingest DAG from S3 (via external
+#   Snowflake stage) into:
+#     1) A VARIANT staging table (COPY-friendly)
+#     2) A typed landing table with a few projected columns from results[0]
+#
+# Trigger:
+#   This DAG is dataset-triggered by the "latest" options manifest file in S3.
+#
+# Notes:
+#   - We keep it "raw-in/raw-out" so dbt handles downstream modeling.
+#   - External stage should point at s3://<bucket>/raw/ (so FILES are 'options/...').
+#   - COPY is batched (configurable), and staging is truncated each run.
+#   - All Snowflake names (db/schema/stage/table) can come from the connection extras.
+# =============================================================================
+
 from __future__ import annotations
 import os
 from datetime import timedelta
@@ -16,17 +35,17 @@ from dags.utils.polygon_datasets import (
     SNOWFLAKE_OPTIONS_RAW_DATASET,
 )
 
-# -----------------------------
-# Config
-# -----------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# Config (env-first with sensible defaults)
+# ────────────────────────────────────────────────────────────────────────────────
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
-BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
-COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))
+BUCKET_NAME = os.getenv("BUCKET_NAME", "test")                  # s3://<BUCKET_NAME>/*
+COPY_BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "1000"))  # FILES list per COPY
 
 @dag(
     dag_id="polygon_options_load",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=[S3_OPTIONS_MANIFEST_DATASET],  # triggered by manifest dataset update
+    schedule=[S3_OPTIONS_MANIFEST_DATASET],   # ← fires when the manifest updates
     catchup=False,
     tags=["load", "polygon", "options", "snowflake"],
     dagrun_timeout=timedelta(hours=4),
@@ -42,14 +61,23 @@ def polygon_options_load_dag():
       3) COPY raw JSON/.json.gz files from external stage into VARIANT staging table
       4) INSERT into landing table:
            - option_symbol (from rec:ticker)
-           - trade_date (from results[0].t)
-           - bar_ts (TIMESTAMP from results[0].t)
+           - trade_date (from results[0].t → DATE)
+           - bar_ts (from results[0].t → TIMESTAMP_NTZ)
            - open, high, low, close, volume, vwap, transactions (from results[0])
            - raw_rec (entire JSON)
       5) TRUNCATE staging
     """
 
-    # --- Resolve Snowflake context from connection extras ---
+    # ── Resolve Snowflake context from connection extras (AWS Secrets-backed) ──
+    # Expected extras (example):
+    #   {
+    #     "database": "STOCKS_ELT_DB",
+    #     "schema": "PUBLIC",
+    #     "warehouse": "STOCKS_ELT_WH",
+    #     "stage": "s3_stage",
+    #     "options_table": "source_polygon_options_raw",
+    #     "options_stage_table": "polygon_options_raw_staging"
+    #   }
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
 
@@ -61,25 +89,23 @@ def polygon_options_load_dag():
             "Edit secret 'airflow/connections/snowflake_default' to include these in extra."
         )
 
-    # External stage & table names (can be overridden via connection extras)
+    # External stage & table names (override via connection extras if desired)
     STAGE_NAME = x.get("stage", "s3_stage")  # external stage rooted at s3://<bucket>/raw/
-    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_raw")  # landing/raw table
+    OPTIONS_TABLE = x.get("options_table", "source_polygon_options_raw")         # landing/raw table
     OPTIONS_STAGE_TABLE = x.get("options_stage_table", "polygon_options_raw_staging")  # VARIANT staging table
 
     FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_TABLE}"
     FQ_STAGE_TABLE = f"{SF_DB}.{SF_SCHEMA}.{OPTIONS_STAGE_TABLE}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"  # note leading '@' required in COPY
 
-    # -----------------------------
+    # ────────────────────────────────────────────────────────────────────────────
     # Tasks
-    # -----------------------------
+    # ────────────────────────────────────────────────────────────────────────────
     @task
     def create_tables() -> None:
         """
-        Ensure schema & tables exist:
-          - CREATE SCHEMA IF NOT EXISTS <DB>.<SCHEMA>
-          - CREATE TABLE IF NOT EXISTS <landing> with raw + projected result fields
-          - CREATE TABLE IF NOT EXISTS <staging> (rec VARIANT)
+        Ensure schema & tables exist. We intentionally keep the "landing"
+        table typed so analysts can explore raw metrics without parsing JSON.
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -105,7 +131,7 @@ def polygon_options_load_dag():
         """
         hook.run(ddl_target)
 
-        # 3) Staging table
+        # 3) Staging table (one VARIANT column, COPY-friendly)
         ddl_stage = f"CREATE TABLE IF NOT EXISTS {FQ_STAGE_TABLE} ( rec VARIANT );"
         hook.run(ddl_stage)
 
@@ -114,7 +140,7 @@ def polygon_options_load_dag():
         """
         Read manifest and convert absolute S3 keys (starting with 'raw/') to
         stage-relative paths for a stage rooted at s3://.../raw/.
-        Filter to options files only.
+        Only keep options files to avoid accidental stocks loads.
         """
         s3 = S3Hook()  # rely on default AWS creds chain
         manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
@@ -141,13 +167,14 @@ def polygon_options_load_dag():
         """
         COPY the specified files from the external stage into the VARIANT staging table.
         Handles .json and .json.gz (COMPRESSION=AUTO).
+        Batch FILES to keep COPY statements tractable in the Snowflake parser/optimizer.
         """
         if not stage_relative_keys:
             raise AirflowSkipException("No S3 keys provided to loader.")
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
-        # Clean slate per run (optional but tidy)
+        # Clean slate per run (optional but keeps the staging table tiny)
         hook.run(f"TRUNCATE TABLE {FQ_STAGE_TABLE};")
 
         total = len(stage_relative_keys)
@@ -172,9 +199,10 @@ def polygon_options_load_dag():
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET])
     def insert_from_staging_to_target(_rows_loaded_to_stage: int) -> int:
         """
-        Insert raw payloads from staging into landing table (no regex or symbol parsing).
-        Projections are from rec:results[0]; extract VARIANT -> STRING -> TRY_TO_NUMBER,
-        and specify scale to preserve decimals before casting to FLOAT.
+        Insert raw payloads from staging into landing table (no symbol regexing).
+        - Extract fields from rec:results[0] with TRY_TO_NUMBER to avoid hard failures
+        - Use scale in TRY_TO_NUMBER to preserve decimals before casting to FLOAT
+        - Keep the full JSON in raw_rec for future reprocessing
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -210,27 +238,33 @@ def polygon_options_load_dag():
         """
         hook.run(insert_sql)
 
+        # Return count of rows still in staging (mostly for visibility)
         cnt = hook.get_first(f"SELECT COUNT(*) FROM {FQ_STAGE_TABLE}")[0] or 0
         return int(cnt)
 
     @task
     def cleanup_staging(_inserted: int) -> None:
+        """
+        Keep staging empty between runs; landing table holds the history.
+        """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         hook.run(f"TRUNCATE TABLE {FQ_STAGE_TABLE};")
 
-    # -----------------------------
-    # Wiring (explicit dependencies)
-    # -----------------------------
+    # ────────────────────────────────────────────────────────────────────────────
+    # Wiring (explicit ordering for readability)
+    # ────────────────────────────────────────────────────────────────────────────
     t_create = create_tables()
     rel_keys = get_s3_keys_from_manifest()
     rows_to_stage = copy_raw_into_staging(rel_keys)
     inserted = insert_from_staging_to_target(rows_to_stage)
     cleanup = cleanup_staging(inserted)
 
-    # Ensure create happens before the rest
+    # Ensure objects exist before any downstream step
     t_create >> rel_keys
     t_create >> rows_to_stage
     t_create >> inserted
     t_create >> cleanup
 
+
+# Instantiate the DAG
 polygon_options_load_dag()
