@@ -14,7 +14,6 @@ select
   option_symbol || '_' || trade_date as option_bar_id,    -- use as primary key
   option_symbol,
   trade_date,
-  strike_price,
   option_type,
   open as open_price,
   high as high_price,
@@ -23,7 +22,7 @@ select
   volume,
   vwap as volume_weighted_average_price,
   transactions,
-  inserted_at as loaded_at
+  inserted_at as loaded_at,
   raw_rec as raw_json_record
 from source
 )

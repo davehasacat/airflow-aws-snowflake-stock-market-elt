@@ -6,14 +6,17 @@ sources:
     tables:
       - name: source_polygon_stocks_raw
         description: "Raw daily OHLCV data for all tickers from Polygon.io."
-        freshness:
-          warn_after: {count: 1, period: day}
         loaded_at_field: inserted_at
+        config:
+          freshness:
+            warn_after: {count: 1, period: day}
+
       - name: source_polygon_options_raw
         description: "Raw daily OHLCV data for all options contracts from Polygon.io."
-        freshness:
-          warn_after: {count: 1, period: day}
         loaded_at_field: inserted_at
+        config:
+          freshness:
+            warn_after: {count: 1, period: day}
 
 models:
   - name: stg_polygon__options_bars
