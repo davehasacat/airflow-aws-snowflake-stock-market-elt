@@ -4,14 +4,14 @@ sources:
   - name: public
     description: "Raw data loaded from the stock market ELT pipeline."
     tables:
-      - name: source_polygon_stocks
+      - name: source_polygon_stocks_raw
         description: "Raw daily OHLCV data for all tickers from Polygon.io."
         loaded_at_field: inserted_at
         config:
           freshness:
             warn_after: {count: 1, period: day}
 
-      - name: source_polygon_options
+      - name: source_polygon_options_raw
         description: "Raw daily OHLCV data for all options contracts from Polygon.io."
         loaded_at_field: inserted_at
         config:
