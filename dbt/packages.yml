@@ -1,4 +1,26 @@
+# =====================================================================
+# dbt Packages
+# ---------------------------------------------------------------------
+# File: dbt/packages.yml
+# Purpose:
+#   Define external dbt packages used by this project.
+#   Packages extend dbt with macros, utilities, and testing frameworks.
+#
+# To install/update:
+#   Run: dbt deps
+#
+# Reference:
+#   https://docs.getdbt.com/docs/build/packages
+# =====================================================================
+
 packages:
-  # Data quality & expectations (like Great Expectations but dbt-native)
+  # -------------------------------------------------------------------
+  # 🔍 Data Quality & Testing
+  # -------------------------------------------------------------------
+  # dbt_expectations:
+  #   - Provides advanced testing macros similar to Great Expectations.
+  #   - Useful for row-level and column-level data quality checks.
+  #   - Maintained by Metaplane.
+  # -------------------------------------------------------------------
   - package: metaplane/dbt_expectations
     version: "0.10.9"

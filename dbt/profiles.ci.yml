@@ -1,8 +1,31 @@
+# =====================================================================
+# dbt Profile (CI Environment)
+# ---------------------------------------------------------------------
+# File: dbt/profiles.ci.yml
+# Purpose:
+#   Provides a lightweight, build-time Snowflake configuration
+#   used for parsing and validation during Docker builds.
+#
+# This file is safe to include in source control.
+# Actual production credentials are fetched at runtime from
+# AWS Secrets Manager via Airflow → `snowflake_default` connection.
+#
+# Reference:
+#   https://docs.getdbt.com/docs/core/connect-data-platform/snowflake-setup
+# =====================================================================
+
 stock_market_elt:
   target: ci
+
   outputs:
     ci:
       type: snowflake
+      # -----------------------------------------------------------------
+      # Use environment variables with safe defaults for CI builds.
+      # These are NOT real credentials—just placeholders for `dbt parse`.
+      # During runtime, Airflow generates a full profiles.yml
+      # from AWS Secrets Manager.
+      # -----------------------------------------------------------------
       account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'acct') }}"
       user: "{{ env_var('SNOWFLAKE_USER', 'user') }}"
       password: "{{ env_var('SNOWFLAKE_PASSWORD', 'pw') }}"
