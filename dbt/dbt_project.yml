@@ -1,13 +1,36 @@
-# dbt/dbt_project.yml
+# =====================================================================
+# dbt Project Configuration
+# ---------------------------------------------------------------------
+# File: dbt/dbt_project.yml
+# Purpose:
+#   Defines your dbt project’s metadata, structure, and default configs.
+#   This file tells dbt where to find models, macros, tests, etc.,
+#   and how to build them (e.g., materializations, tags, documentation).
+#
+# Reference:
+#   https://docs.getdbt.com/docs/build/projects
+# =====================================================================
 
-name: "stock_market_elt"
+# ---------------------------------------------------------------------
+# 📦 Basic project metadata
+# ---------------------------------------------------------------------
+name: "stock_market_elt"          # Unique project name (used in manifest + schema naming)
 version: "1.0.0"
 config-version: 2
 
-# dbt profile name (Cosmos maps this to the Airflow connection)
+# ---------------------------------------------------------------------
+# 🔗 Profile configuration
+# ---------------------------------------------------------------------
+# dbt uses this profile name to find credentials in:
+#   ~/.dbt/profiles.yml  (local)
+#   or rendered via Airflow in /tmp/dbt_profiles (in DAG runtime)
+# The Airflow DAGs in this project dynamically generate it from
+# the `snowflake_default` connection stored in AWS Secrets Manager.
 profile: "stock_market_elt"
 
-# Project paths
+# ---------------------------------------------------------------------
+# 🗂️ Project paths (all relative to this dbt/ directory)
+# ---------------------------------------------------------------------
 model-paths: ["models"]
 analysis-paths: ["analyses"]
 test-paths: ["tests"]
@@ -15,32 +38,56 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
+# Clean up build artifacts with `dbt clean`
 clean-targets:
   - "target"
   - "dbt_packages"
 
-# Layered model config
+# ---------------------------------------------------------------------
+# 🏗️ Model configurations (by layer)
+# ---------------------------------------------------------------------
+# dbt lets you organize models into logical layers:
+# - staging: raw → clean
+# - intermediate: transformations & joins
+# - marts: final reporting-ready tables
+#
+# Each section below defines defaults for models in that folder.
+# ---------------------------------------------------------------------
 models:
   stock_market_elt:
-    # Global defaults for all models in the project
+    # -----------------------------------------------------------------
+    # Global defaults (applied to all models in this project)
+    # -----------------------------------------------------------------
     +persist_docs:
-      relation: true
-      columns: true
+      relation: true    # Attach doc strings to tables/views
+      columns: true     # Attach doc strings to columns
 
-    # Staging views; optionally keep in a dedicated schema
+    # -----------------------------------------------------------------
+    # 📊 Staging Layer
+    # -----------------------------------------------------------------
+    # - Cleans and standardizes raw data
+    # - Usually views (not tables)
     staging:
       +materialized: view
-      # +schema: stg
+      # +schema: stg                    # Uncomment for separate schema
       +tags: ["staging"]
 
-    # Intermediate tables
+    # -----------------------------------------------------------------
+    # 🔄 Intermediate Layer
+    # -----------------------------------------------------------------
+    # - Handles joins, enrichments, and logic between staging + marts
+    # - Usually tables (for downstream performance)
     intermediate:
       +materialized: table
-      # +schema: int
+      # +schema: int                    # Uncomment for separate schema
       +tags: ["intermediate"]
 
-    # Marts / final tables
+    # -----------------------------------------------------------------
+    # 🏁 Marts Layer (Final)
+    # -----------------------------------------------------------------
+    # - Business-ready datasets consumed by BI tools or dashboards
+    # - Materialized as tables
     marts:
       +materialized: table
-      # +schema: marts
+      # +schema: marts                  # Uncomment for separate schema
       +tags: ["marts"]
