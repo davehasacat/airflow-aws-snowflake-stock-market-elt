@@ -320,7 +320,8 @@ def dbt_build():
             }
 
         def _base_cmd(cfg: dict, subcmd: list[str]) -> list[str]:
-            cmd = [cfg["exe"], *subcmd, "--target", cfg["target"], "--no-use-colors"]
+            # ONLY CHANGE: pass --profiles-dir explicitly on every dbt call
+            cmd = [cfg["exe"], *subcmd, "--target", cfg["target"], "--profiles-dir", cfg["profiles_dir"], "--no-use-colors"]
             # selection flags
             if cfg.get("select"):
                 cmd += ["--select", cfg["select"]]
@@ -346,7 +347,8 @@ def dbt_build():
             if not cfg.get("git_ok", False):
                 print("[DBT] Skipping `dbt deps` because `git` is not available in PATH.")
                 return
-            _run([cfg["exe"], "deps"], cfg["project_dir"], extra_env=_env(cfg), timeout_sec=1200)
+            # ONLY CHANGE: include --profiles-dir here too
+            _run([cfg["exe"], "deps", "--profiles-dir", cfg["profiles_dir"]], cfg["project_dir"], extra_env=_env(cfg), timeout_sec=1200)
 
         @task
         def freshness(cfg: dict):
