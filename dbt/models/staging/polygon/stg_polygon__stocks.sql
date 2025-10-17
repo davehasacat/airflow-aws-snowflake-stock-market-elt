@@ -11,7 +11,7 @@ with source as (
 
 renamed_and_casted as (
 select
-  ticker || '_' || trade_date as stock_bar_id,    -- use as primary key
+  ticker || '_' || polygon_trade_date as stock_bar_id,    -- use as primary key
   ticker,
   polygon_trade_date,
   inserted_at as loaded_at,

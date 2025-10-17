@@ -8,7 +8,7 @@ snapshots:
         description: "The stock ticker symbol."
         tests:
           - not_null
-      - name: trade_date
+      - name: polygon_trade_date
         description: "The date of the stock bar."
         tests:
           - not_null
