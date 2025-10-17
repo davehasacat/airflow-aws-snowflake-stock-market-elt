@@ -65,6 +65,7 @@ def polygon_options_load_dag():
            - bar_ts (from results[0].t → TIMESTAMP_NTZ)
            - open, high, low, close, volume, vwap, transactions (from results[0])
            - raw_rec (entire JSON)
+         (inserted_at uses table default CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
       5) TRUNCATE staging
     """
 
@@ -126,7 +127,7 @@ def polygon_options_load_dag():
             vwap            FLOAT,
             transactions    BIGINT,
             raw_rec         VARIANT,               -- full JSON payload
-            inserted_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+            inserted_at     TIMESTAMP_NTZ DEFAULT (CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
         );
         """
         hook.run(ddl_target)
@@ -183,6 +184,7 @@ def polygon_options_load_dag():
             batch = stage_relative_keys[i : i + COPY_BATCH_SIZE]
             files_clause = ", ".join(f"'{k}'" for k in batch)
 
+        # Use COPY INTO with FILES batching
             copy_sql = f"""
             COPY INTO {FQ_STAGE_TABLE} (rec)
             FROM {FQ_STAGE}
@@ -203,6 +205,7 @@ def polygon_options_load_dag():
         - Extract fields from rec:results[0] with TRY_TO_NUMBER to avoid hard failures
         - Use scale in TRY_TO_NUMBER to preserve decimals before casting to FLOAT
         - Keep the full JSON in raw_rec for future reprocessing
+        - inserted_at uses table default (CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
         """
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
@@ -218,7 +221,7 @@ def polygon_options_load_dag():
             /* t is ms since epoch; extract as string -> to number -> timestamp */
             TO_DATE(
               TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 )
-            )                                                                 AS trade_date,
+            )                                                                  AS trade_date,
             TO_TIMESTAMP_NTZ( TRY_TO_NUMBER(rec:results[0]:t::STRING) / 1000 ) AS bar_ts,
 
             /* Preserve decimal precision for numeric fields */
