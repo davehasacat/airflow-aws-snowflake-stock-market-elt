@@ -16,4 +16,3 @@ setup_guide.md
 /images
 dbt_packages
 package-lock.yml
-airflow-secrets-read.json
