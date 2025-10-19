@@ -18,6 +18,7 @@ services:
       # Mount local AWS credentials (read-only) so Airflow/boto3 can reach Secrets Manager and S3
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
       # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
+      - ./keys:/usr/local/airflow/keys:ro  
     environment:
       # Pass-throughs (most already defined in .env); keeping explicit for clarity
       - AWS_PROFILE=${AWS_PROFILE}
@@ -38,6 +39,7 @@ services:
       - ./dbt:/usr/local/airflow/dbt
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
       # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
+      - ./keys:/usr/local/airflow/keys:ro  
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
@@ -57,6 +59,7 @@ services:
       - ./dbt:/usr/local/airflow/dbt
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
       # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
+      - ./keys:/usr/local/airflow/keys:ro  
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
