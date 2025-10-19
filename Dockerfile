@@ -86,12 +86,6 @@ RUN dbt parse \
 COPY docker/dbt_bootstrap.sh /usr/local/bin/dbt_bootstrap.sh
 RUN chmod +x /usr/local/bin/dbt_bootstrap.sh
 
-# Provide sane defaults; can be overridden by .env / docker-compose
-ENV SNOWFLAKE_CONN_SECRET_NAME="airflow/connections/snowflake_default" \
-    DBT_PROFILE_NAME="stock_market_elt" \
-    DBT_PROFILES_DIR="/usr/local/airflow/dbt" \
-    DBT_PROJECT_DIR="/usr/local/airflow/dbt"
-
 # Switch back to non-root Astro runtime user
 USER astro
 
