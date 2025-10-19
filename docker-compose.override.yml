@@ -59,7 +59,7 @@ services:
       - ./dbt:/usr/local/airflow/dbt
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
       # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
-      - ./keys:/usr/local/airflow/keys:ro  
+      - ./keys:/usr/local/airflow/keys:ro
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
@@ -101,9 +101,9 @@ services:
     networks:
       - stocks-elt_default
     restart: unless-stopped
-    # depends_on:                                   # Uncomment if your dashboard requires Airflow up first
-    #   - scheduler
-    #   - webserver
+    depends_on:                                   # Uncomment if your dashboard requires Airflow up first
+      - scheduler
+      - webserver
 
 # -------------------------
 # Shared network
