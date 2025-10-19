@@ -212,7 +212,7 @@ def polygon_stocks_load_dag():
         validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
         return f"""
         COPY INTO {FQ_TABLE}
-          (ticker, polygon_trade_date, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
+          (ticker, polygon_trade_date, volume, vwap, open, close, high, low, transactions, source_file, source_row_number)
         FROM (
             SELECT
                 $1:ticker::TEXT                                                      AS ticker,
@@ -224,8 +224,8 @@ def polygon_stocks_load_dag():
 
                 TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                        AS volume,
                 TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)        AS vwap,
-                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS "open",
-                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS "close",
+                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS open,
+                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS close,
                 TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
                 TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
                 TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                         AS transactions,
