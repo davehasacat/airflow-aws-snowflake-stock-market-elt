@@ -79,19 +79,17 @@ def polygon_stocks_load_dag():
     # ────────────────────────────────────────────────────────────────────────────
     @task
     def create_snowflake_table():
-        """
-        Create/ensure the typed landing table (lineage-friendly for dbt incremental).
-        """
+        """Create/ensure the typed landing table (lineage-friendly for dbt incremental)."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         sql = f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             -- Business columns
             ticker TEXT,
             polygon_trade_date DATE,
-            open NUMERIC(19, 4),
+            "open" NUMERIC(19, 4),
             high NUMERIC(19, 4),
             low NUMERIC(19, 4),
-            close NUMERIC(19, 4),
+            "close" NUMERIC(19, 4),
             volume BIGINT,
             vwap NUMERIC(19, 4),
             transactions BIGINT,
@@ -106,9 +104,7 @@ def polygon_stocks_load_dag():
 
     @task
     def check_stage_exists():
-        """
-        Ensure the external stage exists and is accessible for the Airflow role.
-        """
+        """Ensure the external stage exists and is accessible for the Airflow role."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         try:
             hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
@@ -178,16 +174,16 @@ def polygon_stocks_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         lookback = COPY_HISTORY_LOOKBACK_HOURS
-        # NOTE: copy_history returns 'filename' values that match FILES=() paths (stage-relative).
+        # NOTE: copy_history returns FILE_NAME values that match FILES=() paths (stage-relative).
         sql = f"""
         with hist as (
-          select filename
+          select FILE_NAME
           from table(information_schema.copy_history(
             table_name => '{FQ_TABLE}',
             start_time => dateadd('hour', -{lookback}, current_timestamp())
           ))
         )
-        select filename from hist;
+        select FILE_NAME from hist;
         """
         rows = hook.get_records(sql) or []
         already = {r[0] for r in rows if r and r[0]}
@@ -210,13 +206,13 @@ def polygon_stocks_load_dag():
         Compose COPY or VALIDATION SQL. We:
           - project JSON fields into typed columns
           - include lineage columns via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
-          - allow both .json and .json.gz (COMPRESSION = AUTODETECT)
+          - allow both .json and .json.gz (COMPRESSION inferred from extension)
           - rely on load history for idempotency (FORCE={FORCE})
         """
         validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
         return f"""
         COPY INTO {FQ_TABLE}
-          (ticker, polygon_trade_date, volume, vwap, open, close, high, low, transactions, source_file, source_row_number)
+          (ticker, polygon_trade_date, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
         FROM (
             SELECT
                 $1:ticker::TEXT                                                      AS ticker,
@@ -228,8 +224,8 @@ def polygon_stocks_load_dag():
 
                 TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                        AS volume,
                 TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)        AS vwap,
-                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS open,
-                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS close,
+                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS "open",
+                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS "close",
                 TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
                 TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
                 TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                         AS transactions,
@@ -239,7 +235,7 @@ def polygon_stocks_load_dag():
             FROM {FQ_STAGE}
         )
         FILES = ({files_clause})
-        FILE_FORMAT = (TYPE = 'JSON' COMPRESSION = 'AUTODETECT')
+        FILE_FORMAT = (TYPE = 'JSON')
         ON_ERROR = '{ON_ERROR}'
         FORCE = {FORCE}
         {validate};
@@ -273,10 +269,7 @@ def polygon_stocks_load_dag():
 
     @task
     def sum_loaded(counts: list[int]) -> int:
-        """
-        Visibility: how many files were targeted across COPY batches
-        (Snowflake may skip already-loaded files when FORCE=FALSE).
-        """
+        """Visibility: how many files were targeted across COPY batches."""
         total = sum(counts or [])
         print(f"Total files targeted for load: {total}")
         return total
