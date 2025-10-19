@@ -47,19 +47,34 @@ COPY dbt/dbt_project.yml   /usr/local/airflow/dbt/dbt_project.yml
 # Install dbt packages (dbt_utils, dbt_date, etc.)
 RUN dbt deps --project-dir /usr/local/airflow/dbt
 
-# Provide a minimal profiles.yml for build-time syntax validation only.
-# (Runtime profile is rendered from AWS Secrets Manager by the bootstrap.)
-COPY dbt/profiles.yml      /usr/local/airflow/dbt/profiles.yml
-
 # Copy the remainder of the dbt project (models, snapshots, macros, etc.)
 COPY dbt /usr/local/airflow/dbt
 
 # ---------------------------------------------------------------------
 # ✅ Build-time validation (non-destructive)
 # ---------------------------------------------------------------------
-# Set a dummy passphrase so templating doesn’t fail during build.
-# dbt parse does not contact Snowflake; it only validates project structure.
+# Create a minimal, dummy profiles.yml for build-time `dbt parse` only.
+RUN printf '%s\n' \
+'stock_market_elt:' \
+'  target: dev' \
+'  outputs:' \
+'    dev:' \
+'      type: snowflake' \
+'      account: DUMMY_ACCOUNT' \
+'      user: DUMMY_USER' \
+'      role: DUMMY_ROLE' \
+'      database: DUMMY_DB' \
+'      warehouse: DUMMY_WH' \
+'      schema: PUBLIC' \
+'      private_key_path: /tmp/dummy_key.p8' \
+'      private_key_passphrase: "__build_dummy__"' \
+'      client_session_keep_alive: true' \
+> /usr/local/airflow/dbt/profiles.yml
+
+# Set a dummy passphrase so templating never fails during build.
 ENV SNOWFLAKE_PASSPHRASE="__build_dummy__"
+
+# dbt parse checks model syntax/refs; it does NOT contact Snowflake.
 RUN dbt parse \
     --project-dir /usr/local/airflow/dbt \
     --profiles-dir /usr/local/airflow/dbt

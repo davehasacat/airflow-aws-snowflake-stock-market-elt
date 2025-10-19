@@ -87,39 +87,6 @@ services:
       - stocks-elt_default
     restart: unless-stopped
 
-  # -------------------------
-  # Custom dashboard service
-  # -------------------------
-  # dashboard:
-  #   image: dashboard-app
-  #   container_name: dashboard
-  #   ports:
-  #     - "8501:8501"
-  #   # Mount local AWS creds so the app can read from Secrets Manager
-  #   volumes:
-  #     - ${USERPROFILE}/.aws:/home/astro/.aws:ro
-  #     # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
-  #   environment:
-  #     # Let the dashboard use the same local profile + region
-  #     - AWS_PROFILE=${AWS_PROFILE}
-  #     - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
-
-  #     # If the app runs non-root, point AWS SDK explicitly to the mounted files
-  #     - AWS_SHARED_CREDENTIALS_FILE=/home/astro/.aws/credentials
-  #     - AWS_CONFIG_FILE=/home/astro/.aws/config
-
-  #     # The name of the Airflow Snowflake connection secret in AWS SM
-  #     - SNOWFLAKE_CONN_SECRET_NAME=airflow/connections/snowflake_default
-
-  #     # Optional: a smaller WH just for dashboard queries (app should honor this override)
-  #     - SNOWFLAKE_OVERRIDE_WAREHOUSE=${SNOWFLAKE_OVERRIDE_WAREHOUSE}
-  #   networks:
-  #     - stocks-elt_default
-  #   restart: unless-stopped
-  #   depends_on:                                   # Uncomment if your dashboard requires Airflow up first
-  #     - scheduler
-  #     - webserver
-
 # -------------------------
 # Shared network
 # -------------------------
