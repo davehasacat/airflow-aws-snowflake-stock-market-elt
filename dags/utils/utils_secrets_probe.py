@@ -4,15 +4,17 @@
 # ---------------------------------------------------------------------
 # Purpose:
 #   Focused test of Airflow ↔ AWS Secrets Manager integration.
-#   Confirms backend wiring, Variables & Connections retrieval,
-#   and optional IAM GetSecretValue access (no secret values logged).
+#   Confirms backend wiring, Variable (bucket only) & Connections
+#   (Polygon API keys), validates no API keys remain in Variables,
+#   runs Polygon Stocks API smoke test, optional GetSecretValue IAM check,
+#   then S3 probe.
 # =====================================================================
 
 from __future__ import annotations
 
 import json
 import os
-from typing import List
+from typing import List, Optional
 
 import pendulum
 from airflow.decorators import dag, task
@@ -24,25 +26,46 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
 AWS_CONFIG = Config(
     connect_timeout=5,
     read_timeout=20,
     retries={"max_attempts": 3, "mode": "standard"},
 )
 
+# Variables: only bucket lives here
 REQUIRED_VARIABLES: List[str] = [
     "s3_data_bucket",
+]
+
+# Connections: include Polygon API keys as connections (per your secret names)
+REQUIRED_CONNECTIONS: List[str] = [
+    "aws_default",
+    "snowflake_default",
     "polygon_stocks_api_key",
     "polygon_options_api_key",
 ]
 
-REQUIRED_CONNECTIONS: List[str] = [
-    "aws_default",
-    "snowflake_default",
-    "polygon_options_api",
-]
-
 OPTIONAL_DIRECT_SECRET_ENV = "TEST_SECRET_NAME"
+
+
+def _requests_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
 
 @dag(
@@ -55,9 +78,12 @@ OPTIONAL_DIRECT_SECRET_ENV = "TEST_SECRET_NAME"
     default_args={"retries": 0},
     doc_md="""
     # Utils: Secrets Probe
-    Verifies Airflow ↔ AWS Secrets Manager:
+    Verifies Airflow ↔ AWS Secrets Manager and Polygon:
     - Backend configured and active
-    - Variables + Connections resolvable (no secret values logged)
+    - Variable resolvable (s3_data_bucket as raw string)
+    - Guardrail: throws if Polygon API keys exist as Variables
+    - Required Connections resolvable (aws_default, snowflake_default, polygon_*_api_key)
+    - Polygon Stocks API tiny fetch (AAPL)
     - Optional direct GetSecretValue check
     - Basic AWS identity + S3 read probe
     """,
@@ -105,6 +131,47 @@ def utils_secrets_probe():
             raise RuntimeError(f"[AF] ❌ Missing Airflow Variables (via secrets backend): {missing}")
 
     @task
+    def guardrail_no_api_keys_in_variables():
+        """
+        Fail fast if Polygon API keys are still stored as Variables.
+        Explains Variables vs Connections difference and how to fix.
+        """
+        misplaced = []
+        for bad in ["polygon_stocks_api_key", "polygon_options_api_key"]:
+            try:
+                Variable.get(bad)
+                misplaced.append(bad)
+            except Exception:
+                pass
+
+        if misplaced:
+            raise RuntimeError(
+                "[GUARDRAIL] ❌ API keys must be stored as Airflow Connections, not Variables.\n"
+                "• Variables (airflow/variables/*) are raw strings — good for simple config like 's3_data_bucket'.\n"
+                "• Connections (airflow/connections/*) are JSON objects that map to Airflow's Connection model "
+                "(conn_type/schema/host/login/password/extra). Put API keys there.\n\n"
+                f"Found Variables that should be Connections: {misplaced}\n\n"
+                "Create these Secrets Manager entries as Plaintext JSON (note stringified `extra`):\n"
+                "— airflow/connections/polygon_stocks_api_key\n"
+                "{\n"
+                '  "conn_type": "http",\n'
+                '  "schema": "https",\n'
+                '  "host": "api.polygon.io",\n'
+                '  "extra": "{\\"api_key\\": \\"YOUR_STOCKS_API_KEY\\"}"\n'
+                "}\n"
+                "— airflow/connections/polygon_options_api_key\n"
+                "{\n"
+                '  "conn_type": "http",\n'
+                '  "schema": "https",\n'
+                '  "host": "api.polygon.io",\n'
+                '  "extra": "{\\"api_key\\": \\"YOUR_OPTIONS_API_KEY\\"}"\n'
+                "}\n"
+                "Then delete the Variables with those names."
+            )
+
+        print("[GUARDRAIL] ✅ No misplaced API keys in Variables.")
+
+    @task
     def airflow_connections_probe():
         missing = []
         for conn_id in REQUIRED_CONNECTIONS:
@@ -123,6 +190,87 @@ def utils_secrets_probe():
 
         if missing:
             raise RuntimeError(f"[AF] ❌ Missing Airflow Connections (via secrets backend): {missing}")
+
+    @task
+    def polygon_stocks_smoke_probe():
+        """
+        Use connection 'polygon_stocks_api_key' to fetch a tiny sample from Polygon Stocks API.
+        Extracts key from password or extras.api_key; logs masked preview only.
+        """
+        def _sanitize(k: Optional[str]) -> str:
+            if not k:
+                return ""
+            k = k.strip()
+            if (k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'")):
+                k = k[1:-1].strip()
+            return k
+
+        try:
+            conn = BaseHook.get_connection("polygon_stocks_api_key")
+        except Exception as e:
+            raise RuntimeError(
+                "[POLY] ❌ Connection 'polygon_stocks_api_key' not found. "
+                "Create Secrets Manager secret 'airflow/connections/polygon_stocks_api_key' with JSON including extra.api_key."
+            ) from e
+
+        api_key = _sanitize(conn.password) or _sanitize((conn.extra_dejson or {}).get("api_key", ""))
+        if not api_key:
+            raise RuntimeError(
+                "[POLY] ❌ 'polygon_stocks_api_key' has no API key in password or extra.api_key. "
+                "Fix the connection JSON in Secrets Manager."
+            )
+
+        masked = f"{api_key[:4]}...{api_key[-4:]} (len={len(api_key)})"
+        print(f"[POLY] 🔎 Using sanitized key: {masked}")
+
+        s = _requests_session()
+        ticker = "AAPL"
+        base = "https://api.polygon.io/v2/aggs/ticker"
+        today = pendulum.today("UTC")
+        tried = []
+
+        for i in range(1, 8):
+            d = today.subtract(days=i).format("YYYY-MM-DD")
+            url = f"{base}/{ticker}/range/1/day/{d}/{d}"
+            params = {"adjusted": "true", "limit": 1, "apiKey": api_key}
+            tried.append(d)
+            try:
+                resp = s.get(url, params=params, timeout=15)
+            except requests.RequestException as e:
+                if i == 7:
+                    raise RuntimeError(f"[POLY] ❌ Network error: {e}") from e
+                continue
+
+            q = resp.request.url.split("?")[0]
+            print(f"[POLY] → GET {q} (date={d}) status={resp.status_code}")
+
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    f"[POLY] ❌ Unauthorized/Forbidden (HTTP {resp.status_code}). "
+                    "Likely wrong/expired key or whitespace/quotes in secret."
+                )
+            if resp.status_code == 429:
+                raise RuntimeError("[POLY] ❌ Rate limited by Polygon (429).")
+            if resp.status_code >= 500:
+                if i == 7:
+                    raise RuntimeError(f"[POLY] ❌ Server error {resp.status_code}: {resp.text[:200]}")
+                continue
+            if resp.status_code != 200:
+                raise RuntimeError(f"[POLY] ❌ HTTP {resp.status_code}: {resp.text[:200]}")
+
+            try:
+                data = resp.json()
+            except Exception:
+                raise RuntimeError(f"[POLY] ❌ Non-JSON response: {resp.text[:200]}")
+
+            results = data.get("results") or []
+            if results:
+                r = results[0]
+                o, h, l, c, v = r.get("o"), r.get("h"), r.get("l"), r.get("c"), r.get("v")
+                print(f"[POLY] ✅ {ticker} {d} agg OK (o={o}, h={h}, l={l}, c={c}, v={v})")
+                return {"ticker": ticker, "date": d}
+
+        raise RuntimeError(f"[POLY] ❌ No data found for {ticker} on dates tried: {tried}")
 
     @task
     def optional_direct_boto3_secret_check(env: dict):
@@ -171,7 +319,9 @@ def utils_secrets_probe():
     # ── Flow ──────────────────────────────────────────────────────────
     env = show_env_and_backend()
     airflow_variables_probe()
+    guardrail_no_api_keys_in_variables()    # ⛔ throws if API keys still in Variables
     airflow_connections_probe()
+    polygon_stocks_smoke_probe()
     optional_direct_boto3_secret_check(env)
     aws_identity_and_s3_probe(env)
 
