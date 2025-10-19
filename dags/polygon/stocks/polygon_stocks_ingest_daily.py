@@ -1,12 +1,15 @@
 # dags/polygon/stocks/polygon_stocks_ingest_daily.py
 # =============================================================================
 # Polygon Stocks → S3 (Daily) — Connection-aware key lookup + header auth
+# Incremental-friendly: gzip output + audit/lineage fields at root.
 # =============================================================================
 from __future__ import annotations
 import os
 import json
 import csv
 import time
+import gzip
+from io import BytesIO
 from datetime import timedelta
 from typing import List
 
@@ -19,7 +22,7 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
-from airflow.hooks.base import BaseHook  # NEW
+from airflow.hooks.base import BaseHook
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
@@ -37,7 +40,6 @@ DAILY_MANIFEST_PREFIX = os.getenv("STOCKS_DAILY_MANIFEST_PREFIX", "raw/manifests
 
 
 def _extract_api_key_from_conn(conn) -> str | None:
-    # Priority: password, login, extra['api_key']
     if conn and conn.password and conn.password.strip():
         return conn.password.strip()
     if conn and conn.login and conn.login.strip():
@@ -193,6 +195,10 @@ def polygon_stocks_ingest_daily_dag():
         if not results:
             return []
 
+        # Audit/lineage values for dbt
+        run_id = context["run_id"]
+        now_utc = pendulum.now("UTC").to_iso8601_string()
+
         processed: list[str] = []
         for r in results:
             ticker = (r.get("T") or "").upper()
@@ -200,6 +206,7 @@ def polygon_stocks_ingest_daily_dag():
                 continue
 
             payload = {
+                # business keys (unchanged so loader SQL keeps working)
                 "ticker": ticker,
                 "queryCount": 1,
                 "resultsCount": 1,
@@ -216,11 +223,21 @@ def polygon_stocks_ingest_daily_dag():
                 }],
                 "status": "OK",
                 "request_id": data.get("request_id"),
+
+                # lineage/audit fields (helpful for dbt incremental + troubleshooting)
+                "ingested_at_utc": now_utc,
+                "as_of_date": target_date,
+                "run_id": run_id,
             }
 
-            s3_key = f"raw/stocks/{ticker}/{target_date}.json"
-            s3.load_string(json.dumps(payload, separators=(",", ":")), key=s3_key,
-                           bucket_name=BUCKET_NAME, replace=True)
+            # Write as gzip for faster loads and lower storage
+            buf = BytesIO()
+            with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
+                gz.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+            gz_bytes = buf.getvalue()
+
+            s3_key = f"raw/stocks/{ticker}/{target_date}.json.gz"
+            s3.load_bytes(gz_bytes, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
             processed.append(s3_key)
             time.sleep(REQUEST_DELAY_SECONDS)
 
