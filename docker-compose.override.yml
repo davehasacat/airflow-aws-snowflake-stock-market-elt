@@ -1,95 +1,123 @@
 # docker-compose.override.yml
-# Purpose: Local overrides for Airflow + a custom dashboard
-# Notes:
-# - Secrets come from AWS Secrets Manager (via Airflow backend); do NOT hardcode secrets here.
-# - Windows users: ensure COMPOSE_CONVERT_WINDOWS_PATHS=1 in your .env so ${USERPROFILE} works.
-# - macOS/Linux users: replace ${USERPROFILE}/.aws with ${HOME}/.aws if needed (see commented lines).
+# Option 1: Let Astro build & run all services, including the one-shot dbt-init.
+# - No Airflow command overrides.
+# - Airflow services wait on dbt-init (profiles.yml rendered from AWS SM).
+# - All config comes from .env (no secrets in this file).
 
 services:
-  # -------------------------
-  # Airflow core services
-  # -------------------------
+  # ──────────────────────────────────────────────────────────────────────────────
+  # One-shot init: render dbt profiles.yml from AWS Secrets Manager, then exit
+  # ──────────────────────────────────────────────────────────────────────────────
+  dbt-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    entrypoint: [ "bash", "-lc", "dbt_bootstrap.sh" ]
+    restart: "no"
+    volumes:
+      # dbt project (so profiles.yml is written into this mounted path)
+      - ./dbt:/usr/local/airflow/dbt
+      # AWS creds for Secrets Manager
+      - ${USERPROFILE}/.aws:/home/astro/.aws:ro
+      # - ${HOME}/.aws:/home/astro/.aws:ro         # (macOS/Linux alt)
+      # Snowflake private key(s)
+      - ./keys:/usr/local/airflow/keys:ro
+    environment:
+      # dbt bootstrap settings (all defined in .env)
+      - DBT_PROFILES_DIR=${DBT_PROFILES_DIR}
+      - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
+      - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
+      - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
+      - DBT_BOOTSTRAP_VALIDATE=${DBT_BOOTSTRAP_VALIDATE}
+    networks:
+      - stocks-elt_default
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Airflow core services — use Astro’s defaults; just add env/volumes + depends_on
+  # ──────────────────────────────────────────────────────────────────────────────
   scheduler:
+    depends_on:
+      dbt-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
-      # Mount the dbt project for live edits
       - ./dbt:/usr/local/airflow/dbt
-      # Mount local AWS credentials (read-only) so Airflow/boto3 can reach Secrets Manager and S3
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
-      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
-      - ./keys:/usr/local/airflow/keys:ro  
+      - ./keys:/usr/local/airflow/keys:ro
     environment:
-      # Pass-throughs (most already defined in .env); keeping explicit for clarity
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
       - AWS_CONFIG_FILE=${AWS_CONFIG_FILE}
+      - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
-      - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}
       - DBT_PROFILES_DIR=${DBT_PROFILES_DIR}
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
-      - SNOWFLAKE_CONN_SECRET_NAME=airflow/connections/snowflake_default
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
-    command: [ "bash", "-lc", "dbt_bootstrap.sh && exec /entrypoint" ]
+      - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
     networks:
       - default
       - stocks-elt_default
     restart: unless-stopped
 
   webserver:
+    depends_on:
+      dbt-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
-      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
-      - ./keys:/usr/local/airflow/keys:ro  
+      - ./keys:/usr/local/airflow/keys:ro
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
       - AWS_CONFIG_FILE=${AWS_CONFIG_FILE}
+      - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
-      - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}
       - DBT_PROFILES_DIR=${DBT_PROFILES_DIR}
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
-      - SNOWFLAKE_CONN_SECRET_NAME=airflow/connections/snowflake_default
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
-    command: [ "bash", "-lc", "dbt_bootstrap.sh && exec /entrypoint" ]
+      - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
     networks:
       - default
       - stocks-elt_default
     restart: unless-stopped
 
   triggerer:
+    depends_on:
+      dbt-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
       - ./dbt:/usr/local/airflow/dbt
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
-      # - ${HOME}/.aws:/home/astro/.aws:ro          # (macOS/Linux alt)
       - ./keys:/usr/local/airflow/keys:ro
     environment:
       - AWS_PROFILE=${AWS_PROFILE}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
       - AWS_CONFIG_FILE=${AWS_CONFIG_FILE}
+      - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}
       - AIRFLOW__SECRETS__BACKEND=${AIRFLOW__SECRETS__BACKEND}
       - AIRFLOW__SECRETS__BACKEND_KWARGS=${AIRFLOW__SECRETS__BACKEND_KWARGS}
-      - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE}
       - DBT_PROFILES_DIR=${DBT_PROFILES_DIR}
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
-      - SNOWFLAKE_CONN_SECRET_NAME=airflow/connections/snowflake_default
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
-    command: [ "bash", "-lc", "dbt_bootstrap.sh && exec /entrypoint" ]
+      - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
     networks:
       - default
       - stocks-elt_default
     restart: unless-stopped
 
-# -------------------------
-# Shared network
-# -------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# Shared network used by your dashboard & Airflow (kept separate from Astro’s)
+# ────────────────────────────────────────────────────────────────────────────────
 networks:
   stocks-elt_default:
     name: stocks-elt_default
