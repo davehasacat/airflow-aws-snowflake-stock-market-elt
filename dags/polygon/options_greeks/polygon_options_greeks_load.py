@@ -1,15 +1,15 @@
 # =============================================================================
-# Polygon Options → Snowflake (Loader; Greeks Chain Snapshot)
+# Polygon Options → Snowflake (Loader; Greeks — PARSED)
 # -----------------------------------------------------------------------------
-# Mirrors the bars loader's flow & datasets (incremental, idempotent, batch).
 # Strategy (Snowflake-compliant):
-#   1) COPY raw JSON into a staging VARIANT table via a simple SELECT from @stage
-#   2) INSERT parsed rows into a typed landing table using LATERAL FLATTEN
-#      with an anti-join on (source_file, source_row_number) for idempotency
+#   1) COPY raw JSON(.gz) from S3 external stage → STAGING table (VARIANT)
+#      - Simple SELECT from @stage (required by Snowflake)
+#   2) INSERT parsed rows → TYPED landing table using LATERAL FLATTEN
+#      - Idempotent via anti-join on (source_file, source_row_number)
 #
-# Dataset triggers/outlets:
-#   - schedule=[S3_OPTIONS_GREEKS_MANIFEST_DATASET]
-#   - INSERT task outlets=[SNOWFLAKE_OPTIONS_GREEKS_RAW_DATASET]
+# Datasets:
+#   - schedule=[S3_OPTIONS_GREEKS_MANIFEST_DATASET]                (from ingest)
+#   - INSERT task outlets=[SNOWFLAKE_OPTIONS_GREEKS_RAW_DATASET]   (typed table)
 #
 # Default manifest pointer:
 #   raw/manifests/polygon_options_greeks_manifest_latest.txt
@@ -56,7 +56,7 @@ COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOU
     start_date=pendulum.datetime(2025, 10, 1, tz="UTC"),
     schedule=[S3_OPTIONS_GREEKS_MANIFEST_DATASET],   # fires when greeks manifest updates
     catchup=False,
-    tags=["load", "polygon", "snowflake", "options", "greeks"],
+    tags=["load", "polygon", "snowflake", "options", "greeks", "parsed"],
     dagrun_timeout=timedelta(hours=2),
     max_active_runs=1,
 )
@@ -107,7 +107,7 @@ def polygon_options_greeks_load_dag():
         );
 
         CREATE TABLE IF NOT EXISTS {FQ_TYPED_TBL} (
-            -- Business columns (one row per contract per day)
+            -- Business columns (one row per contract snapshot)
             underlying_ticker TEXT,
             contract_symbol   TEXT,
             as_of_ts          TIMESTAMP_NTZ,
@@ -195,7 +195,6 @@ def polygon_options_greeks_load_dag():
         """
         Optional: prefilter keys already copied into the STAGING table,
         based on INFORMATION_SCHEMA.COPY_HISTORY for the staging table.
-        Aligns with PREFILTER_LOADED behavior in the bars loader.
         """
         if not PREFILTER_LOADED or not keys:
             return keys
@@ -278,6 +277,7 @@ def polygon_options_greeks_load_dag():
         """
         INSERT parsed rows from staging VARIANT into typed table.
         Idempotent via anti-join on (source_file, source_row_number=f.index).
+        Handles either data.results[] or data.options[] shapes from Polygon.
         """
         return f"""
         INSERT INTO {FQ_TYPED_TBL} (
@@ -298,17 +298,17 @@ def polygon_options_greeks_load_dag():
             TRY_TO_NUMBER(f.value:greeks:theta::STRING)                                    AS theta,
             TRY_TO_NUMBER(f.value:greeks:vega::STRING)                                     AS vega,
             COALESCE(
-              TRY_TO_NUMBER(f.value:implied_volatility::STRING),
-              TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING)
+                TRY_TO_NUMBER(f.value:implied_volatility::STRING),
+                TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING)
             )                                                                              AS implied_vol,
             TRY_TO_NUMBER(f.value:open_interest::STRING)                                   AS open_interest,
             COALESCE(
-              TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING),
-              TRY_TO_NUMBER(f.value:bid_price::STRING)
+                TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING),
+                TRY_TO_NUMBER(f.value:bid_price::STRING)
             )                                                                              AS bid_price,
             COALESCE(
-              TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING),
-              TRY_TO_NUMBER(f.value:ask_price::STRING)
+                TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING),
+                TRY_TO_NUMBER(f.value:ask_price::STRING)
             )                                                                              AS ask_price,
 
             s.source_file                                                                   AS source_file,
