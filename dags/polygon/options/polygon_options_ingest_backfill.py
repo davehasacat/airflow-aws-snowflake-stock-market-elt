@@ -5,7 +5,11 @@
 # Goal:
 #   Efficiently backfill daily options OHLCV (per-contract) from Polygon.io to S3.
 #
-# Key ideas:
+# Update 1 applied:
+#   - S3 partitioning switched to date/underlying-first:
+#     raw/options/year=YYYY/month=MM/day=DD/underlying=<UNDERLYING>/contract=<CONTRACT>.json.gz
+#
+# Key ideas (unchanged):
 #   1) Build flat (underlying, trade_date) pairs → map over pairs (no nested maps)
 #   2) Discover option contracts valid on that date (pagination + retries)
 #   3) Batch contracts to control API pressure
@@ -253,7 +257,11 @@ def polygon_options_ingest_backfill_dag():
         Discover contracts for a (ticker, target_date) using Polygon contracts API.
 
         Returns:
-          {'target_date': <YYYY-MM-DD>, 'contracts': [<CONTRACT>, ...]}
+          {
+            'underlying': <UNDERLYING>,
+            'target_date': <YYYY-MM-DD>,
+            'contracts': [<CONTRACT>, ...]
+          }
 
         Notes:
           - Paginates via next_url
@@ -293,22 +301,27 @@ def polygon_options_ingest_backfill_dag():
             next_url = data.get("next_url")
             time.sleep(REQUEST_DELAY_SECONDS)  # play nice
 
-        return {"target_date": target_date, "contracts": sorted(set(contracts))}
+        return {
+            "underlying": ticker,
+            "target_date": target_date,
+            "contracts": sorted(set(contracts)),
+        }
 
     @task
     def batch_contracts_for_pair(discovery: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Convert discovery into homogeneous batch-specs:
-          [{'target_date': D, 'contract_batch': [c1, c2, ...]}, ...]
+          [{'underlying': U, 'target_date': D, 'contract_batch': [c1, c2, ...]}, ...]
 
         Keeps downstream logic generic (each spec is processable on its own).
         """
+        underlying = discovery["underlying"]
         target_date = discovery["target_date"]
         contracts: List[str] = discovery.get("contracts") or []
         if not contracts:
             return []
         batches = _batch(contracts, CONTRACTS_BATCH_SIZE)
-        return [{"target_date": target_date, "contract_batch": b} for b in batches]
+        return [{"underlying": underlying, "target_date": target_date, "contract_batch": b} for b in batches]
 
     @task
     def flatten_batch_specs(nested: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -335,7 +348,7 @@ def polygon_options_ingest_backfill_dag():
         For each contract in each spec:
           - GET day aggs for target_date
           - If results exist: gzip the raw JSON to S3 at:
-              raw/options/<CONTRACT>/<YYYY-MM-DD>.json.gz
+              raw/options/year=YYYY/month=MM/day=DD/underlying=<UNDERLYING>/contract=<CONTRACT>.json.gz
 
         Returns:
           - The list of S3 keys written for this chunk (for manifest assembly)
@@ -352,13 +365,15 @@ def polygon_options_ingest_backfill_dag():
 
         written: List[str] = []
         for item in specs:
+            underlying = item["underlying"]
             target_date = item["target_date"]
+            yyyy, mm, dd = target_date.split("-")
             contract_batch: List[str] = item.get("contract_batch") or []
             if not contract_batch:
                 continue
 
             for contract in contract_batch:
-                key = f"raw/options/{contract}/{target_date}.json.gz"
+                key = f"raw/options/year={yyyy}/month={mm}/day={dd}/underlying={underlying}/contract={contract}.json.gz"
 
                 if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
                     # Already present; skip unless explicit replace
