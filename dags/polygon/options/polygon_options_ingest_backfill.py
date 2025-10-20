@@ -3,9 +3,11 @@
 # Polygon Options Backfill (Ingestion)
 # -----------------------------------------------------------------------------
 # Updates applied:
-#   1) S3 layout: raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
-#   2) Per-day manifests at raw/manifests/options/YYYY-MM-DD.txt + "latest" pointer
-#   4) Filter contracts to those alive on target day (list_date ≤ day ≤ expiration_date)
+#  1) S3 layout: raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
+#  2) Per-day manifests at raw/manifests/options/YYYY-MM-DD.txt + "latest" pointer
+#  4) Filter contracts to those alive on target day (list_date ≤ day ≤ expiration_date)
+#  5) XCom-size safety: workers return only small per-day counts; manifests are
+#     built by listing S3 (no giant key lists through XCom)
 # =============================================================================
 from __future__ import annotations
 
@@ -251,7 +253,6 @@ def polygon_options_ingest_backfill_dag():
             next_url = data.get("next_url")
             time.sleep(REQUEST_DELAY_SECONDS)
 
-        # Update 4: filter to alive contracts for target_date
         filtered = [r for r in all_recs if _alive_on_day(r, target_date)]
         contracts = sorted({r["ticker"] for r in filtered})
 
@@ -279,19 +280,26 @@ def polygon_options_ingest_backfill_dag():
         return [batch_specs[i:i+sz] for i in range(0, len(batch_specs), sz)]
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
-    def process_chunk(specs: List[Dict[str, Any]]) -> List[str]:
+    def process_chunk(specs: List[Dict[str, Any]]) -> Dict[str, int]:
+        """
+        Process a chunk of batch-specs and return a tiny map of {day_iso: wrote_count}.
+        Files are written directly to S3; we DO NOT return key lists via XCom.
+        """
         if not specs:
-            return []
+            return {}
 
         api_key = _get_polygon_options_key()
         sess = _session()
         s3 = S3Hook()
 
-        written: List[str] = []
+        counts_by_day: Dict[str, int] = {}
+
         for item in specs:
             underlying  = item["underlying"]
             target_date = item["target_date"]
             yyyy, mm, dd = target_date.split("-")
+            wrote = 0
+
             for contract in (item.get("contract_batch") or []):
                 key = f"raw/options/year={yyyy}/month={mm}/day={dd}/underlying={underlying}/contract={contract}.json.gz"
 
@@ -314,45 +322,55 @@ def polygon_options_ingest_backfill_dag():
                 with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
                     gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
                 s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
-                written.append(key)
+                wrote += 1
 
                 time.sleep(REQUEST_DELAY_SECONDS)
 
-        return written
+            if wrote:
+                counts_by_day[target_date] = counts_by_day.get(target_date, 0) + wrote
+
+        return counts_by_day
 
     @task
-    def flatten_str_lists(list_of_lists: List[List[str]]) -> List[str]:
-        return [k for sub in (list_of_lists or []) for k in (sub or []) if k]
+    def merge_day_counts(list_of_maps: List[Dict[str, int]]) -> Dict[str, int]:
+        """
+        Merge small {day_iso: count} maps into one.
+        This keeps XCom tiny regardless of run size.
+        """
+        out: Dict[str, int] = {}
+        for m in (list_of_maps or []):
+            for k, v in (m or {}).items():
+                out[k] = out.get(k, 0) + int(v or 0)
+        return out
 
     @task
-    def write_day_manifests(all_keys: List[str]) -> List[str]:
+    def write_day_manifests_from_s3(trading_days: List[str], counts_by_day: Dict[str, int]) -> List[str]:
         """
-        Write per-day manifests at raw/manifests/options/YYYY-MM-DD.txt
-        based on keys actually written.
+        Build per-day manifests by LISTING S3 prefixes, not by XCom key lists.
+        Only write a manifest if the day has files (based on listing or counts).
         """
-        if not all_keys:
-            return []
-
-        by_day: dict[str, list[str]] = {}
-        for k in all_keys:
-            parts = (k or "").split("/")
-            if len(parts) < 6 or parts[0] != "raw" or parts[1] != "options":
-                continue
-            y = parts[3].split("=")[-1]
-            m = parts[4].split("=")[-1]
-            d = parts[5].split("=")[-1]
-            iso = f"{y}-{m}-{d}"
-            by_day.setdefault(iso, []).append(k)
-
         s3 = S3Hook()
         manifest_keys: List[str] = []
-        for iso, keys in sorted(by_day.items()):
+
+        for iso in sorted(trading_days):
+            y, m, d = iso.split("-")
+            prefix = f"raw/options/year={y}/month={m}/day={d}/"
+            # Fast path: if we saw zero writes for this day, skip listing unless replace is enabled
+            # (If REPLACE_FILES, listing still matters for rewrites; we’ll list anyway.)
+            if not REPLACE_FILES and counts_by_day.get(iso, 0) == 0:
+                # still list once—there might have been preexisting files from earlier runs
+                pass
+
+            keys = s3.list_keys(bucket_name=BUCKET_NAME, prefix=prefix) or []
+            keys = [k for k in keys if k and k.startswith(prefix)]
             if not keys:
                 continue
+
             mkey = f"raw/manifests/options/{iso}.txt"
             s3.load_string("\n".join(sorted(set(keys))) + "\n",
                            key=mkey, bucket_name=BUCKET_NAME, replace=True)
             manifest_keys.append(mkey)
+
         return manifest_keys
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
@@ -378,10 +396,15 @@ def polygon_options_ingest_backfill_dag():
     batch_specs_nested = batch_contracts_for_pair.expand(discovery=discoveries)
     batch_specs_flat   = flatten_batch_specs(batch_specs_nested)
     chunked_specs      = chunk_batch_specs(batch_specs_flat)
-    written_lists      = process_chunk.expand(specs=chunked_specs)
-    all_keys           = flatten_str_lists(written_lists)
 
-    day_manifests = write_day_manifests(all_keys)
+    # Workers return tiny {day_iso: count} maps
+    day_counts_list    = process_chunk.expand(specs=chunked_specs)
+    counts_by_day      = merge_day_counts(day_counts_list)
+
+    # Build per-day manifests by listing S3 (no big XComs)
+    day_manifests      = write_day_manifests_from_s3(trading_days, counts_by_day)
+
+    # Update 'latest' with the content of most recent non-empty day manifest
     update_latest_pointer(day_manifests)
 
 # Instantiate
