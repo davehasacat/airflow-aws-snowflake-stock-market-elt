@@ -43,7 +43,7 @@ snapshots:
         description: "The unique OCC symbol for the option contract."
         tests:
           - not_null
-      - name: trade_date
+      - name: polygon_trade_date
         description: "The date of the option bar."
         tests:
           - not_null

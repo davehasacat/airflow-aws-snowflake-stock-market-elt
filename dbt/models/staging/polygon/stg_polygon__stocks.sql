@@ -15,10 +15,10 @@ select
   ticker,
   polygon_trade_date,
   inserted_at as loaded_at,
-  open as open_price,
+  "open" as open_price,
   high as high_price,
   low as low_price,
-  close as close_price,
+  "close" as close_price,
   vwap as volume_weighted_average_price,
   volume,
   transactions
