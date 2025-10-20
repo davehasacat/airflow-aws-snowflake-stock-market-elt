@@ -1,10 +1,10 @@
+# dags/polygon/options/polygon_options_load.py
 # =============================================================================
-# Polygon Options → Snowflake (Loader; Bars) — lineage-aware & dbt-incremental friendly
+# Polygon Options → Snowflake (Loader) — lineage-aware & dbt-incremental friendly
 # -----------------------------------------------------------------------------
-# Loads raw JSON(.gz) produced by the options "bars" ingest DAG from S3 (external stage)
+# Loads raw JSON(.gz) produced by the options ingest DAG from S3 (external stage)
 # into a typed landing table. Supports flat and pointer manifests.
 # Adds lineage columns for dbt incremental models.
-# Default manifest pointer: raw/manifests/polygon_options_manifest_latest.txt
 # =============================================================================
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import pendulum
 from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-from airflow.exceptions import AirflowSkipException, AirflowFailException
+from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
 
 from dags.utils.polygon_datasets import (
@@ -29,7 +29,7 @@ from dags.utils.polygon_datasets import (
 # ────────────────────────────────────────────────────────────────────────────────
 MANIFEST_KEY = os.getenv(
     "OPTIONS_MANIFEST_KEY",
-    "raw/manifests/polygon_options_manifest_latest.txt"  # bars latest pointer (created by ingest DAG)
+    "raw/manifests/polygon_options_manifest_latest.txt"  # compatible with your current ingest DAG
 )
 BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
@@ -46,9 +46,9 @@ COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOU
 @dag(
     dag_id="polygon_options_load",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule=[S3_OPTIONS_MANIFEST_DATASET],   # fires when bars manifest updates
+    schedule=[S3_OPTIONS_MANIFEST_DATASET],   # fires when options manifest updates
     catchup=False,
-    tags=["load", "polygon", "snowflake", "options", "bars"],
+    tags=["load", "polygon", "snowflake", "options"],
     dagrun_timeout=timedelta(hours=2),
     max_active_runs=1,
 )
@@ -63,7 +63,7 @@ def polygon_options_load_dag():
     SF_DB = x.get("database")
     SF_SCHEMA = x.get("schema")
     if not SF_DB or not SF_SCHEMA:
-        raise AirflowFailException(
+        raise ValueError(
             "Snowflake connection extras must include 'database' and 'schema'. "
             "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
         )
@@ -76,7 +76,7 @@ def polygon_options_load_dag():
     FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"               # for DESC/SHOW
 
     if not BUCKET_NAME:
-        raise AirflowFailException("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
+        raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
     # ────────────────────────────────────────────────────────────────────────────
     # Tasks
@@ -102,7 +102,7 @@ def polygon_options_load_dag():
             -- Lineage & audit (for dbt incremental)
             source_file TEXT,
             source_row_number BIGINT,
-            inserted_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            inserted_at TIMESTAMP_NTZ DEFAULT (CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
         );
         """
         hook.run(sql)
@@ -114,7 +114,7 @@ def polygon_options_load_dag():
         try:
             hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
         except Exception as e:
-            raise AirflowFailException(
+            raise RuntimeError(
                 f"Stage {FQ_STAGE_NO_AT} not found or not accessible. "
                 f"Verify existence and privileges. Original error: {e}"
             )
@@ -144,7 +144,7 @@ def polygon_options_load_dag():
         if first.startswith("POINTER="):
             pointed_key = first.split("=", 1)[1].strip()
             if not pointed_key:
-                raise AirflowFailException(f"Pointer manifest has empty target in {MANIFEST_KEY}")
+                raise ValueError(f"Pointer manifest has empty target in {MANIFEST_KEY}")
             lines = _read_lines(pointed_key)
             if not lines:
                 raise AirflowSkipException(f"Pointer target is empty: {pointed_key}")
@@ -209,7 +209,8 @@ def polygon_options_load_dag():
         """
         Compose COPY or VALIDATION SQL. We:
           - project JSON fields into typed columns
-          - include lineage via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
+          - include lineage columns via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
+          - allow both .json and .json.gz (COMPRESSION inferred from extension)
           - rely on load history for idempotency (FORCE={FORCE})
         """
         validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
@@ -293,4 +294,6 @@ def polygon_options_load_dag():
 
     tbl >> stage_ok >> remaining >> batches >> validated_counts >> loaded_counts >> total
 
+
+# Instantiate the DAG
 polygon_options_load_dag()
