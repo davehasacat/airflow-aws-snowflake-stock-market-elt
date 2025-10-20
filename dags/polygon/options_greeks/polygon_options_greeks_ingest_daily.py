@@ -32,7 +32,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
 
 from dags.utils.polygon_datasets import (
-    S3_OPTIONS_GREEKS_MANIFEST_DATASET,  # ← emitted when latest pointer updates
+    S3_OPTIONS_GREEKS_MANIFEST_DATASET,  # emitted when latest pointer updates
 )
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ def _json_gz_bytes(obj: Any) -> bytes:
     description="Polygon options Greeks daily ingest: chain snapshots → S3 + per-day manifest & latest pointer.",
     start_date=pendulum.datetime(2025, 10, 1, tz="UTC"),
     schedule_interval="0 0 * * 1-5",  # Mon–Fri midnight UTC
-    catchup=True,
+    catchup=False,
     default_args=default_args,
     dagrun_timeout=pendulum.duration(hours=6),
     tags=["ingestion", "polygon", "options", "daily", "aws", "greeks"],
@@ -219,6 +219,7 @@ def polygon_options_greeks_ingest_daily_dag():
 
         @task
         def write_chain_snapshot_to_s3(payloads: List[Optional[Dict[str, Any]]], target_date: str) -> List[str]:
+            """Write payloads to S3 with idempotency guard (REPLACE_FILES=false => skip existing)."""
             s3 = S3Hook()
             keys: List[str] = []
             if not payloads:
@@ -230,6 +231,11 @@ def polygon_options_greeks_ingest_daily_dag():
                     continue
                 u = p["_meta"]["underlying"]
                 key = f"raw/options_greeks/year={yyyy}/month={mm}/day={dd}/underlying={u}/chain.json.gz"
+
+                # Idempotency guard to mirror bars ingest behavior
+                if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                    continue
+
                 s3.load_bytes(_json_gz_bytes(p), key=key, bucket_name=BUCKET_NAME, replace=True)
                 keys.append(key)
             return keys
