@@ -1,7 +1,4 @@
-# dags/utils/utils_secrets_probe.py
-# =====================================================================
-# Utils: Secrets Probe DAG (+ dbt check)
-# ---------------------------------------------------------------------
+# dags/utils/utils_smoke_detector.py
 
 from __future__ import annotations
 
@@ -14,7 +11,7 @@ from airflow.decorators import dag, task
 from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 from airflow.configuration import conf
-from airflow.operators.bash import BashOperator  # 👈 added
+from airflow.operators.bash import BashOperator
 
 import boto3
 from botocore.config import Config
@@ -31,17 +28,13 @@ AWS_CONFIG = Config(
     retries={"max_attempts": 3, "mode": "standard"},
 )
 
-REQUIRED_VARIABLES: List[str] = [
-    "s3_data_bucket",
-]
-
+REQUIRED_VARIABLES: List[str] = ["s3_data_bucket"]
 REQUIRED_CONNECTIONS: List[str] = [
     "aws_default",
     "snowflake_default",
     "polygon_stocks_api_key",
     "polygon_options_api_key",
 ]
-
 OPTIONAL_DIRECT_SECRET_ENV = "TEST_SECRET_NAME"
 
 
@@ -61,27 +54,22 @@ def _requests_session() -> requests.Session:
 
 
 @dag(
-    dag_id="utils_secrets_probe",
+    dag_id="utils_smoke_detector",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     schedule=None,
     catchup=False,
+    is_paused_upon_creation=False,
     max_active_runs=1,
-    tags=["utils", "smoke", "infra", "secrets"],
-    default_args={"retries": 0},
-    doc_md="""
-    # Utils: Secrets Probe
-    Verifies Airflow ↔ AWS Secrets Manager and Polygon:
-    - Backend configured and active
-    - Variable resolvable (s3_data_bucket as raw string)
-    - Guardrail: throws if Polygon API keys exist as Variables
-    - Required Connections resolvable (aws_default, snowflake_default, polygon_*_api_key)
-    - **dbt debug** connectivity to Snowflake (profile rendered from AWS SM)
-    - Polygon Stocks API tiny fetch (AAPL)
-    - Optional direct GetSecretValue check
-    - Basic AWS identity + S3 read probe
+    tags=["utils", "infra", "healthcheck", "smoke", "secrets", "dbt"],
+    default_args={"retries": 0, "depends_on_past": False},  # <-- moved here
+    doc_md="""\
+    # Utils: Smoke Detector
+
+    End-to-end sanity check of the ELT stack (Secrets backend, Connections/Variables,
+    dbt → Snowflake, external API, and S3 access).
     """,
 )
-def utils_secrets_probe():
+def utils_smoke_detector():
 
     @task
     def show_env_and_backend():
@@ -138,8 +126,7 @@ def utils_secrets_probe():
         if misplaced:
             raise RuntimeError(
                 "[GUARDRAIL] ❌ API keys must be stored as Airflow Connections, not Variables.\n"
-                "• Variables are raw strings (good for 's3_data_bucket').\n"
-                "• Connections map to Airflow's Connection model and can hold secrets safely.\n\n"
+                "Variables are raw strings; Connections map to Airflow's Connection model and can hold secrets safely.\n"
                 f"Found Variables that should be Connections: {misplaced}\n"
                 "Fix in AWS Secrets Manager under airflow/connections/*."
             )
@@ -166,7 +153,6 @@ def utils_secrets_probe():
         if missing:
             raise RuntimeError(f"[AF] ❌ Missing Airflow Connections (via secrets backend): {missing}")
 
-    # --- NEW: dbt connectivity check (uses env-injected DBT_* paths) ---
     dbt_debug = BashOperator(
         task_id="dbt_debug",
         bash_command=(
@@ -176,7 +162,7 @@ def utils_secrets_probe():
             'echo "[DBT] 🔎 profiles=$PROFILES project=$PROJECT"; '
             'dbt debug --profiles-dir "$PROFILES" --project-dir "$PROJECT" -t dev'
         ),
-        env={  # pass through current values (optional; they’re already in the container env)
+        env={
             "DBT_PROFILES_DIR": os.getenv("DBT_PROFILES_DIR", "/usr/local/airflow/dbt"),
             "DBT_PROJECT_DIR": os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt"),
         },
@@ -301,15 +287,15 @@ def utils_secrets_probe():
         except (BotoCoreError, ClientError) as e:
             raise RuntimeError(f"[S3] ❌ Probe failed for bucket '{bucket}': {e}") from e
 
-    # ── Flow ──────────────────────────────────────────────────────────
+    # ── Flow
     env = show_env_and_backend()
     airflow_variables_probe()
     guardrail_no_api_keys_in_variables()
     airflow_connections_probe()
-    dbt_debug  # 👈 ensure dbt can load profile & connect to Snowflake
+    dbt_debug
     polygon_stocks_smoke_probe()
     optional_direct_boto3_secret_check(env)
     aws_identity_and_s3_probe(env)
 
 
-utils_secrets_probe()
+utils_smoke_detector()
