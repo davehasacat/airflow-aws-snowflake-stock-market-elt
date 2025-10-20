@@ -1,28 +1,5 @@
 services:
-  # One-shot init that renders dbt profiles.yml from AWS SM, then exits
-  dbt-init:
-    image: ${PROJECT_IMAGE}                # reuse the same image Astro uses
-    env_file:
-      - .env
-    entrypoint: [ "bash", "-lc", "dbt_bootstrap.sh" ]
-    restart: "no"
-    volumes:
-      - ./dbt:/usr/local/airflow/dbt
-      - ${USERPROFILE}/.aws:/home/astro/.aws:ro
-      - ./keys:/usr/local/airflow/keys:ro
-    environment:
-      - DBT_PROFILES_DIR=${DBT_PROFILES_DIR}
-      - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
-      - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
-      - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
-      - DBT_BOOTSTRAP_VALIDATE=${DBT_BOOTSTRAP_VALIDATE}
-    networks:
-      - stocks-elt_default
-
   scheduler:
-    depends_on:
-      dbt-init:
-        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
@@ -40,15 +17,15 @@ services:
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
       - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
+      - DBT_BOOTSTRAP_VALIDATE=${DBT_BOOTSTRAP_VALIDATE}
+      - DBT_BOOTSTRAP_ENABLED=${DBT_BOOTSTRAP_ENABLED}
+      - DBT_BOOTSTRAP_STRICT=${DBT_BOOTSTRAP_STRICT}
     networks:
       - default
       - stocks-elt_default
     restart: unless-stopped
 
   webserver:
-    depends_on:
-      dbt-init:
-        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
@@ -66,15 +43,15 @@ services:
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
       - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
+      - DBT_BOOTSTRAP_VALIDATE=${DBT_BOOTSTRAP_VALIDATE}
+      - DBT_BOOTSTRAP_ENABLED=${DBT_BOOTSTRAP_ENABLED}
+      - DBT_BOOTSTRAP_STRICT=${DBT_BOOTSTRAP_STRICT}
     networks:
       - default
       - stocks-elt_default
     restart: unless-stopped
 
   triggerer:
-    depends_on:
-      dbt-init:
-        condition: service_completed_successfully
     env_file:
       - .env
     volumes:
@@ -92,6 +69,9 @@ services:
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
       - SNOWFLAKE_CONN_SECRET_NAME=${SNOWFLAKE_CONN_SECRET_NAME}
+      - DBT_BOOTSTRAP_VALIDATE=${DBT_BOOTSTRAP_VALIDATE}
+      - DBT_BOOTSTRAP_ENABLED=${DBT_BOOTSTRAP_ENABLED}
+      - DBT_BOOTSTRAP_STRICT=${DBT_BOOTSTRAP_STRICT}
     networks:
       - default
       - stocks-elt_default
