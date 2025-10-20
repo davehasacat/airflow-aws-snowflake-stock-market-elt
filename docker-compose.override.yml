@@ -1,31 +1,16 @@
-# docker-compose.override.yml
-# Option 1: Let Astro build & run all services, including the one-shot dbt-init.
-# - No Airflow command overrides.
-# - Airflow services wait on dbt-init (profiles.yml rendered from AWS SM).
-# - All config comes from .env (no secrets in this file).
-
 services:
-  # ──────────────────────────────────────────────────────────────────────────────
-  # One-shot init: render dbt profiles.yml from AWS Secrets Manager, then exit
-  # ──────────────────────────────────────────────────────────────────────────────
+  # One-shot init that renders dbt profiles.yml from AWS SM, then exits
   dbt-init:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${PROJECT_IMAGE}                # reuse the same image Astro uses
     env_file:
       - .env
     entrypoint: [ "bash", "-lc", "dbt_bootstrap.sh" ]
     restart: "no"
     volumes:
-      # dbt project (so profiles.yml is written into this mounted path)
       - ./dbt:/usr/local/airflow/dbt
-      # AWS creds for Secrets Manager
       - ${USERPROFILE}/.aws:/home/astro/.aws:ro
-      # - ${HOME}/.aws:/home/astro/.aws:ro         # (macOS/Linux alt)
-      # Snowflake private key(s)
       - ./keys:/usr/local/airflow/keys:ro
     environment:
-      # dbt bootstrap settings (all defined in .env)
       - DBT_PROFILES_DIR=${DBT_PROFILES_DIR}
       - DBT_PROJECT_DIR=${DBT_PROJECT_DIR}
       - DBT_PROFILE_NAME=${DBT_PROFILE_NAME}
@@ -34,9 +19,6 @@ services:
     networks:
       - stocks-elt_default
 
-  # ──────────────────────────────────────────────────────────────────────────────
-  # Airflow core services — use Astro’s defaults; just add env/volumes + depends_on
-  # ──────────────────────────────────────────────────────────────────────────────
   scheduler:
     depends_on:
       dbt-init:
@@ -115,9 +97,6 @@ services:
       - stocks-elt_default
     restart: unless-stopped
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Shared network used by your dashboard & Airflow (kept separate from Astro’s)
-# ────────────────────────────────────────────────────────────────────────────────
 networks:
   stocks-elt_default:
     name: stocks-elt_default
