@@ -4,10 +4,10 @@
 # -----------------------------------------------------------------------------
 # Updates applied:
 #  1) S3 layout: raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
-#  2) Per-day manifests at raw/manifests/options/YYYY-MM-DD.txt + "latest" pointer
+#  2) Per-day manifests at raw/manifests/options/YYYY-MM-DD.txt + "latest" pointer (content)
 #  4) Filter contracts to those alive on target day (list_date ≤ day ≤ expiration_date)
-#  5) XCom-size safety: workers return only small per-day counts; manifests are
-#     built by listing S3 (no giant key lists through XCom)
+#  5) XCom-size safety: workers return small per-day counts; manifests built via S3 listing
+#  6) Bulletproof pagination auth: session uses Authorization: Bearer <key> + apiKey param; 401 guard
 # =============================================================================
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ DISABLE_CONTRACT_DATE_FILTER = os.getenv("POLYGON_DISABLE_CONTRACT_DATE_FILTER",
 def _get_polygon_options_key() -> str:
     """
     Resolve the Polygon Options API key (connection → variable → env).
-    Connection ID: polygon_options_api_key
+    Airflow Connection ID: polygon_options_api_key
     """
     # 1) Airflow Connection
     try:
@@ -110,7 +110,11 @@ def _get_polygon_options_key() -> str:
         "Variable 'polygon_options_api_key', or env POLYGON_OPTIONS_API_KEY."
     )
 
-def _session() -> requests.Session:
+def _session(api_key: str) -> requests.Session:
+    """
+    HTTP session with pooling + retries and **Authorization: Bearer <key>**.
+    Keeping apiKey in query params too (belt & suspenders).
+    """
     s = requests.Session()
     retries = Retry(
         total=6,
@@ -119,11 +123,20 @@ def _session() -> requests.Session:
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
     )
-    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
-    s.headers.update({"User-Agent": USER_AGENT})
+    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=64, pool_maxsize=64))
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Authorization": f"Bearer {api_key}",
+    })
     return s
 
 def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max_tries: int = 6) -> requests.Response:
+    """
+    GET with client-side rate limiting:
+      - Honor 'Retry-After' for 429
+      - Exponential backoff for 5xx
+      - Respect REQUEST_TIMEOUT_SECS
+    """
     backoff = 1.5
     delay = 1.0
     tries = 0
@@ -228,29 +241,38 @@ def polygon_options_ingest_backfill_dag():
         underlying = pair["ticker"]
         target_date = pair["target_date"]
         api_key = _get_polygon_options_key()
-        sess = _session()
+        sess = _session(api_key)
 
         params = {
             "underlying_ticker": underlying,
             "expiration_date.gte": target_date,
             "as_of": target_date,
             "limit": 1000,
-            "apiKey": api_key,
+            "apiKey": api_key,  # keep in params too
         }
         all_recs: List[Dict[str, Any]] = []
 
+        # First page
         resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
+        if resp.status_code == 401:
+            # tiny guard: retry once (headers already have Bearer)
+            time.sleep(0.5)
+            resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
         resp.raise_for_status()
         data = resp.json() or {}
         all_recs.extend([r for r in (data.get("results") or []) if r and r.get("ticker")])
 
+        # Cursor pages (next_url may omit apiKey; Authorization header covers us)
         next_url = data.get("next_url")
         while next_url:
             resp = _rate_limited_get(sess, next_url, {"apiKey": api_key})
+            if resp.status_code == 401:
+                time.sleep(0.5)
+                resp = _rate_limited_get(sess, next_url, {"apiKey": api_key})
             resp.raise_for_status()
-            data = resp.json() or {}
-            all_recs.extend([r for r in (data.get("results") or []) if r and r.get("ticker")])
-            next_url = data.get("next_url")
+            p = resp.json() or {}
+            all_recs.extend([r for r in (p.get("results") or []) if r and r.get("ticker")])
+            next_url = p.get("next_url")
             time.sleep(REQUEST_DELAY_SECONDS)
 
         filtered = [r for r in all_recs if _alive_on_day(r, target_date)]
@@ -283,13 +305,13 @@ def polygon_options_ingest_backfill_dag():
     def process_chunk(specs: List[Dict[str, Any]]) -> Dict[str, int]:
         """
         Process a chunk of batch-specs and return a tiny map of {day_iso: wrote_count}.
-        Files are written directly to S3; we DO NOT return key lists via XCom.
+        Files are written directly to S3; no large XComs.
         """
         if not specs:
             return {}
 
         api_key = _get_polygon_options_key()
-        sess = _session()
+        sess = _session(api_key)
         s3 = S3Hook()
 
         counts_by_day: Dict[str, int] = {}
@@ -307,8 +329,11 @@ def polygon_options_ingest_backfill_dag():
                     continue
 
                 url = f"{POLYGON_AGGS_URL_BASE}/{contract}/range/1/day/{target_date}/{target_date}"
-                params = {"adjusted": "true", "apiKey": api_key}
+                params = {"adjusted": "true", "apiKey": api_key}  # still include apiKey
                 resp = _rate_limited_get(sess, url, params)
+                if resp.status_code == 401:
+                    time.sleep(0.5)
+                    resp = _rate_limited_get(sess, url, params)
                 if resp.status_code == 404:
                     continue
                 resp.raise_for_status()
@@ -333,10 +358,6 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def merge_day_counts(list_of_maps: List[Dict[str, int]]) -> Dict[str, int]:
-        """
-        Merge small {day_iso: count} maps into one.
-        This keeps XCom tiny regardless of run size.
-        """
         out: Dict[str, int] = {}
         for m in (list_of_maps or []):
             for k, v in (m or {}).items():
@@ -346,8 +367,8 @@ def polygon_options_ingest_backfill_dag():
     @task
     def write_day_manifests_from_s3(trading_days: List[str], counts_by_day: Dict[str, int]) -> List[str]:
         """
-        Build per-day manifests by LISTING S3 prefixes, not by XCom key lists.
-        Only write a manifest if the day has files (based on listing or counts).
+        Build per-day manifests by LISTING S3 prefixes (no big XComs).
+        Only write a manifest if the day has files.
         """
         s3 = S3Hook()
         manifest_keys: List[str] = []
@@ -355,12 +376,7 @@ def polygon_options_ingest_backfill_dag():
         for iso in sorted(trading_days):
             y, m, d = iso.split("-")
             prefix = f"raw/options/year={y}/month={m}/day={d}/"
-            # Fast path: if we saw zero writes for this day, skip listing unless replace is enabled
-            # (If REPLACE_FILES, listing still matters for rewrites; we’ll list anyway.)
-            if not REPLACE_FILES and counts_by_day.get(iso, 0) == 0:
-                # still list once—there might have been preexisting files from earlier runs
-                pass
-
+            # Still list even if counts_by_day shows 0; previous runs may have files.
             keys = s3.list_keys(bucket_name=BUCKET_NAME, prefix=prefix) or []
             keys = [k for k in keys if k and k.startswith(prefix)]
             if not keys:
@@ -401,7 +417,7 @@ def polygon_options_ingest_backfill_dag():
     day_counts_list    = process_chunk.expand(specs=chunked_specs)
     counts_by_day      = merge_day_counts(day_counts_list)
 
-    # Build per-day manifests by listing S3 (no big XComs)
+    # Build per-day manifests by listing S3
     day_manifests      = write_day_manifests_from_s3(trading_days, counts_by_day)
 
     # Update 'latest' with the content of most recent non-empty day manifest
