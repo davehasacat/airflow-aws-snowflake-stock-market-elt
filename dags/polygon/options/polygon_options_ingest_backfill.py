@@ -81,50 +81,59 @@ def _get_polygon_options_key() -> str:
     Resolve the Polygon Options API key.
 
     Precedence:
-      1) Airflow Variable 'polygon_options_api_key' (SecretsManager-backed)
-         - Accepts raw string *or* small JSON dict like {"api_key": "..."}
-      2) ENV POLYGON_OPTIONS_API_KEY (for local dev)
+      1) Airflow Connection 'polygon_options_api_key'
+         - use connection.password, or extra['api_key']
+      2) Airflow Variable 'polygon_options_api_key' (string or tiny JSON)
+      3) ENV POLYGON_OPTIONS_API_KEY
     """
+    # 1) Airflow Connection
     try:
-        v = Variable.get("polygon_options_api_key", deserialize_json=True)
-        if isinstance(v, dict):
-            for k in ("polygon_options_api_key", "api_key", "key", "value"):
-                s = v.get(k)
-                if isinstance(s, str) and s.strip():
-                    return s.strip()
-            if len(v) == 1:
-                s = next(iter(v.values()))
-                if isinstance(s, str) and s.strip():
-                    return s.strip()
+        from airflow.hooks.base import BaseHook
+        conn = BaseHook.get_connection("polygon_options_api_key")
+        if conn:
+            if conn.password and conn.password.strip():
+                return conn.password.strip()
+            extra = (conn.extra_dejson or {})
+            v = extra.get("api_key")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
     except Exception:
         pass
+
+    # 2) Airflow Variable (string or tiny JSON)
     try:
-        s = Variable.get("polygon_options_api_key")
-        if s:
-            s = s.strip()
-            if s.startswith("{"):
+        from airflow.models import Variable
+        raw = Variable.get("polygon_options_api_key")
+        if raw:
+            raw = raw.strip()
+            if raw.startswith("{"):
+                import json as _json
                 try:
-                    obj = json.loads(s)
+                    obj = _json.loads(raw)
                     if isinstance(obj, dict):
                         for k in ("polygon_options_api_key", "api_key", "key", "value"):
-                            v2 = obj.get(k)
-                            if isinstance(v2, str) and v2.strip():
-                                return v2.strip()
+                            val = obj.get(k)
+                            if isinstance(val, str) and val.strip():
+                                return val.strip()
                         if len(obj) == 1:
-                            v2 = next(iter(obj.values()))
-                            if isinstance(v2, str) and v2.strip():
-                                return v2.strip()
+                            only = next(iter(obj.values()))
+                            if isinstance(only, str) and only.strip():
+                                return only.strip()
                 except Exception:
                     pass
-            return s
+            return raw
     except Exception:
         pass
+
+    # 3) Environment variable
     env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
     if env:
         return env
+
     raise RuntimeError(
-        "Polygon Options API key not found. Create secret 'airflow/variables/polygon_options_api_key' "
-        "or set env POLYGON_OPTIONS_API_KEY."
+        "Polygon Options API key not found. Provide it via Airflow connection "
+        "'polygon_options_api_key', Airflow Variable 'polygon_options_api_key', "
+        "or env POLYGON_OPTIONS_API_KEY."
     )
 
 def _session() -> requests.Session:
