@@ -5,28 +5,22 @@
 # Goal:
 #   Efficiently backfill daily options OHLCV (per-contract) from Polygon.io to S3.
 #
-# Update 1 applied:
-#   - S3 partitioning switched to date/underlying-first:
-#     raw/options/year=YYYY/month=MM/day=DD/underlying=<UNDERLYING>/contract=<CONTRACT>.json.gz
+# Updates applied so far:
+#   1) S3 partitioning switched to date/underlying-first:
+#      raw/options/year=YYYY/month=MM/day=DD/underlying=<UNDERLYING>/contract=<CONTRACT>.json.gz
+#   2) Write per-day manifests at raw/manifests/options/YYYY-MM-DD.txt,
+#      then overwrite raw/manifests/polygon_options_manifest_latest.txt
+#      with the contents of the most recent non-empty day.
 #
-# Key ideas (unchanged):
-#   1) Build flat (underlying, trade_date) pairs → map over pairs (no nested maps)
-#   2) Discover option contracts valid on that date (pagination + retries)
-#   3) Batch contracts to control API pressure
-#   4) CHUNK batches to avoid Airflow max map length (tunable via env)
-#   5) Process chunk internally: fetch day agg for each contract → gzip JSON → S3
-#   6) Write a single S3 manifest enumerating all written object keys (Dataset outlet)
-#
-# Why this shape?
-#   - Keeps mapping fan-out predictable (pairs + chunks)
-#   - Uses strong HTTP retry strategy + light client-side rate limiting
-#   - Avoids parsing/transforming raw payloads here (raw-in/raw-out)
-#   - Produces a deterministic manifest to trigger downstream DAGs via Dataset
+# Key ideas:
+#   - Flat (underlying, date) pairs → discover contracts → batch → chunk
+#   - Process chunk internally: fetch day agg per contract → gzip JSON → S3
+#   - Per-day manifests and a tiny “latest” pointer file for the loader
 #
 # Safety:
-#   - Secrets come from Airflow Variables backed by AWS Secrets Manager
-#   - Retries on transient HTTP (429/5xx) and task-level retries where appropriate
-#   - Skips weekends automatically when computing trading dates
+#   - Secrets via Airflow Connection/Variable or env
+#   - Retries for HTTP + task-level retries
+#   - Skips weekends when computing trading dates
 # =============================================================================
 
 from __future__ import annotations
@@ -49,7 +43,6 @@ from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.models import Variable  # Secrets Manager-backed Variables
 
 from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
@@ -81,12 +74,11 @@ def _get_polygon_options_key() -> str:
     Resolve the Polygon Options API key.
 
     Precedence:
-      1) Airflow Connection 'polygon_options_api_key'
-         - use connection.password, or extra['api_key']
-      2) Airflow Variable 'polygon_options_api_key' (string or tiny JSON)
+      1) Airflow Connection 'polygon_options_api_key' (password or extra.api_key)
+      2) Airflow Variable  'polygon_options_api_key' (string or tiny JSON)
       3) ENV POLYGON_OPTIONS_API_KEY
     """
-    # 1) Airflow Connection
+    # 1) Connection
     try:
         from airflow.hooks.base import BaseHook
         conn = BaseHook.get_connection("polygon_options_api_key")
@@ -100,7 +92,7 @@ def _get_polygon_options_key() -> str:
     except Exception:
         pass
 
-    # 2) Airflow Variable (string or tiny JSON)
+    # 2) Variable (string or tiny JSON)
     try:
         from airflow.models import Variable
         raw = Variable.get("polygon_options_api_key")
@@ -112,9 +104,9 @@ def _get_polygon_options_key() -> str:
                     obj = _json.loads(raw)
                     if isinstance(obj, dict):
                         for k in ("polygon_options_api_key", "api_key", "key", "value"):
-                            val = obj.get(k)
-                            if isinstance(val, str) and val.strip():
-                                return val.strip()
+                            vv = obj.get(k)
+                            if isinstance(vv, str) and vv.strip():
+                                return vv.strip()
                         if len(obj) == 1:
                             only = next(iter(obj.values()))
                             if isinstance(only, str) and only.strip():
@@ -125,15 +117,14 @@ def _get_polygon_options_key() -> str:
     except Exception:
         pass
 
-    # 3) Environment variable
+    # 3) ENV
     env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
     if env:
         return env
 
     raise RuntimeError(
-        "Polygon Options API key not found. Provide it via Airflow connection "
-        "'polygon_options_api_key', Airflow Variable 'polygon_options_api_key', "
-        "or env POLYGON_OPTIONS_API_KEY."
+        "Polygon Options API key not found. Provide via Airflow connection "
+        "'polygon_options_api_key', Variable 'polygon_options_api_key', or env POLYGON_OPTIONS_API_KEY."
     )
 
 def _session() -> requests.Session:
@@ -210,7 +201,7 @@ def polygon_options_ingest_backfill_dag():
       - Flat pairs (ticker x date) → discover contracts per pair
       - Batch + CHUNK to stay below max map length
       - Process each chunk task internally (looping): write raw JSON.gz to S3
-      - Emit a single manifest file (Dataset outlet) for downstream triggers
+      - Emit per-day manifests and update the “latest” file for the loader
     """
 
     @task
@@ -271,10 +262,6 @@ def polygon_options_ingest_backfill_dag():
             'target_date': <YYYY-MM-DD>,
             'contracts': [<CONTRACT>, ...]
           }
-
-        Notes:
-          - Paginates via next_url
-          - De-dupes + sorts tickers for stable downstream batches
         """
         ticker = pair["ticker"]
         target_date = pair["target_date"]
@@ -321,8 +308,6 @@ def polygon_options_ingest_backfill_dag():
         """
         Convert discovery into homogeneous batch-specs:
           [{'underlying': U, 'target_date': D, 'contract_batch': [c1, c2, ...]}, ...]
-
-        Keeps downstream logic generic (each spec is processable on its own).
         """
         underlying = discovery["underlying"]
         target_date = discovery["target_date"]
@@ -361,9 +346,6 @@ def polygon_options_ingest_backfill_dag():
 
         Returns:
           - The list of S3 keys written for this chunk (for manifest assembly)
-
-        Idempotency:
-          - If BACKFILL_REPLACE=false, will skip existing keys (safe re-runs).
         """
         if not specs:
             return []
@@ -389,7 +371,7 @@ def polygon_options_ingest_backfill_dag():
                     continue
 
                 url = f"{POLYGON_AGGS_URL_BASE}/{contract}/range/1/day/{target_date}/{target_date}"
-                params = {"adjusted": "true", "apiKey": api_key}
+                params = {"adjusted": "true", "apiKey": _get_polygon_options_key()}
                 resp = _rate_limited_get(sess, url, params)
                 if resp.status_code == 404:
                     # Contract/date not found — benign for illiquid symbols
@@ -418,18 +400,58 @@ def polygon_options_ingest_backfill_dag():
         """Flatten list[list[str]] → list[str] and drop empties."""
         return [k for sub in (list_of_lists or []) for k in (sub or []) if k]
 
-    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def write_manifest(all_keys: List[str]) -> None:
+    # ──────────────── Update 2: per-day manifests + latest pointer ───────────────
+    @task
+    def write_day_manifests(all_keys: List[str]) -> List[str]:
         """
-        Emit a single manifest enumerating all written keys.
-        Downstream DAGs can use this Dataset to trigger dbt/loads.
+        Group written keys by YYYY-MM-DD (parsed from the key path) and
+        write per-day manifests at raw/manifests/options/YYYY-MM-DD.txt.
+        Returns the list of manifest keys that were actually written (non-empty days).
         """
         if not all_keys:
-            raise AirflowSkipException("No files written; skipping manifest.")
+            return []
+
+        # Group keys by date
+        by_day: dict[str, list[str]] = {}
+        for k in all_keys:
+            # Expecting: raw/options/year=YYYY/month=MM/day=DD/...
+            parts = (k or "").split("/")
+            if len(parts) < 6 or parts[0] != "raw" or parts[1] != "options":
+                continue
+            y = parts[3].split("=")[-1]
+            m = parts[4].split("=")[-1]
+            d = parts[5].split("=")[-1]
+            iso = f"{y}-{m}-{d}"
+            by_day.setdefault(iso, []).append(k)
+
         s3 = S3Hook()
-        manifest_key = "raw/manifests/polygon_options_manifest_latest.txt"
-        s3.load_string("\n".join(all_keys), key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
-        print(f"✅ Manifest updated with {len(all_keys)} keys at s3://{BUCKET_NAME}/{manifest_key}")
+        manifest_keys: List[str] = []
+        for iso, keys in sorted(by_day.items()):
+            if not keys:
+                continue
+            mkey = f"raw/manifests/options/{iso}.txt"
+            s3.load_string("\n".join(sorted(set(keys))) + "\n",
+                           key=mkey, bucket_name=BUCKET_NAME, replace=True)
+            manifest_keys.append(mkey)
+        return manifest_keys
+
+    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
+    def update_latest_pointer(manifest_keys: List[str]) -> None:
+        """
+        Overwrite the 'latest' manifest file with the **content** of the
+        most recent non-empty day manifest so the loader keeps working unchanged.
+        """
+        if not manifest_keys:
+            raise AirflowSkipException("No non-empty per-day manifests; skipping latest pointer update.")
+
+        latest_mkey = sorted(manifest_keys)[-1]  # lexicographic works for ISO dates
+        s3 = S3Hook()
+        # Read the latest day manifest we just wrote, then copy its content into 'latest'
+        content = s3.read_key(key=latest_mkey, bucket_name=BUCKET_NAME) or ""
+        if not content.strip():
+            raise AirflowSkipException(f"Latest day manifest {latest_mkey} is empty.")
+        latest_ptr = "raw/manifests/polygon_options_manifest_latest.txt"
+        s3.load_string(content, key=latest_ptr, bucket_name=BUCKET_NAME, replace=True)
 
     # ───────────────────────────────
     # Wiring / Dataflow
@@ -444,7 +466,9 @@ def polygon_options_ingest_backfill_dag():
     chunked_specs = chunk_batch_specs(batch_specs_flat)                            # list[list[dict]] chunks
     written_lists = process_chunk.expand(specs=chunked_specs)                      # mapped per chunk
     all_keys = flatten_str_lists(written_lists)
-    write_manifest(all_keys)
+
+    day_manifests = write_day_manifests(all_keys)
+    update_latest_pointer(day_manifests)
 
 # Instantiate DAG
 polygon_options_ingest_backfill_dag()
