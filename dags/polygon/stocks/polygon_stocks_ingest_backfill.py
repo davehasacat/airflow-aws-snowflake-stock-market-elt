@@ -1,4 +1,3 @@
-# dags/polygon/stocks/polygon_stocks_ingest_backfill.py
 # =============================================================================
 # Polygon Stocks → S3 (Backfill)
 # -----------------------------------------------------------------------------
@@ -14,7 +13,8 @@
 # Notes:
 #   - Uses pooled HTTP session + retry/backoff + gentle rate limiting.
 #   - Skips weekends automatically; 404s (market holidays) are treated as empty.
-#   - API key resolved from Airflow Variable (AWS Secrets-backed) with env fallback.
+#   - API key resolved from Airflow Connection 'polygon_stocks_api_key'
+#     (password or extra), with env/Variable fallbacks.
 # =============================================================================
 
 from __future__ import annotations
@@ -34,7 +34,8 @@ from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.models import Variable  # read from Secrets Manager via Variables
+from airflow.models import Variable  # fallback only
+from airflow.hooks.base import BaseHook  # NEW: read API key from Connection
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
@@ -63,35 +64,42 @@ REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "true").lower() == "true"
 def _get_polygon_stocks_key() -> str:
     """
     Resolve Polygon Stocks API key from:
-      1) Airflow Variable 'polygon_stocks_api_key' (can be plain string OR JSON).
-      2) Env POLYGON_STOCKS_API_KEY (fallback).
-    This is robust to console/SecretsManager storing a JSON object by accident.
+      1) Airflow Connection 'polygon_stocks_api_key'
+         - prefer Connection.password
+         - else check Connection.extra for common fields: api_key/key/token/polygon_stocks_api_key/value
+      2) Env POLYGON_STOCKS_API_KEY
+      3) (Fallback for legacy setups) Airflow Variable 'polygon_stocks_api_key'
     """
-    # 1) Try JSON variable
+    # 1) Airflow Connection
     try:
-        v = Variable.get("polygon_stocks_api_key", deserialize_json=True)
-        if isinstance(v, dict):
-            for k in ("polygon_stocks_api_key", "api_key", "key", "value"):
-                s = v.get(k)
-                if isinstance(s, str) and s.strip():
-                    return s.strip()
-            if len(v) == 1:
-                s = next(iter(v.values()))
-                if isinstance(s, str) and s.strip():
-                    return s.strip()
+        conn = BaseHook.get_connection("polygon_stocks_api_key")
+        # password field (most common)
+        if conn.password and conn.password.strip():
+            return conn.password.strip()
+        # look in extras as secondary
+        extra = (conn.extra_dejson or {}) if hasattr(conn, "extra_dejson") else {}
+        for k in ("api_key", "key", "token", "polygon_stocks_api_key", "value"):
+            v = extra.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
     except Exception:
         pass
 
-    # 2) Try plain-text variable (which might itself be a JSON string)
+    # 2) Env fallback
+    env = os.getenv("POLYGON_STOCKS_API_KEY", "").strip()
+    if env:
+        return env
+
+    # 3) Legacy Variable fallback
     try:
-        s = Variable.get("polygon_stocks_api_key")
-        if s:
-            s = s.strip()
-            if s.startswith("{"):
+        raw = Variable.get("polygon_stocks_api_key")
+        if raw:
+            raw = raw.strip()
+            if raw.startswith("{"):
                 try:
-                    obj = json.loads(s)
+                    obj = json.loads(raw)
                     if isinstance(obj, dict):
-                        for k in ("polygon_stocks_api_key", "api_key", "key", "value"):
+                        for k in ("api_key", "key", "token", "polygon_stocks_api_key", "value"):
                             v = obj.get(k)
                             if isinstance(v, str) and v.strip():
                                 return v.strip()
@@ -100,21 +108,14 @@ def _get_polygon_stocks_key() -> str:
                             if isinstance(v, str) and v.strip():
                                 return v.strip()
                 except Exception:
-                    # fall through to return s as-is
                     pass
-            return s
+            return raw
     except Exception:
         pass
 
-    # 3) Env fallback
-    env = os.getenv("POLYGON_STOCKS_API_KEY", "").strip()
-    if env:
-        return env
-
     raise RuntimeError(
-        "Missing Polygon API key. In AWS Secrets Manager set secret "
-        "'airflow/variables/polygon_stocks_api_key' to the raw key string, "
-        "or set POLYGON_STOCKS_API_KEY in the environment."
+        "Missing Polygon API key. Set Airflow Connection 'polygon_stocks_api_key' "
+        "(password recommended) or define POLYGON_STOCKS_API_KEY env."
     )
 
 

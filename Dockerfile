@@ -1,103 +1,109 @@
 # =====================================================================
 # Dockerfile for Airflow (Astro Runtime) + dbt (Snowflake)
 # ---------------------------------------------------------------------
-# Purpose:
-# - Extend Astronomer’s Airflow base image
-# - Add AWS CLI (v2) and dbt for Snowflake transformations
-# - Prepare dbt packages and validate configuration at build time
+# - Extends Astronomer’s Airflow base image
+# - Installs AWS CLI v2 and dbt (Snowflake) in an isolated venv
+# - Pre-installs dbt packages and validates project at build time
+# - Wraps entrypoint to run dbt bootstrap once on container start
+#   (renders profiles.yml from AWS Secrets Manager)
 # =====================================================================
 
 FROM quay.io/astronomer/astro-runtime:13.2.0
 
-# Switch to root for installing system dependencies
+# Use root for system-level installs
 USER root
 
 # ---------------------------------------------------------------------
-# 🧰 Install AWS CLI v2 + git
+# 🧰 System deps: AWS CLI v2 + git
 # ---------------------------------------------------------------------
-# Why:
-# - AWS CLI: used by dbt and Airflow hooks (S3, Secrets Manager, etc.)
-# - git: required by dbt deps for Git-based packages (e.g., dbt_utils)
-# ---------------------------------------------------------------------
-RUN apt-get update && apt-get install -y curl unzip git && \
-    curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" && \
-    unzip /tmp/awscliv2.zip -d /tmp && \
-    /tmp/aws/install && \
-    rm -rf /var/lib/apt/lists/* /tmp/aws /tmp/awscliv2.zip
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl unzip git \
+ && curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" \
+ && unzip /tmp/awscliv2.zip -d /tmp \
+ && /tmp/aws/install \
+ && rm -rf /var/lib/apt/lists/* /tmp/aws /tmp/awscliv2.zip
 
 # ---------------------------------------------------------------------
-# 🧱 Create and install dbt in a dedicated virtual environment
-# ---------------------------------------------------------------------
-# Why:
-# - Keeps dbt isolated from Airflow dependencies (prevents version conflicts)
-# - Makes it easier to upgrade dbt without breaking Astronomer’s base runtime
+# 🧱 dbt in a dedicated virtualenv (isolated from Airflow deps)
 # ---------------------------------------------------------------------
 RUN python -m venv /usr/local/airflow/dbt_venv
-
-# Install specific dbt + adapter versions (pinned for reproducibility)
 RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir \
-    "dbt-core==1.10.4" \
-    "dbt-snowflake==1.10.0"
+      "dbt-core==1.10.4" \
+      "dbt-snowflake==1.10.0" \
+      "PyYAML>=6.0"
 
-# Add dbt virtualenv to PATH so `dbt` is callable anywhere
+# Put dbt venv on PATH and guarantee a stable binary path
 ENV PATH="/usr/local/airflow/dbt_venv/bin:${PATH}"
+RUN ln -sf /usr/local/airflow/dbt_venv/bin/dbt /usr/local/bin/dbt \
+ && /usr/local/airflow/dbt_venv/bin/dbt --version
 
 # ---------------------------------------------------------------------
-# 📁 Prepare dbt project directory
-# ---------------------------------------------------------------------
-# Why:
-# - Allows incremental Docker caching when dbt deps are reinstalled
-# - Prevents rebuilds unless dbt dependency files actually change
+# 📁 Prepare dbt project & install packages
 # ---------------------------------------------------------------------
 RUN mkdir -p /usr/local/airflow/dbt
 
-# Copy dependency files first for efficient caching
-COPY dbt/packages.yml /usr/local/airflow/dbt/packages.yml
+# Copy dependency files first for better layer caching
+COPY dbt/packages.yml    /usr/local/airflow/dbt/packages.yml
 COPY dbt/dbt_project.yml /usr/local/airflow/dbt/dbt_project.yml
 
-# ---------------------------------------------------------------------
-# 📦 Install dbt packages (dbt_utils, dbt_date, dbt_expectations, etc.)
-# ---------------------------------------------------------------------
+# Install dbt packages declared in packages.yml
 RUN dbt deps --project-dir /usr/local/airflow/dbt
 
-# ---------------------------------------------------------------------
-# 🧩 Provide a minimal profiles.yml for build-time validation
-# ---------------------------------------------------------------------
-# Why:
-# - Enables `dbt parse` to succeed during build (avoids runtime secrets)
-# - Should include a lightweight, non-sensitive Snowflake CI target
-#   (profiles.ci.yml is safe and checked into source control)
-# ---------------------------------------------------------------------
-COPY dbt/profiles.ci.yml /usr/local/airflow/dbt/profiles.yml
-
-# ---------------------------------------------------------------------
-# 🗂 Copy the remainder of the dbt project
-# ---------------------------------------------------------------------
-# This includes models, snapshots, macros, etc.
-# NOTE: Place COPY *after* dbt deps for build caching efficiency.
-# ---------------------------------------------------------------------
+# Copy the rest of the dbt project (models, macros, snapshots, etc.)
 COPY dbt /usr/local/airflow/dbt
 
 # ---------------------------------------------------------------------
-# ✅ Validate project structure at build time (non-destructive)
+# ✅ Build-time validation (non-destructive)
+#    Create a dummy profiles.yml so `dbt parse` can validate syntax.
+#    Runtime bootstrap will overwrite with real credentials.
 # ---------------------------------------------------------------------
-# Why:
-# - Ensures dbt syntax, models, and references are valid before runtime
-# - Uses `--target ci` to align with lightweight CI testing target
-# ---------------------------------------------------------------------
-RUN dbt parse \
-  --project-dir /usr/local/airflow/dbt \
-  --profiles-dir /usr/local/airflow/dbt \
-  --target ci
+RUN printf '%s\n' \
+'stock_market_elt:' \
+'  target: dev' \
+'  outputs:' \
+'    dev:' \
+'      type: snowflake' \
+'      account: DUMMY_ACCOUNT' \
+'      user: DUMMY_USER' \
+'      role: DUMMY_ROLE' \
+'      database: DUMMY_DB' \
+'      warehouse: DUMMY_WH' \
+'      schema: PUBLIC' \
+'      private_key_path: /tmp/dummy_key.p8' \
+'      private_key_passphrase: "__build_dummy__"' \
+'      client_session_keep_alive: true' \
+> /usr/local/airflow/dbt/profiles.yml
 
-# Switch back to non-root Astro runtime user
+ENV SNOWFLAKE_PASSPHRASE="__build_dummy__"
+RUN dbt parse \
+    --project-dir /usr/local/airflow/dbt \
+    --profiles-dir /usr/local/airflow/dbt
+
+# ---------------------------------------------------------------------
+# 🚀 Bootstrap scripts: render profiles.yml from AWS Secrets Manager
+#    and entrypoint wrapper to run bootstrap once before Airflow.
+#    Normalize Windows line endings to avoid bash\r errors.
+# ---------------------------------------------------------------------
+COPY docker/dbt_bootstrap.sh   /usr/local/bin/dbt_bootstrap.sh
+COPY docker/with_bootstrap.sh  /usr/local/bin/with_bootstrap.sh
+RUN sed -i 's/\r$//' /usr/local/bin/dbt_bootstrap.sh /usr/local/bin/with_bootstrap.sh \
+ && chmod +x /usr/local/bin/dbt_bootstrap.sh /usr/local/bin/with_bootstrap.sh
+
+# Run containers as the non-root Astro user
 USER astro
 
+# Replace the stock entrypoint with our wrapper; it will exec /entrypoint "$@"
+ENTRYPOINT ["/usr/local/bin/with_bootstrap.sh"]
+
 # ---------------------------------------------------------------------
-# ✅ Final Notes:
-# ---------------------------------------------------------------------
-# - Runtime Airflow + dbt DAGs will use a dynamically rendered profiles.yml
-#   from AWS Secrets Manager (Snowflake creds never baked into the image)
-# - dbt_venv is available to all Airflow tasks via DBT_EXECUTABLE_PATH
-# - To update dbt, modify both the pip install versions and dbt_project.yml
+# Notes:
+# - No secrets are baked into the image; bootstrap reads from AWS SM at runtime.
+# - Mounts expected at runtime (via compose override):
+#     ./dbt  -> /usr/local/airflow/dbt
+#     ./keys -> /usr/local/airflow/keys:ro   (private key used by Snowflake)
+#     ~/.aws -> /home/astro/.aws:ro          (for AWS Secrets Manager access)
+# - Configure via .env:
+#     DBT_PROFILE_NAME, DBT_PROFILES_DIR, DBT_PROJECT_DIR,
+#     SNOWFLAKE_CONN_SECRET_NAME, DBT_BOOTSTRAP_VALIDATE,
+#     DBT_BOOTSTRAP_ENABLED, DBT_BOOTSTRAP_STRICT
 # ---------------------------------------------------------------------

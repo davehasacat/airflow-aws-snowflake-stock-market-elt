@@ -6,14 +6,14 @@
 }}
 
 with source as (
-    select * from {{ ref('snapshot_polygon_stocks_bars') }} where dbt_valid_to is null
+    select * from {{ ref('snapshot_polygon_stocks') }} where dbt_valid_to is null
 ),
 
 renamed_and_casted as (
 select
-  ticker || '_' || trade_date as stock_bar_id,    -- use as primary key
+  ticker || '_' || polygon_trade_date as stock_bar_id,    -- use as primary key
   ticker,
-  trade_date,
+  polygon_trade_date,
   inserted_at as loaded_at,
   open as open_price,
   high as high_price,

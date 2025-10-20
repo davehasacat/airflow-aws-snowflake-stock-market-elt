@@ -1,9 +1,9 @@
-{% snapshot snapshot_polygon_stocks_bars %}
+{% snapshot snapshot_polygon_stocks %}
 
 {{
     config(
       target_schema='public',
-      unique_key="ticker || '_' || trade_date",
+      unique_key="ticker || '_' || polygon_trade_date",
       strategy='timestamp',
       updated_at='inserted_at'
     )
