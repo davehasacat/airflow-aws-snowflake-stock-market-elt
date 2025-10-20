@@ -159,9 +159,9 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
 @dag(
     dag_id="polygon_options_ingest_daily",
     description="Polygon options daily ingest (backfill-parity): raw JSON.gz to S3 + per-day & latest manifests.",
-    start_date=pendulum.datetime(2025, 10, 7, tz="UTC"),
+    start_date=pendulum.now(tz="UTC"),
     schedule="0 0 * * 1-5",
-    catchup=True,   # set to True temporarily when you want a rolling backfill from start_date
+    catchup=False,   # set to True temporarily when you want a rolling backfill from start_date
     default_args=default_args,
     dagrun_timeout=pendulum.duration(hours=12),
     tags=["ingestion", "polygon", "options", "daily", "aws"],
