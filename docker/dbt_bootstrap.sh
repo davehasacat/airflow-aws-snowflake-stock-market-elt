@@ -14,6 +14,7 @@ set -euo pipefail
 : "${DBT_PROFILES_DIR:=${DBT_DIR}}"
 : "${DBT_PROJECT_DIR:=${DBT_DIR}}"
 : "${DBT_BOOTSTRAP_VALIDATE:=1}"                    # set to 0 to skip dbt parse
+: "${DBT_BIN:=/usr/local/airflow/dbt_venv/bin/dbt}" # prefer venv path; can override
 
 # AWS CLI retry behavior (reduces transient failures)
 export AWS_RETRY_MODE=standard
@@ -33,12 +34,31 @@ require_bin() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required binary: $1"
 }
 
+# Resolve a working dbt binary without relying on PATH
+resolve_dbt_bin() {
+  local primary="${DBT_BIN:-/usr/local/airflow/dbt_venv/bin/dbt}"
+  if [ -x "$primary" ]; then
+    echo "$primary"; return 0
+  fi
+  if [ -x "/usr/local/bin/dbt" ]; then
+    echo "/usr/local/bin/dbt"; return 0
+  fi
+  # Last resort: PATH
+  if command -v dbt >/dev/null 2>&1; then
+    command -v dbt; return 0
+  fi
+  return 1
+}
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Pre-flight checks
 # ────────────────────────────────────────────────────────────────────────────────
 require_bin aws
 require_bin python
-require_bin dbt
+
+DBT_BIN_RESOLVED="$(resolve_dbt_bin)" || die "dbt executable not found at ${DBT_BIN} or /usr/local/bin/dbt, and not in PATH."
+log "Using dbt binary: ${DBT_BIN_RESOLVED}"
+"${DBT_BIN_RESOLVED}" --version >/dev/null 2>&1 || die "dbt is not executable or failed to run."
 
 mkdir -p "${DBT_DIR}"
 
@@ -182,7 +202,7 @@ if [ "${DBT_BOOTSTRAP_VALIDATE}" = "1" ]; then
   log "Validating dbt project with dbt parse…"
   DBT_PROFILES_DIR="${DBT_PROFILES_DIR}" \
   DBT_PROJECT_DIR="${DBT_PROJECT_DIR}" \
-  dbt parse --quiet \
+  "${DBT_BIN_RESOLVED}" parse --quiet \
     --project-dir "${DBT_PROJECT_DIR}" \
     --profiles-dir "${DBT_PROFILES_DIR}"
   log "Validation successful."

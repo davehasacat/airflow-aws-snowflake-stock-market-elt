@@ -36,6 +36,10 @@ RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir \
 # Make the dbt venv available on PATH
 ENV PATH="/usr/local/airflow/dbt_venv/bin:${PATH}"
 
+# Ensure dbt is resolvable even if PATH changes; verify at build time
+RUN ln -sf /usr/local/airflow/dbt_venv/bin/dbt /usr/local/bin/dbt \
+ && /usr/local/airflow/dbt_venv/bin/dbt --version
+
 # ---------------------------------------------------------------------
 # 📁 Prepare dbt project directory & install packages
 # ---------------------------------------------------------------------
@@ -92,9 +96,8 @@ USER astro
 
 # ---------------------------------------------------------------------
 # Notes:
-# - At container start, compose should run:
-#     command: ["bash","-lc","dbt_bootstrap.sh && exec /entrypoint"]
-#   so dbt profiles are rendered from AWS SM before Airflow starts.
+# - Use docker-compose.override.yml to run a one-shot dbt-init service
+#   that executes `dbt_bootstrap.sh` before Airflow starts.
 # - Private key(s) must be mounted at runtime, e.g.:
 #     ./keys -> /usr/local/airflow/keys:ro
 # - Secrets are never baked into the image; they are fetched at runtime.
