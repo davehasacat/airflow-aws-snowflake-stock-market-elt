@@ -169,12 +169,6 @@ raw → staging → intermediate → marts
 
 ---
 
-## 🧾 License
-
-MIT License © 2025
-
----
-
 ### 🧩 Notes
 
 This project emphasizes:
