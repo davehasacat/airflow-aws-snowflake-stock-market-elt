@@ -1,5 +1,6 @@
 services:
   scheduler:
+    entrypoint: ["/usr/local/bin/with_bootstrap.sh"]
     env_file:
       - .env
     volumes:
@@ -26,6 +27,7 @@ services:
     restart: unless-stopped
 
   webserver:
+    entrypoint: ["/usr/local/bin/with_bootstrap.sh"]
     env_file:
       - .env
     volumes:
@@ -52,6 +54,7 @@ services:
     restart: unless-stopped
 
   triggerer:
+    entrypoint: ["/usr/local/bin/with_bootstrap.sh"]
     env_file:
       - .env
     volumes:

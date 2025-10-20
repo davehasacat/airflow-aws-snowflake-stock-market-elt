@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${DBT_BOOTSTRAP_ENABLED:=1}"   # set to 0 to skip bootstrap entirely
-: "${DBT_BOOTSTRAP_STRICT:=1}"    # 1 = fail container on bootstrap error; 0 = warn and continue
+: "${DBT_BOOTSTRAP_ENABLED:=1}"   # 0 = skip bootstrap
+: "${DBT_BOOTSTRAP_STRICT:=1}"    # 1 = fail container on bootstrap error; 0 = warn & continue
 
 run_bootstrap() {
   echo "[entrypoint] Running dbt bootstrap..."
@@ -41,5 +41,5 @@ else
   echo "[entrypoint] DBT_BOOTSTRAP_ENABLED=0 → skipping bootstrap."
 fi
 
-# Hand off to Astronomer’s stock entrypoint
-exec /entrypoint "$@"
+# Hand off to the service's original command (Astro sets it per service)
+exec "$@"
