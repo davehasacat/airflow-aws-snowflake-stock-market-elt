@@ -82,15 +82,17 @@ RUN dbt parse \
 # ---------------------------------------------------------------------
 # 🚀 Bootstrap scripts: render profiles.yml from AWS Secrets Manager
 #    and entrypoint wrapper to run bootstrap once before Airflow.
+#    Normalize Windows line endings to avoid bash\r errors.
 # ---------------------------------------------------------------------
 COPY docker/dbt_bootstrap.sh   /usr/local/bin/dbt_bootstrap.sh
 COPY docker/with_bootstrap.sh  /usr/local/bin/with_bootstrap.sh
-RUN chmod +x /usr/local/bin/dbt_bootstrap.sh /usr/local/bin/with_bootstrap.sh
+RUN sed -i 's/\r$//' /usr/local/bin/dbt_bootstrap.sh /usr/local/bin/with_bootstrap.sh \
+ && chmod +x /usr/local/bin/dbt_bootstrap.sh /usr/local/bin/with_bootstrap.sh
 
 # Run containers as the non-root Astro user
 USER astro
 
-# Replace the stock entrypoint with our wrapper; it will exec /entrypoint
+# Replace the stock entrypoint with our wrapper; it will exec /entrypoint "$@"
 ENTRYPOINT ["/usr/local/bin/with_bootstrap.sh"]
 
 # ---------------------------------------------------------------------
