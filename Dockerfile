@@ -30,7 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /usr/local/airflow/dbt_venv
 RUN /usr/local/airflow/dbt_venv/bin/pip install --no-cache-dir \
       "dbt-core==1.10.4" \
-      "dbt-snowflake==1.10.0"
+      "dbt-snowflake==1.10.0" \
+      "PyYAML>=6.0"
 
 # Make the dbt venv available on PATH
 ENV PATH="/usr/local/airflow/dbt_venv/bin:${PATH}"
