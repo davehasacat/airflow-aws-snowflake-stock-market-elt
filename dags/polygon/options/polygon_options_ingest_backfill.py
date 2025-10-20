@@ -7,7 +7,8 @@
 #  2) Per-day manifests at raw/manifests/options/YYYY-MM-DD.txt + "latest" pointer (content)
 #  4) Filter contracts to those alive on target day (list_date ≤ day ≤ expiration_date)
 #  5) XCom-size safety: workers return small per-day counts; manifests built via S3 listing
-#  6) Bulletproof pagination auth: session uses Authorization: Bearer <key> + apiKey param; 401 guard
+#  6) Bulletproof pagination auth: Authorization: Bearer <key> + apiKey param; 401 guard
+#  7) Observability worklogs per (day, underlying) under raw/manifests/options/worklogs/...
 # =============================================================================
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import os
 import time
 import gzip
 from io import BytesIO
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import pendulum
 import requests
@@ -50,7 +51,7 @@ CONTRACTS_BATCH_SIZE  = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "300"))
 REPLACE_FILES        = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"
 MAP_CHUNK_SIZE       = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))
 
-# Allow toggling the date-alive filter if needed
+# Toggle the date-alive filter if needed
 DISABLE_CONTRACT_DATE_FILTER = os.getenv("POLYGON_DISABLE_CONTRACT_DATE_FILTER", "false").lower() in ("1","true","yes")
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -112,8 +113,8 @@ def _get_polygon_options_key() -> str:
 
 def _session(api_key: str) -> requests.Session:
     """
-    HTTP session with pooling + retries and **Authorization: Bearer <key>**.
-    Keeping apiKey in query params too (belt & suspenders).
+    HTTP session with pooling + retries and Authorization: Bearer <key>.
+    Keep apiKey in params too (belt & suspenders).
     """
     s = requests.Session()
     retries = Retry(
@@ -255,14 +256,13 @@ def polygon_options_ingest_backfill_dag():
         # First page
         resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
         if resp.status_code == 401:
-            # tiny guard: retry once (headers already have Bearer)
             time.sleep(0.5)
             resp = _rate_limited_get(sess, POLYGON_CONTRACTS_URL, params)
         resp.raise_for_status()
         data = resp.json() or {}
         all_recs.extend([r for r in (data.get("results") or []) if r and r.get("ticker")])
 
-        # Cursor pages (next_url may omit apiKey; Authorization header covers us)
+        # Cursor pages
         next_url = data.get("next_url")
         while next_url:
             resp = _rate_limited_get(sess, next_url, {"apiKey": api_key})
@@ -305,7 +305,7 @@ def polygon_options_ingest_backfill_dag():
     def process_chunk(specs: List[Dict[str, Any]]) -> Dict[str, int]:
         """
         Process a chunk of batch-specs and return a tiny map of {day_iso: wrote_count}.
-        Files are written directly to S3; no large XComs.
+        Also writes per-(day, underlying) worklogs to S3 for observability.
         """
         if not specs:
             return {}
@@ -315,6 +315,12 @@ def polygon_options_ingest_backfill_dag():
         s3 = S3Hook()
 
         counts_by_day: Dict[str, int] = {}
+        # For worklogs: {(iso, underlying): {attempted, wrote, empty, err_404, err_other}}
+        wl: Dict[Tuple[str, str], Dict[str, int]] = {}
+
+        def bump(iso: str, und: str, field: str, inc: int = 1):
+            d = wl.setdefault((iso, und), {"attempted":0, "wrote":0, "empty":0, "err_404":0, "err_other":0})
+            d[field] += inc
 
         for item in specs:
             underlying  = item["underlying"]
@@ -323,36 +329,61 @@ def polygon_options_ingest_backfill_dag():
             wrote = 0
 
             for contract in (item.get("contract_batch") or []):
+                bump(target_date, underlying, "attempted")
                 key = f"raw/options/year={yyyy}/month={mm}/day={dd}/underlying={underlying}/contract={contract}.json.gz"
 
                 if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                    # Treat existing as already "wrote" for sane accounting
+                    wrote += 1
+                    bump(target_date, underlying, "wrote")
                     continue
 
                 url = f"{POLYGON_AGGS_URL_BASE}/{contract}/range/1/day/{target_date}/{target_date}"
-                params = {"adjusted": "true", "apiKey": api_key}  # still include apiKey
-                resp = _rate_limited_get(sess, url, params)
-                if resp.status_code == 401:
-                    time.sleep(0.5)
+                params = {"adjusted": "true", "apiKey": api_key}
+
+                try:
                     resp = _rate_limited_get(sess, url, params)
-                if resp.status_code == 404:
-                    continue
-                resp.raise_for_status()
+                    if resp.status_code == 401:
+                        time.sleep(0.5)
+                        resp = _rate_limited_get(sess, url, params)
 
-                obj = resp.json() or {}
-                results = obj.get("results") or []
-                if not results:
-                    continue
+                    if resp.status_code == 404:
+                        bump(target_date, underlying, "err_404")
+                        continue
 
-                buf = BytesIO()
-                with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
-                    gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
-                s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
-                wrote += 1
+                    resp.raise_for_status()
+                    obj = resp.json() or {}
+                    results = obj.get("results") or []
+                    if not results:
+                        bump(target_date, underlying, "empty")
+                        continue
+
+                    buf = BytesIO()
+                    with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
+                        gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+                    s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
+
+                    wrote += 1
+                    bump(target_date, underlying, "wrote")
+
+                except requests.RequestException:
+                    bump(target_date, underlying, "err_other")
+                    continue
 
                 time.sleep(REQUEST_DELAY_SECONDS)
 
             if wrote:
                 counts_by_day[target_date] = counts_by_day.get(target_date, 0) + wrote
+
+        # Write worklogs
+        for (iso, und), stats in wl.items():
+            log_key = f"raw/manifests/options/worklogs/{iso}/{und}.log"
+            header = (
+                f"# as_of={iso} underlying={und}\n"
+                f"# attempted={stats['attempted']} wrote={stats['wrote']} "
+                f"empty={stats['empty']} err_404={stats['err_404']} err_other={stats['err_other']}\n"
+            )
+            s3.load_string(header, key=log_key, bucket_name=BUCKET_NAME, replace=True)
 
         return counts_by_day
 
@@ -376,7 +407,6 @@ def polygon_options_ingest_backfill_dag():
         for iso in sorted(trading_days):
             y, m, d = iso.split("-")
             prefix = f"raw/options/year={y}/month={m}/day={d}/"
-            # Still list even if counts_by_day shows 0; previous runs may have files.
             keys = s3.list_keys(bucket_name=BUCKET_NAME, prefix=prefix) or []
             keys = [k for k in keys if k and k.startswith(prefix)]
             if not keys:
@@ -413,7 +443,7 @@ def polygon_options_ingest_backfill_dag():
     batch_specs_flat   = flatten_batch_specs(batch_specs_nested)
     chunked_specs      = chunk_batch_specs(batch_specs_flat)
 
-    # Workers return tiny {day_iso: count} maps
+    # Workers return tiny {day_iso: count} maps and write worklogs
     day_counts_list    = process_chunk.expand(specs=chunked_specs)
     counts_by_day      = merge_day_counts(day_counts_list)
 
