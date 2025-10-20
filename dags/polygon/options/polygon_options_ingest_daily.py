@@ -167,7 +167,7 @@ def _json_gz_bytes(obj: Any) -> bytes:
 @dag(
     dag_id="polygon_options_ingest_daily",
     description="Polygon options daily ingest (backfill-parity) + Greeks chain snapshots.",
-    start_date=pendulum.datetime(2025, 10, 17, tz="UTC"),  # static start date for determinism
+    start_date=pendulum.datetime(2025, 10, 18, tz="UTC"),  # static start date for determinism
     schedule_interval="0 0 * * 1-5",                      # Mon–Fri midnight UTC
     catchup=True,   # set True temporarily for rolling backfill from start_date
     default_args=default_args,

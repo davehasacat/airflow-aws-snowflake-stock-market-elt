@@ -1,0 +1,292 @@
+# =============================================================================
+# Polygon Options → Snowflake (Loader; Greeks Chain Snapshot)
+# -----------------------------------------------------------------------------
+# Loads gzip’d JSON chain snapshots from S3 (produced by daily ingest) into a
+# typed landing table — one row per contract per day with greeks/IV/OI.
+# Supports flat and pointer manifests.
+# Default manifest pointer: raw/manifests/polygon_options_greeks_manifest_latest.txt
+# =============================================================================
+
+from __future__ import annotations
+import os
+from datetime import timedelta
+
+import pendulum
+
+from airflow.decorators import dag, task
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+from airflow.exceptions import AirflowSkipException, AirflowFailException
+from airflow.hooks.base import BaseHook
+
+# If you add a dataset for greeks later, you can wire it here. For now we cron.
+MANIFEST_KEY = os.getenv(
+    "OPTIONS_GREEKS_MANIFEST_KEY",
+    "raw/manifests/polygon_options_greeks_manifest_latest.txt"
+)
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
+
+# COPY tuning
+BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "400"))
+ON_ERROR = os.getenv("SNOWFLAKE_COPY_ON_ERROR", "ABORT_STATEMENT")
+FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()
+DO_VALIDATE = os.getenv("SNOWFLAKE_COPY_VALIDATE", "FALSE").upper() == "TRUE"
+PREFILTER_LOADED = os.getenv("SNOWFLAKE_PREFILTER_LOADED", "TRUE").upper() == "TRUE"
+COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))
+
+
+@dag(
+    dag_id="polygon_options_greeks_load",
+    start_date=pendulum.datetime(2025, 10, 1, tz="UTC"),
+    schedule_interval="15 1 * * 1-5",   # run after ingest; adjust as desired
+    catchup=False,
+    tags=["load", "polygon", "snowflake", "options", "greeks"],
+    dagrun_timeout=timedelta(hours=2),
+    max_active_runs=1,
+)
+def polygon_options_greeks_load_dag():
+
+    # Resolve Snowflake context
+    conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
+    x = conn.extra_dejson or {}
+
+    SF_DB = x.get("database")
+    SF_SCHEMA = x.get("schema")
+    if not SF_DB or not SF_SCHEMA:
+        raise AirflowFailException(
+            "Snowflake connection extras must include 'database' and 'schema'. "
+            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
+        )
+
+    STAGE_NAME = x.get("stage", "s3_stage")
+    TABLE_NAME = x.get("options_greeks_table", "source_polygon_options_greeks_raw")
+
+    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
+    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+
+    if not BUCKET_NAME:
+        raise AirflowFailException("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
+
+    @task
+    def create_snowflake_table():
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        sql = f"""
+        CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
+            -- Business columns (one row per contract per day)
+            underlying_ticker TEXT,
+            contract_symbol   TEXT,
+            as_of_ts          TIMESTAMP_NTZ,
+            trade_date        DATE,
+
+            delta             FLOAT,
+            gamma             FLOAT,
+            theta             FLOAT,
+            vega              FLOAT,
+            implied_vol       FLOAT,
+            open_interest     BIGINT,
+
+            bid_price         FLOAT,
+            ask_price         FLOAT,
+
+            -- Lineage
+            source_file       TEXT,
+            source_row_number BIGINT,
+            inserted_at       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        );
+        """
+        hook.run(sql)
+
+    @task
+    def check_stage_exists():
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        try:
+            hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
+        except Exception as e:
+            raise AirflowFailException(
+                f"Stage {FQ_STAGE_NO_AT} not found or not accessible. "
+                f"Verify existence and privileges. Original error: {e}"
+            )
+
+    @task
+    def get_stage_relative_keys_from_manifest() -> list[str]:
+        """
+        Read the S3 manifest and normalize keys into stage-relative paths.
+        Filters to 'options_greeks/'.
+        Supports pointer manifests ('POINTER=<key>').
+        """
+        s3 = S3Hook()
+
+        def _read_lines(key: str) -> list[str]:
+            if not s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                raise FileNotFoundError(f"Manifest not found: s3://{BUCKET_NAME}/{key}")
+            content = s3.read_key(key=key, bucket_name=BUCKET_NAME) or ""
+            return [ln.strip() for ln in content.splitlines() if ln.strip()]
+
+        lines = _read_lines(MANIFEST_KEY)
+        if not lines:
+            raise AirflowSkipException("Manifest is empty; nothing to load.")
+
+        first = lines[0]
+        if first.startswith("POINTER="):
+            pointed_key = first.split("=", 1)[1].strip()
+            if not pointed_key:
+                raise AirflowFailException(f"Pointer manifest has empty target in {MANIFEST_KEY}")
+            lines = _read_lines(pointed_key)
+            if not lines:
+                raise AirflowSkipException(f"Pointer target is empty: {pointed_key}")
+
+        rel = [(k[4:] if k.startswith("raw/") else k) for k in lines]
+        rel = [k for k in rel if k.startswith("options_greeks/")]
+
+        # De-dupe keep order
+        seen = set()
+        out: list[str] = []
+        for k in rel:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+
+        if not out:
+            raise AirflowSkipException("No eligible options_greeks files in manifest after filtering.")
+
+        print(f"Manifest files (options_greeks/*): {len(out)} (from {len(lines)} raw entries)")
+        return out
+
+    @task
+    def prefilter_already_loaded(keys: list[str]) -> list[str]:
+        if not PREFILTER_LOADED or not keys:
+            return keys
+
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        lookback = COPY_HISTORY_LOOKBACK_HOURS
+        sql = f"""
+        with hist as (
+          select FILE_NAME
+          from table(information_schema.copy_history(
+            table_name => '{FQ_TABLE}',
+            start_time => dateadd('hour', -{lookback}, current_timestamp())
+          ))
+        )
+        select FILE_NAME from hist;
+        """
+        rows = hook.get_records(sql) or []
+        already = {r[0] for r in rows if r and r[0]}
+        if not already:
+            return keys
+
+        remaining = [k for k in keys if k not in already]
+        print(f"Prefiltered {len(keys) - len(remaining)} already-loaded files (lookback {lookback}h).")
+        return remaining
+
+    @task
+    def chunk_keys(keys: list[str]) -> list[list[str]]:
+        if not keys:
+            raise AirflowSkipException("No files to load after prefiltering.")
+        return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
+
+    def _copy_sql(files_clause: str, validation_only: bool = False) -> str:
+        """
+        COPY with inline flatten:
+          - Each staged file is a single JSON object with:
+              {_meta:{...}, data:{ results:[{...}, ...] OR options:[{...}, ...] }}
+          - We FLATTEN the array to one row per contract.
+          - We use _meta.as_of when available for as_of_ts; otherwise NULL.
+        """
+        validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
+
+        # Notes:
+        #  - COALESCE($1:data:results, $1:data:options) handles both shapes.
+        #  - FLATTEN(... ) AS f exposes f.value (row), f.index (position).
+        #  - TRY_TO_NUMBER(...) keeps the load resilient to funky strings/nulls.
+        #  - We compute trade_date from as_of_ts to align with your incremental keys.
+        return f"""
+        COPY INTO {FQ_TABLE}
+          (underlying_ticker, contract_symbol, as_of_ts, trade_date,
+           delta, gamma, theta, vega, implied_vol, open_interest,
+           bid_price, ask_price,
+           source_file, source_row_number)
+        FROM (
+          SELECT
+            COALESCE($1:_meta:underlying::TEXT, f.value:underlying_asset:ticker::TEXT)           AS underlying_ticker,
+            f.value:ticker::TEXT                                                                AS contract_symbol,
+
+            -- Prefer our captured meta timestamp; fallback NULL if absent
+            TRY_TO_TIMESTAMP_NTZ($1:_meta:as_of::TEXT)                                          AS as_of_ts,
+            TO_DATE(TRY_TO_TIMESTAMP_NTZ($1:_meta:as_of::TEXT))                                 AS trade_date,
+
+            TRY_TO_NUMBER(f.value:greeks:delta::STRING)                                         AS delta,
+            TRY_TO_NUMBER(f.value:greeks:gamma::STRING)                                         AS gamma,
+            TRY_TO_NUMBER(f.value:greeks:theta::STRING)                                         AS theta,
+            TRY_TO_NUMBER(f.value:greeks:vega::STRING)                                          AS vega,
+
+            COALESCE(
+              TRY_TO_NUMBER(f.value:implied_volatility::STRING),
+              TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING)
+            )                                                                                   AS implied_vol,
+
+            TRY_TO_NUMBER(f.value:open_interest::STRING)                                        AS open_interest,
+
+            COALESCE(
+              TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING),
+              TRY_TO_NUMBER(f.value:bid_price::STRING)
+            )                                                                                   AS bid_price,
+            COALESCE(
+              TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING),
+              TRY_TO_NUMBER(f.value:ask_price::STRING)
+            )                                                                                   AS ask_price,
+
+            METADATA$FILENAME::TEXT                                                             AS source_file,
+            f.index::BIGINT                                                                     AS source_row_number
+          FROM {FQ_STAGE},
+               LATERAL FLATTEN(INPUT => COALESCE($1:data:results, $1:data:options)) AS f
+        )
+        FILES = ({files_clause})
+        FILE_FORMAT = (TYPE = 'JSON')
+        ON_ERROR = '{ON_ERROR}'
+        FORCE = {FORCE}
+        {validate};
+        """
+
+    @task(retries=2)
+    def validate_batch_in_snowflake(batch: list[str]) -> int:
+        if not DO_VALIDATE or not batch:
+            return 0
+        files_clause = ", ".join(f"'{k}'" for k in batch)
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        hook.run(_copy_sql(files_clause, validation_only=True))
+        print(f"Validated greeks batch of {len(batch)} files for {FQ_TABLE}.")
+        return len(batch)
+
+    @task(retries=2)
+    def copy_batch_to_snowflake(batch: list[str]) -> int:
+        if not batch:
+            return 0
+        files_clause = ", ".join(f"'{k}'" for k in batch)
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        hook.run(_copy_sql(files_clause, validation_only=False))
+        print(f"Loaded greeks batch of {len(batch)} files into {FQ_TABLE}.")
+        return len(batch)
+
+    @task
+    def sum_loaded(counts: list[int]) -> int:
+        total = sum(counts or [])
+        print(f"Total greeks files targeted for load: {total}")
+        return total
+
+    # Flow
+    create = create_snowflake_table()
+    stage_ok = check_stage_exists()
+    rel_keys = get_stage_relative_keys_from_manifest()
+    remaining = prefilter_already_loaded(rel_keys)
+    batches = chunk_keys(remaining)
+
+    validated_counts = validate_batch_in_snowflake.expand(batch=batches)
+    loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
+    total = sum_loaded(loaded_counts)
+
+    create >> stage_ok >> remaining >> batches >> validated_counts >> loaded_counts >> total
+
+
+polygon_options_greeks_load_dag()
