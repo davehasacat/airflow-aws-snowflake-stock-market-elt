@@ -1,10 +1,11 @@
 # =============================================================================
 # Polygon Options → Snowflake (Loader; Greeks Chain Snapshot)
 # -----------------------------------------------------------------------------
-# Loads gzip’d JSON chain snapshots from S3 (produced by daily ingest) into a
-# typed landing table — one row per contract per day with greeks/IV/OI.
-# Supports flat and pointer manifests.
-# Default manifest pointer: raw/manifests/polygon_options_greeks_manifest_latest.txt
+# Step 1: COPY raw JSON into a staging VARIANT table (simple SELECT from stage)
+# Step 2: INSERT parsed rows into typed landing table with LATERAL FLATTEN
+#         (idempotent via anti-join on source_file + source_row_number)
+# Supports flat and pointer manifests. Default pointer:
+#   raw/manifests/polygon_options_greeks_manifest_latest.txt
 # =============================================================================
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException, AirflowFailException
 from airflow.hooks.base import BaseHook
 
-# If you add a dataset for greeks later, you can wire it here. For now we cron.
+# Config
 MANIFEST_KEY = os.getenv(
     "OPTIONS_GREEKS_MANIFEST_KEY",
     "raw/manifests/polygon_options_greeks_manifest_latest.txt"
@@ -60,20 +61,32 @@ def polygon_options_greeks_load_dag():
         )
 
     STAGE_NAME = x.get("stage", "s3_stage")
-    TABLE_NAME = x.get("options_greeks_table", "source_polygon_options_greeks_raw")
+    # Final typed table (dbt-friendly)
+    TYPED_TABLE = x.get("options_greeks_table", "source_polygon_options_greeks_raw")
+    # NEW: raw staging table for COPY
+    STAGING_TABLE = x.get("options_greeks_stage_table", "source_polygon_options_greeks_stage")
 
-    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
     FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
     FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"
+
+    FQ_STAGE_TBL = f"{SF_DB}.{SF_SCHEMA}.{STAGING_TABLE}"
+    FQ_TYPED_TBL = f"{SF_DB}.{SF_SCHEMA}.{TYPED_TABLE}"
 
     if not BUCKET_NAME:
         raise AirflowFailException("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
     @task
-    def create_snowflake_table():
+    def create_tables():
+        """Ensure staging (VARIANT) and typed landing tables exist."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         sql = f"""
-        CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
+        CREATE TABLE IF NOT EXISTS {FQ_STAGE_TBL} (
+            raw VARIANT,
+            source_file TEXT,
+            load_ts TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        );
+
+        CREATE TABLE IF NOT EXISTS {FQ_TYPED_TBL} (
             -- Business columns (one row per contract per day)
             underlying_ticker TEXT,
             contract_symbol   TEXT,
@@ -111,11 +124,7 @@ def polygon_options_greeks_load_dag():
 
     @task
     def get_stage_relative_keys_from_manifest() -> list[str]:
-        """
-        Read the S3 manifest and normalize keys into stage-relative paths.
-        Filters to 'options_greeks/'.
-        Supports pointer manifests ('POINTER=<key>').
-        """
+        """Read manifest (supports POINTER=<key>); filter to options_greeks/; return stage-relative keys."""
         s3 = S3Hook()
 
         def _read_lines(key: str) -> list[str]:
@@ -140,7 +149,7 @@ def polygon_options_greeks_load_dag():
         rel = [(k[4:] if k.startswith("raw/") else k) for k in lines]
         rel = [k for k in rel if k.startswith("options_greeks/")]
 
-        # De-dupe keep order
+        # De-dupe while preserving order
         seen = set()
         out: list[str] = []
         for k in rel:
@@ -155,7 +164,11 @@ def polygon_options_greeks_load_dag():
         return out
 
     @task
-    def prefilter_already_loaded(keys: list[str]) -> list[str]:
+    def prefilter_already_copied_to_stage(keys: list[str]) -> list[str]:
+        """
+        Optional: prefilter keys already copied into the STAGING table,
+        based on INFORMATION_SCHEMA.COPY_HISTORY for the staging table.
+        """
         if not PREFILTER_LOADED or not keys:
             return keys
 
@@ -165,7 +178,7 @@ def polygon_options_greeks_load_dag():
         with hist as (
           select FILE_NAME
           from table(information_schema.copy_history(
-            table_name => '{FQ_TABLE}',
+            table_name => '{FQ_STAGE_TBL}',
             start_time => dateadd('hour', -{lookback}, current_timestamp())
           ))
         )
@@ -177,7 +190,7 @@ def polygon_options_greeks_load_dag():
             return keys
 
         remaining = [k for k in keys if k not in already]
-        print(f"Prefiltered {len(keys) - len(remaining)} already-loaded files (lookback {lookback}h).")
+        print(f"Prefiltered {len(keys) - len(remaining)} already-copied (lookback {lookback}h).")
         return remaining
 
     @task
@@ -186,61 +199,22 @@ def polygon_options_greeks_load_dag():
             raise AirflowSkipException("No files to load after prefiltering.")
         return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
 
-    def _copy_sql(files_clause: str, validation_only: bool = False) -> str:
+    def _copy_to_stage_sql(files_clause: str, validation_only: bool = False) -> str:
         """
-        COPY with inline flatten:
-          - Each staged file is a single JSON object with:
-              {_meta:{...}, data:{ results:[{...}, ...] OR options:[{...}, ...] }}
-          - We FLATTEN the array to one row per contract.
-          - We use _meta.as_of when available for as_of_ts; otherwise NULL.
+        COPY into VARIANT staging. Only a simple SELECT from stage is used (Snowflake requirement).
+        Columns:
+          - raw         : full JSON object
+          - source_file : METADATA$FILENAME (for downstream idempotency)
         """
         validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
-
-        # Notes:
-        #  - COALESCE($1:data:results, $1:data:options) handles both shapes.
-        #  - FLATTEN(... ) AS f exposes f.value (row), f.index (position).
-        #  - TRY_TO_NUMBER(...) keeps the load resilient to funky strings/nulls.
-        #  - We compute trade_date from as_of_ts to align with your incremental keys.
         return f"""
-        COPY INTO {FQ_TABLE}
-          (underlying_ticker, contract_symbol, as_of_ts, trade_date,
-           delta, gamma, theta, vega, implied_vol, open_interest,
-           bid_price, ask_price,
-           source_file, source_row_number)
+        COPY INTO {FQ_STAGE_TBL}
+          (raw, source_file)
         FROM (
           SELECT
-            COALESCE($1:_meta:underlying::TEXT, f.value:underlying_asset:ticker::TEXT)           AS underlying_ticker,
-            f.value:ticker::TEXT                                                                AS contract_symbol,
-
-            -- Prefer our captured meta timestamp; fallback NULL if absent
-            TRY_TO_TIMESTAMP_NTZ($1:_meta:as_of::TEXT)                                          AS as_of_ts,
-            TO_DATE(TRY_TO_TIMESTAMP_NTZ($1:_meta:as_of::TEXT))                                 AS trade_date,
-
-            TRY_TO_NUMBER(f.value:greeks:delta::STRING)                                         AS delta,
-            TRY_TO_NUMBER(f.value:greeks:gamma::STRING)                                         AS gamma,
-            TRY_TO_NUMBER(f.value:greeks:theta::STRING)                                         AS theta,
-            TRY_TO_NUMBER(f.value:greeks:vega::STRING)                                          AS vega,
-
-            COALESCE(
-              TRY_TO_NUMBER(f.value:implied_volatility::STRING),
-              TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING)
-            )                                                                                   AS implied_vol,
-
-            TRY_TO_NUMBER(f.value:open_interest::STRING)                                        AS open_interest,
-
-            COALESCE(
-              TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING),
-              TRY_TO_NUMBER(f.value:bid_price::STRING)
-            )                                                                                   AS bid_price,
-            COALESCE(
-              TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING),
-              TRY_TO_NUMBER(f.value:ask_price::STRING)
-            )                                                                                   AS ask_price,
-
-            METADATA$FILENAME::TEXT                                                             AS source_file,
-            f.index::BIGINT                                                                     AS source_row_number
-          FROM {FQ_STAGE},
-               LATERAL FLATTEN(INPUT => COALESCE($1:data:results, $1:data:options)) AS f
+            $1,
+            METADATA$FILENAME
+          FROM {FQ_STAGE}
         )
         FILES = ({files_clause})
         FILE_FORMAT = (TYPE = 'JSON')
@@ -250,43 +224,101 @@ def polygon_options_greeks_load_dag():
         """
 
     @task(retries=2)
-    def validate_batch_in_snowflake(batch: list[str]) -> int:
+    def validate_batch_copy_to_stage(batch: list[str]) -> int:
         if not DO_VALIDATE or not batch:
             return 0
         files_clause = ", ".join(f"'{k}'" for k in batch)
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(files_clause, validation_only=True))
-        print(f"Validated greeks batch of {len(batch)} files for {FQ_TABLE}.")
+        hook.run(_copy_to_stage_sql(files_clause, validation_only=True))
+        print(f"Validated COPY→stage for {len(batch)} files into {FQ_STAGE_TBL}.")
         return len(batch)
 
     @task(retries=2)
-    def copy_batch_to_snowflake(batch: list[str]) -> int:
+    def copy_batch_to_stage(batch: list[str]) -> int:
         if not batch:
             return 0
         files_clause = ", ".join(f"'{k}'" for k in batch)
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(files_clause, validation_only=False))
-        print(f"Loaded greeks batch of {len(batch)} files into {FQ_TABLE}.")
+        hook.run(_copy_to_stage_sql(files_clause, validation_only=False))
+        print(f"Copied {len(batch)} files into staging table {FQ_STAGE_TBL}.")
         return len(batch)
 
+    def _insert_parsed_sql() -> str:
+        """
+        Insert parsed rows from staging VARIANT into typed table.
+        Idempotent via anti-join on (source_file, source_row_number).
+        """
+        return f"""
+        INSERT INTO {FQ_TYPED_TBL} (
+            underlying_ticker, contract_symbol, as_of_ts, trade_date,
+            delta, gamma, theta, vega, implied_vol, open_interest,
+            bid_price, ask_price,
+            source_file, source_row_number
+        )
+        SELECT
+            COALESCE(s.raw:_meta:underlying::TEXT, f.value:underlying_asset:ticker::TEXT)  AS underlying_ticker,
+            f.value:ticker::TEXT                                                           AS contract_symbol,
+
+            TRY_TO_TIMESTAMP_NTZ(s.raw:_meta:as_of::TEXT)                                  AS as_of_ts,
+            TO_DATE(TRY_TO_TIMESTAMP_NTZ(s.raw:_meta:as_of::TEXT))                         AS trade_date,
+
+            TRY_TO_NUMBER(f.value:greeks:delta::STRING)                                    AS delta,
+            TRY_TO_NUMBER(f.value:greeks:gamma::STRING)                                    AS gamma,
+            TRY_TO_NUMBER(f.value:greeks:theta::STRING)                                    AS theta,
+            TRY_TO_NUMBER(f.value:greeks:vega::STRING)                                     AS vega,
+            COALESCE(
+              TRY_TO_NUMBER(f.value:implied_volatility::STRING),
+              TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING)
+            )                                                                              AS implied_vol,
+            TRY_TO_NUMBER(f.value:open_interest::STRING)                                   AS open_interest,
+            COALESCE(
+              TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING),
+              TRY_TO_NUMBER(f.value:bid_price::STRING)
+            )                                                                              AS bid_price,
+            COALESCE(
+              TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING),
+              TRY_TO_NUMBER(f.value:ask_price::STRING)
+            )                                                                              AS ask_price,
+
+            s.source_file                                                                   AS source_file,
+            f.index                                                                          AS source_row_number
+        FROM {FQ_STAGE_TBL} AS s,
+             LATERAL FLATTEN(INPUT => COALESCE(s.raw:data:results, s.raw:data:options)) AS f
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM {FQ_TYPED_TBL} t
+            WHERE t.source_file = s.source_file
+              AND t.source_row_number = f.index
+        );
+        """
+
+    @task(retries=2)
+    def insert_parsed_from_stage() -> int:
+        """Parse + insert into typed table with FLATTEN; returns rows inserted (Snowflake prints rowcount)."""
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        hook.run(_insert_parsed_sql())
+        # SnowflakeHook.run doesn't return rowcount; rely on logs
+        return 0
+
     @task
-    def sum_loaded(counts: list[int]) -> int:
-        total = sum(counts or [])
-        print(f"Total greeks files targeted for load: {total}")
+    def sum_loaded(copy_counts: list[int]) -> int:
+        total = sum(copy_counts or [])
+        print(f"Total greeks files copied to staging: {total}")
         return total
 
     # Flow
-    create = create_snowflake_table()
+    create = create_tables()
     stage_ok = check_stage_exists()
     rel_keys = get_stage_relative_keys_from_manifest()
-    remaining = prefilter_already_loaded(rel_keys)
+    remaining = prefilter_already_copied_to_stage(rel_keys)
     batches = chunk_keys(remaining)
 
-    validated_counts = validate_batch_in_snowflake.expand(batch=batches)
-    loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
-    total = sum_loaded(loaded_counts)
+    validated = validate_batch_copy_to_stage.expand(batch=batches)
+    copied = copy_batch_to_stage.expand(batch=batches)
+    copied_total = sum_loaded(copied)
+    inserted = insert_parsed_from_stage()
 
-    create >> stage_ok >> remaining >> batches >> validated_counts >> loaded_counts >> total
+    create >> stage_ok >> remaining >> batches >> validated >> copied >> copied_total >> inserted
 
 
 polygon_options_greeks_load_dag()
