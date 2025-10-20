@@ -16,4 +16,10 @@ setup_guide.md
 /images
 dbt_packages
 package-lock.yml
-airflow-secrets-read.json
+scratch.txt
+# Local RSA keys (never commit)
+keys/
+*.pem
+*.p8
+*.der
+dbt/profiles.yml
