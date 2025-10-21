@@ -42,6 +42,9 @@ DO_VALIDATE = os.getenv("SNOWFLAKE_COPY_VALIDATE", "FALSE").upper() == "TRUE"
 PREFILTER_LOADED = os.getenv("SNOWFLAKE_PREFILTER_LOADED", "TRUE").upper() == "TRUE"
 COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # 7d
 
+# Optional: non-transform probe validation (fast-fail for JSON/compression/access)
+DO_PROBE_VALIDATE = os.getenv("SNOWFLAKE_PROBE_VALIDATE", "FALSE").upper() == "TRUE"
+
 
 @dag(
     dag_id="polygon_options_load",
@@ -205,27 +208,27 @@ def polygon_options_load_dag():
             raise AirflowSkipException("No files to load after prefiltering.")
         return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
 
-    def _copy_sql(files_clause: str, validation_only: bool = False) -> str:
+    def _copy_sql(files: list[str], validation_only: bool = False) -> str:
         """
-        Compose COPY or VALIDATION SQL. We:
-          - project JSON fields into typed columns
-          - include lineage columns via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
-          - allow both .json and .json.gz (COMPRESSION inferred from extension)
-          - rely on load history for idempotency (FORCE={FORCE})
+        Compose COPY SQL using transformed SELECT.
+        - projects JSON fields into typed columns
+        - includes lineage via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
+        - supports .json and .json.gz
+        - relies on load history for idempotency (FORCE={FORCE})
+        NOTE: VALIDATION_MODE is not supported with transformed loads; caller should skip.
         """
-        validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
+        files_clause = ", ".join(f"'{k}'" for k in files)
         return f"""
         COPY INTO {FQ_TABLE}
           (option_symbol, polygon_trade_date, polygon_bar_ts, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
         FROM (
             SELECT
                 $1:ticker::TEXT                                                      AS option_symbol,
-
-                /* Event ms → TIMESTAMP_NTZ → DATE + raw ts */
+                /* Event ms → TIMESTAMP_NTZ → DATE (keep raw ts below) */
                 TO_DATE(
-                  TO_TIMESTAMP_NTZ( TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000 )
+                  TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)
                 )                                                                     AS polygon_trade_date,
-                TO_TIMESTAMP_NTZ( TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000 )     AS polygon_bar_ts,
+                TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)       AS polygon_bar_ts,
 
                 TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                        AS volume,
                 TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)        AS vwap,
@@ -233,7 +236,7 @@ def polygon_options_load_dag():
                 TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS "close",
                 TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
                 TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
-                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                         AS transactions,
+                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                        AS transactions,
 
                 METADATA$FILENAME::TEXT                                               AS source_file,
                 METADATA$FILE_ROW_NUMBER::BIGINT                                       AS source_row_number
@@ -242,19 +245,49 @@ def polygon_options_load_dag():
         FILES = ({files_clause})
         FILE_FORMAT = (TYPE = 'JSON')
         ON_ERROR = '{ON_ERROR}'
-        FORCE = {FORCE}
-        {validate};
+        FORCE = {FORCE};
         """
 
     @task(retries=2)
     def validate_batch_in_snowflake(batch: list[str]) -> int:
-        """Optional dry-run validation. Returns the number of files checked."""
+        """
+        Validation step (transformed COPY) is a no-op: Snowflake doesn't support VALIDATION_MODE here.
+        We keep this for interface symmetry and logging.
+        """
         if not DO_VALIDATE or not batch:
             return 0
+        print("Skipping transformed COPY validation: VALIDATION_MODE not supported with SELECT loads.")
+        return 0
+
+    @task(retries=1)
+    def probe_validate_batch(batch: list[str]) -> int:
+        """
+        Optional non-transform JSON validation: dry-run COPY that returns errors.
+        Checks JSON/compression/access before the transformed load.
+        Enabled when SNOWFLAKE_PROBE_VALIDATE=TRUE.
+        """
+        if not DO_PROBE_VALIDATE or not batch:
+            return 0
+
         files_clause = ", ".join(f"'{k}'" for k in batch)
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(files_clause, validation_only=True))
-        print(f"Validated batch of {len(batch)} files for {FQ_TABLE}.")
+
+        # Ensure temp table exists (target for COPY; data won't be loaded due to VALIDATION_MODE)
+        hook.run("CREATE TEMP TABLE IF NOT EXISTS TMP_JSON_VALIDATION (v VARIANT);")
+
+        validate_sql = f"""
+            COPY INTO TMP_JSON_VALIDATION
+            FROM {FQ_STAGE}
+            FILES = ({files_clause})
+            FILE_FORMAT = (TYPE = 'JSON')
+            VALIDATION_MODE = 'RETURN_ERRORS';
+        """
+        rows = hook.get_records(validate_sql) or []
+
+        if rows:
+            # Each row describes an error (row/file/error). Raise with first error for brevity.
+            raise RuntimeError(f"Probe validation failed for {len(rows)} row(s); first error: {rows[0]}")
+        print(f"Probe validated batch of {len(batch)} files (no errors).")
         return len(batch)
 
     @task(outlets=[SNOWFLAKE_OPTIONS_RAW_DATASET], retries=2)
@@ -266,9 +299,8 @@ def polygon_options_load_dag():
         """
         if not batch:
             return 0
-        files_clause = ", ".join(f"'{k}'" for k in batch)
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(files_clause, validation_only=False))
+        hook.run(_copy_sql(batch, validation_only=False))
         print(f"Loaded batch of {len(batch)} files into {FQ_TABLE}.")
         return len(batch)
 
@@ -280,7 +312,7 @@ def polygon_options_load_dag():
         return total
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Flow
+    # Flow (dependency fix + optional probe)
     # ────────────────────────────────────────────────────────────────────────────
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
@@ -288,11 +320,12 @@ def polygon_options_load_dag():
     remaining = prefilter_already_loaded(rel_keys)
     batches = chunk_keys(remaining)
 
-    validated_counts = validate_batch_in_snowflake.expand(batch=batches)
+    validated_counts = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
+    probe_counts = probe_validate_batch.expand(batch=batches)             # gated by DO_PROBE_VALIDATE
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
     total = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> remaining >> batches >> validated_counts >> loaded_counts >> total
+    tbl >> stage_ok >> rel_keys >> remaining >> batches >> validated_counts >> probe_counts >> loaded_counts >> total
 
 
 # Instantiate the DAG
