@@ -11,9 +11,8 @@ airflow.db
 .user.yml
 dbt/logs
 dbt/target
-/documentation
 setup_guide.md
-/images
+/images/
 dbt_packages
 package-lock.yml
 scratch.txt
@@ -23,3 +22,4 @@ keys/
 *.p8
 *.der
 dbt/profiles.yml
+/.astro/
