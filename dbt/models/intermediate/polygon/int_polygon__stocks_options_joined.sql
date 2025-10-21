@@ -14,7 +14,7 @@ select
   t1.option_bar_id,
   t1.option_symbol,
   t1.underlying_ticker,
-  t1.trade_date,
+  t1.polygon_trade_date,
   t1.expiration_date,
   t1.strike_price,
   t1.option_type,
