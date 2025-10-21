@@ -1,4 +1,4 @@
-# Airflow-AWS-Snowflake Stock Market ELT
+# Enterprise Stock Market ELT
 
 ## Overview
 
@@ -83,7 +83,7 @@ Open a GitHub Issue for bugs/features or submit a Pull Request with proposed cha
 
 ---
 
-## License / Licensure
+## License
 
 © 2025 **DaveHasACat LLC**. All rights reserved.  
 This project and its contents are owned and maintained by davehasacat.  
