@@ -29,6 +29,8 @@ The project is structured in **phases**:
 4. **Deployment & Ops (v1.0.0 Target)** — Managed Airflow, AWS Secrets Manager, CloudWatch logging, CI/CD pipelines, IAM governance.  
 5. **Dashboard Layer (v2.0.0)** — Plotly Dash visualization layer for end users.
 
+<img width="1939" height="363" alt="v0 1 0-pipeline" src="https://github.com/user-attachments/assets/6215ef30-1003-4716-82cb-7c633be73f94" />
+
 *(Architecture diagrams and AWS service maps will be added in the `/docs` directory.)*
 
 ---
