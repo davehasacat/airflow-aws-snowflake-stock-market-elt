@@ -1,0 +1,130 @@
+version: 2
+
+models:
+  - name: marts_polygon__stocks_options_joined
+    description: Curated mart that joins enriched options bars with corresponding underlying stock metrics for analysis and reporting.
+    tags: ["marts", "polygon", "joined", "options", "stocks"]
+    columns:
+      - name: option_bar_id
+        description: Unique identifier for a single day's option bar.
+        tests:
+          - unique
+          - not_null
+
+      - name: option_symbol
+        description: OCC-formatted option contract symbol (e.g., O:GOOGL251017P00247500).
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: '^O:[A-Z0-9]{1,6}\\d{6}[CP]\\d{8}$'
+
+      - name: underlying_ticker
+        description: Underlying stock ticker symbol.
+        tests:
+          - not_null
+
+      - name: polygon_trade_date
+        description: Trading date (UTC) for the aggregated daily bar.
+        tests:
+          - not_null
+
+      - name: expiration_date
+        description: Option contract expiration date (UTC).
+        tests:
+          - not_null
+
+      - name: strike_price
+        description: Strike price of the option contract.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_type
+        description: Contract type.
+        tests:
+          - accepted_values:
+              values: ["call", "put"]
+
+      - name: option_open
+        description: Option opening price for the day.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_high
+        description: Option highest price for the day.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_low
+        description: Option lowest price for the day.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_close
+        description: Option closing price for the day.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_vwap
+        description: Option volume-weighted average price for the day.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_volume
+        description: Number of option contracts traded for the day.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: option_transactions
+        description: Number of trades contributing to the option bar.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: days_to_expiration
+        description: Days between trade date and expiration date.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: underlying_close_price
+        description: Underlying stock closing price on the trade date.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: underlying_moving_avg_20d
+        description: 20-day simple moving average of the underlying close price.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              config:
+                where: underlying_moving_avg_20d is not null
+
+      - name: underlying_moving_avg_50d
+        description: 50-day simple moving average of the underlying close price.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              config:
+                where: underlying_moving_avg_50d is not null
+
+      - name: underlying_moving_avg_120d
+        description: 120-day simple moving average of the underlying close price.
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              config:
+                where: underlying_moving_avg_120d is not null
+
+      - name: moneyness
+        description: Relative value of the option vs. underlying (in_the_money, at_the_money, out_of_the_money).
+        tests:
+          - accepted_values:
+              values: ["in_the_money", "at_the_money", "out_of_the_money"]

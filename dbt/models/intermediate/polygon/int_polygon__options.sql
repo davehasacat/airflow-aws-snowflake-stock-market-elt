@@ -2,7 +2,7 @@
     config(
         materialized='incremental',
         unique_key='option_bar_id',
-        incremental_strategy='delete+insert'
+        incremental_strategy='merge'
     )
 }}
 
