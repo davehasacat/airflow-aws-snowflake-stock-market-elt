@@ -6,7 +6,7 @@ models:
     tags: ["intermediate", "stocks", "polygon"]
     columns:
       - name: stock_bar_id
-        description: Unique identifier for a single day's stock bar (ticker + trade_date).
+        description: Unique identifier for a single day's stock bar (ticker + polygon_trade_date).
         tests:
           - unique
           - not_null
@@ -16,7 +16,7 @@ models:
         tests:
           - not_null
 
-      - name: trade_date
+      - name: polygon_trade_date
         description: Date of the stock bar.
         tests:
           - not_null
@@ -74,7 +74,7 @@ models:
 
     tests:
       - dbt_expectations.expect_compound_columns_to_be_unique:
-          column_list: ["ticker", "trade_date"]
+          column_list: ["ticker", "polygon_trade_date"]
 
   - name: int_polygon__options
     description: Enriches daily options data with calculated metrics like days to expiration. This model is incremental.
@@ -98,7 +98,7 @@ models:
         tests:
           - not_null
 
-      - name: trade_date
+      - name: polygon_trade_date
         description: Date of the option bar.
         tests:
           - not_null
@@ -146,7 +146,7 @@ models:
 
     tests:
       - dbt_expectations.expect_compound_columns_to_be_unique:
-          column_list: ["option_symbol", "trade_date"]
+          column_list: ["option_symbol", "polygon_trade_date"]
 
   - name: int_polygon__stocks_options_joined
     description: Joins enriched options and stock data to create a comprehensive view for analysis. This model is incremental.
@@ -157,9 +157,3 @@ models:
         tests:
           - unique
           - not_null
-
-      - name: moneyness
-        description: Indicates whether the option is in-the-money, at-the-money, or out-of-the-money.
-        tests:
-          - accepted_values:
-              values: ["in_the_money", "at_the_money", "out_of_the_money"]
