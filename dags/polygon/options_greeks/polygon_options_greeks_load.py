@@ -50,7 +50,7 @@ COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOU
 
 @dag(
     dag_id="polygon_options_greeks_load",
-    start_date=pendulum.datetime(2025, 10, 1, tz="UTC"),
+    start_date=pendulum.datetime(2023, 10, 1, tz="UTC"),
     schedule=[S3_OPTIONS_GREEKS_MANIFEST_DATASET],
     catchup=False,
     tags=["load", "polygon", "snowflake", "options", "greeks", "parsed"],

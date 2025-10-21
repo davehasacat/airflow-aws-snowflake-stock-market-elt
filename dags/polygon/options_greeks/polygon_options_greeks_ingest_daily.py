@@ -129,9 +129,9 @@ def _json_gz_bytes(obj: Any) -> bytes:
 @dag(
     dag_id="polygon_options_greeks_ingest_daily",
     description="Polygon options Greeks daily ingest: chain snapshots → S3 + per-day manifest & latest pointer.",
-    start_date=pendulum.datetime(2025, 10, 1, tz="UTC"),
+    start_date=pendulum.now(tz="UTC"),
     schedule_interval="0 0 * * 1-5",  # Mon–Fri midnight UTC
-    catchup=True,
+    catchup=False,
     default_args=default_args,
     dagrun_timeout=pendulum.duration(hours=6),
     tags=["ingestion", "polygon", "options", "daily", "aws", "greeks"],
