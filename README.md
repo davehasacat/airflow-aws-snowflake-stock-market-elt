@@ -1,179 +1,75 @@
-# 🧠 Stock Market ELT Pipeline
+# Airflow‑AWS‑Snowflake Stock Market ELT
 
-> **This project is in pre-release (v0.1.0)** — full end-to-end ingestion, transformation, and mart creation are live and queryable in Snowflake.  
-> **Version v1.0.0** will include the Plotly Dash analytics dashboard.
+## Overview
 
----
+This repository hosts the ELT (Extract‑Load‑Transform) pipeline for stock‑market data using Apache Airflow, dbt and Snowflake, built to run on AWS infrastructure.  
+The project is structured in **phases**:
 
-## 📈 Overview
+- Phase 1 (v0.1.0): Local development and full end‑to‑end pipeline on Docker/Astro.  
+- Phase 2 (v1.0.0): Fully cloud operational – infrastructure deployed and orchestrated in AWS (and Snowflake in production mode) with no local dependencies.  
+- Phase 3 (v2.0.0): Analytics dashboard layer (e.g., Plotly Dash) on top of the Snowflake‑data‑mart.
 
-The **Stock Market ELT Pipeline** is a cloud-native data engineering project that ingests, stores, transforms, and models historical and daily market data from **Polygon.io** (stocks and options).  
-It demonstrates a **production-grade ELT stack** using **Airflow**, **AWS**, **Snowflake**, and **dbt Core**, all containerized and orchestrated via **Astronomer**.
+## 🧩 Project Versioning
 
-This project is designed for **data engineering skill development** and mirrors an enterprise-grade data platform—secure, modular, and fully automated.
+| Version     | Status            | Goal / Acceptance Criteria                                                                 | Key Components                                                                                           |
+|-------------|-------------------|--------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| **v0.1.0 — MVP (Local)** | ✅ In progress     | Pipeline runs full end‑to‑end **locally** (Docker Desktop / Astro) with data flowing: Polygon → S3 → Snowflake → dbt models → marts. | Airflow (local), AWS S3 (dev), Snowflake (dev), dbt Core, Secrets Manager, IAM roles/policies            |
+| **v1.0.0 — Fully Cloud Operational** | ⏳ Next milestone | Pipeline runs **fully in the cloud** with no local dependencies. Infrastructure is deployed on AWS/Snowflake in production‑mode, with CI/CD, logging/monitoring, cost/ops readiness. | Managed Airflow (MWAA or Astro Cloud), AWS S3 (lifecycle policies), Snowflake (prod), dbt Cloud or containerized dbt, observability/logging, IAM, network/security |
+| **v2.0.0 — Analytics Dashboard (Plotly Dash)** | 🔜 Future        | Adds analytics/dashboard layer. A Plotly Dash (or Streamlit) app connects to the Snowflake marts and is hosted on AWS (App Runner or ECS) for end‑user consumption. | Dash app, Snowflake connector, authentication/authorization, deployment pipeline, optional API gateway     |
 
----
+## Architecture
 
-## ☁️ Cloud Architecture
+*(You may update this section with architecture diagrams, AWS service lists, networking/VPC setup, etc.)*
 
-**Core Stack:**
+1. **Data Extraction** — Pull stock‑market data (e.g., from APIs) and store raw files in S3.  
+2. **Data Ingestion** — Use Airflow DAGs to load raw files into Snowflake Staging.  
+3. **Transformations** — Use dbt models to build marts and analytics tables in Snowflake.  
+4. **Deployment & Ops (v1.0.0 target)** — Pipeline scheduled and managed in cloud via Managed Airflow, secrets in AWS Secrets Manager, logging/monitoring via CloudWatch/third‑party, CI/CD deployments via GitHub Actions or similar.  
+5. **Dashboard Layer (v2.0.0)** — Visualization layer for stakeholders, powered by Plotly Dash, connecting to Snowflake marts.
 
-| Layer | Tool | Purpose |
-|-------|------|----------|
-| **Orchestration** | Apache Airflow (Astronomer) | Manages ingestion, load, and dbt runs |
-| **Storage (Data Lake)** | AWS S3 | Raw JSON/CSV files stored by ticker/date |
-| **Secrets Management** | AWS Secrets Manager | Securely stores Airflow connections & variables |
-| **Data Warehouse** | Snowflake | Centralized analytical warehouse |
-| **Transformation** | dbt Core (run via Astro CLI) | Models data into staged, intermediate, and mart layers |
-| **Dashboard (upcoming)** | Plotly Dash | Interactive visual analytics layer |
+## Getting Started (v0.1.0 Local)
 
-**Data Flow:**
+*These steps assume you are running locally with Astro CLI / Docker.*
 
-``` txt
-Polygon API → Airflow → S3 (raw) → Snowflake (load) → dbt (models) → Dashboard (v1.0.0)
-```
+1. Clone the repository:
 
-**Key Integrations:**
+   ```bash
+   git clone https://github.com/davehasacat/airflow-aws-snowflake-stock-market-elt.git
+   cd airflow-aws-snowflake-stock-market-elt
+   ```
 
-- Airflow retrieves API keys and credentials from **AWS Secrets Manager**
-- Ingestion DAGs use **HTTP retries + API Pools** for rate limit control
-- Snowflake external stages point to **S3** for raw data ingestion
-- dbt runs are **incremental**, ensuring efficient daily refreshes
-- Future dashboard (v1.0.0) will query Snowflake marts directly
+2. Copy `.env_example` to `.env` and fill in your Snowflake, AWS and other credentials.
 
----
-
-## 🧮 Data Modeling (dbt)
-
-The project follows a **layered dbt structure** aligned with best practices:
-
-``` txt
-raw → staging → intermediate → marts
-```
-
-| Layer | Example Model | Description |
-|--------|----------------|-------------|
-| **Staging (`stg_`)** | `stg_polygon__stocks`, `stg_polygon__options` | Typed + cleaned data from Snowflake landing tables |
-| **Intermediate (`int_`)** | `int_polygon__options_stocks_joined` | Joins stocks and options into a unified dataset |
-| **Mart (`mart_`)** | `mart_polygon__options_stocks_joined` | Final queryable dataset optimized for dashboards |
-
-**Incremental Models:**
-
-- All dbt models downstream of staging are **incremental**, leveraging `is_incremental()` filters and unique keys.
-- Enables fast re-runs and minimal recomputation during daily refreshes.
-
----
-
-## ⚙️ Current Features (v0.1.0)
-
-- ✅ Airflow running locally with Astronomer (Docker Desktop)
-- ✅ AWS Secrets Manager integration for credentials
-- ✅ Ingest DAGs for Stocks and Options (daily + backfill)
-- ✅ S3 data structured as `raw/stocks/` and `raw/options/` (gzip JSON)
-- ✅ Snowflake tables for both datasets loaded via Airflow Load DAGs
-- ✅ dbt Core connected via `profiles.yml` (auto-generated)
-- ✅ One dbt mart model (`mart_polygon__options_stocks_joined.sql`) fully queryable
-- ✅ Sample queries returning joined Stocks + Options data
-
----
-
-## 🧰 Tech Stack Summary
-
-| Category | Tool / Service |
-|-----------|----------------|
-| **Container Runtime** | Docker Desktop + Astro CLI |
-| **Scheduler** | Apache Airflow |
-| **Storage** | AWS S3 |
-| **Warehouse** | Snowflake |
-| **Modeling** | dbt Core (v1.10.x) |
-| **Secrets / IAM** | AWS Secrets Manager + IAM Roles |
-| **Dashboard (planned)** | Plotly Dash |
-| **Languages** | Python, SQL, YAML |
-| **Region** | AWS `us-east-2` |
-
----
-
-## 🧩 Example Workflow
-
-1. **Airflow DAGs** fetch daily stock + options data from Polygon.io  
-2. Files are compressed and stored in S3 (raw layer)  
-3. Load DAGs move data into Snowflake typed tables  
-4. dbt transforms data incrementally into marts  
-5. Analysts query joined Stocks + Options data in Snowflake  
-6. *(Upcoming v1.0.0)* Plotly Dash visualizes mart results interactively  
-
----
-
-## 🧠 Pre-Release Roadmap
-
-| Version | Milestone | Key Deliverables |
-|----------|------------|------------------|
-| **v0.1.0** | Pre-Release | Joined mart model live in Snowflake (stocks + options) |
-| **v0.5.0** | Alpha | Airflow + dbt fully automated daily refresh |
-| **v0.9.0** | Beta | Plotly Dash prototype connected to Snowflake |
-| **v1.0.0** | Stable | Dashboard finalized + full documentation |
-
----
-
-## 📂 Repository Structure
-
-``` txt
-.
-├── dags/
-│   ├── polygon/
-│   │   ├── stocks/
-│   │   └── options/
-│   └── utils/
-├── dbt/
-│   ├── models/
-│   │   ├── staging/
-│   │   ├── intermediate/
-│   │   └── marts/
-│   ├── snapshots/
-│   ├── macros/
-│   └── profiles.yml (auto-generated)
-├── snowflake/
-│   ├── grants.sql
-│   └── setup.sql
-├── docs/
-│   ├── aws-secrets-manager-setup.md
-│   ├── runbook.md
-│   └── architecture-diagram.png
-└── docker-compose.override.yml
-```
-
----
-
-## 🧭 Getting Started (Local Development)
-
-1. **Start Airflow with Astronomer**
+3. Start the local Airflow environment:
 
    ```bash
    astro dev start
    ```
 
-2. **Verify AWS & Snowflake Connections**
-   - AWS credentials mounted under `${USERPROFILE}/.aws`
-   - Secrets fetched from AWS Secrets Manager
+4. Verify the DAGs, sources and target marts operate as expected.  
+5. Once local pipeline is validated, move to v1.0.0 (cloud) architecture.
 
-3. **Run dbt Commands**
+## Deployment for v1.0.0 (Fully Cloud)
 
-   ```bash
-   astro dev run dbt debug
-   astro dev run dbt run
-   ```
+*(Brief overview — detailed steps to be added)*
 
-4. **Inspect Models**
-   - Query Snowflake `STOCKS_ELT_DB.PUBLIC.MART_POLYGON__OPTIONS_STOCKS_JOINED`
-   - Confirm incremental data build success
+- Provision AWS resources (S3 buckets, IAM roles/policies, VPC, networking)  
+- Configure Managed Airflow (e.g., MWAA or Astro Cloud)  
+- Deploy Snowflake in production mode (warehouse sizing, security/roles, database/schema)  
+- Configure dbt (Cloud or containerized) to run models in Snowflake  
+- Setup CI/CD pipeline for DAG + DBT code changes  
+- Setup monitoring, logging, alerting, cost controls, tagging, documentation  
 
----
+## Roadmap & Next Steps
 
-### 🧩 Notes
+- Finalize infrastructure for v1.0.0 (target: cloud‑first production).  
+- Once v1.0.0 is green, move to v2.0.0: build and deploy dashboard layer.  
+- Continuous improvements: data‑quality checks, lineage, observability, cost optimisation, governance.
 
-This project emphasizes:
+## Contributing
 
-- Secure, secrets-managed Airflow integration  
-- Incremental dbt architecture  
-- Modular ELT design for scalability and low maintenance  
-- End-to-end reproducibility using containerized components  
+Contributions, feedback, issues and feature requests are welcome. Please open a GitHub Issue for any bug or feature and submit a PR for changes.
+
+## License
+
+*(Insert your license information here)*
