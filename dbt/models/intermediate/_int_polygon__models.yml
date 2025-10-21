@@ -1,0 +1,54 @@
+version: 2
+
+sources:
+  - name: public
+    description: "Raw data loaded from the stock market ELT pipeline."
+    tables:
+      - name: source_polygon_stocks_raw
+        description: "Raw daily OHLCV data for all tickers from Polygon.io."
+        loaded_at_field: inserted_at
+        config:
+          freshness:
+            warn_after: {count: 1, period: day}
+
+      - name: source_polygon_options_raw
+        description: "Raw daily OHLCV data for all options contracts from Polygon.io."
+        loaded_at_field: inserted_at
+        config:
+          freshness:
+            warn_after: {count: 1, period: day}
+
+models:
+  - name: stg_polygon__options
+    description: Cleans and enriches data from the options snapshot, selecting only currently valid records and parsing OCC symbols into their components (underlying ticker, expiration date, call/put, and strike price).
+    tags: ["staging", "options", "polygon"]
+    columns:
+      - name: option_bar_id
+        description: Synthetic primary key built as option_symbol || '_' || polygon_trade_date.
+
+      - name: option_symbol
+        description: Full OCC option symbol, e.g. O:GOOGL251017P00247500.
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: '^O:[A-Z0-9]{1,6}\\d{6}[CP]\\d{8}$'
+              config:
+                where: is_parsable
+
+      - name: polygon_trade_date
+        description: Date of the aggregated OHLCV bar.
+        tests:
+          - not_null
+
+  - name: stg_polygon__stocks
+    description: Cleans and renames data from the stock bars snapshot, selecting only currently valid records. Provides daily OHLCV data for each ticker as the foundation for downstream transformations and analytics.
+    tags: ["staging", "stocks", "polygon"]
+    columns:
+      - name: ticker
+        description: Stock ticker symbol.
+        tests:
+          - not_null
+      - name: polygon_trade_date
+        description: Date of the aggregated OHLCV bar.
+        tests:
+          - not_null
