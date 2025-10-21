@@ -2,7 +2,7 @@
     config(
         materialized='incremental',
         unique_key='option_bar_id',
-        incremental_strategy='delete+insert'
+        incremental_strategy='merge'
     )
 }}
 
@@ -42,7 +42,7 @@ from options t1
 left join stocks t2
 
 on t1.underlying_ticker = t2.ticker
-and t1.trade_date = t2.trade_date
+and t1.polygon_trade_date = t2.polygon_trade_date
 )
 
 select * from joined
