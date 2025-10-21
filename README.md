@@ -85,7 +85,7 @@ Open a GitHub Issue for bugs/features or submit a Pull Request with proposed cha
 
 ## License / Licensure
 
-© 2025 **[DaveHasACat LLC]**. All rights reserved.  
+© 2025 **DaveHasACat LLC**. All rights reserved.  
 This project and its contents are owned and maintained by davehasacat.  
 
 Unless explicitly stated otherwise, no part of this repository may be copied, modified, or distributed without written permission.  
