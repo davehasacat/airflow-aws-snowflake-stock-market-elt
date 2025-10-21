@@ -31,8 +31,6 @@ The project is structured in **phases**:
 
 <img width="1939" height="363" alt="v0 1 0-pipeline" src="https://github.com/user-attachments/assets/6215ef30-1003-4716-82cb-7c633be73f94" />
 
-*(Architecture diagrams and AWS service maps will be added in the `/docs` directory.)*
-
 ---
 
 ## Getting Started (v0.1.0 Local)
@@ -87,8 +85,8 @@ Open a GitHub Issue for bugs/features or submit a Pull Request with proposed cha
 
 ## License / Licensure
 
-© 2025 **[Your LLC Name, LLC]**. All rights reserved.  
-This project and its contents are owned and maintained by [Your LLC Name].  
+© 2025 **[DaveHasACat LLC]**. All rights reserved.  
+This project and its contents are owned and maintained by DaveHasACat.  
 
 Unless explicitly stated otherwise, no part of this repository may be copied, modified, or distributed without written permission.  
 If you intend to open-source the project, replace this section with your chosen license (e.g. MIT, Apache 2.0, etc.) and include a `LICENSE` file.
