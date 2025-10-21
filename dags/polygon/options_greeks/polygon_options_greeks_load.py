@@ -30,11 +30,14 @@ from dags.utils.polygon_datasets import (
     SNOWFLAKE_OPTIONS_GREEKS_RAW_DATASET,
 )
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────────────────────────────────────
 MANIFEST_KEY = os.getenv(
     "OPTIONS_GREEKS_MANIFEST_KEY",
     "raw/manifests/polygon_options_greeks_manifest_latest.txt"
 )
-BUCKET_NAME = os.getenv("BUCKET_NAME")
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
 
 BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "400"))
@@ -56,6 +59,7 @@ COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOU
 )
 def polygon_options_greeks_load_dag():
 
+    # Resolve Snowflake context
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
 
@@ -63,7 +67,8 @@ def polygon_options_greeks_load_dag():
     SF_SCHEMA = x.get("schema")
     if not SF_DB or not SF_SCHEMA:
         raise AirflowFailException(
-            "Snowflake connection extras must include 'database' and 'schema'."
+            "Snowflake connection extras must include 'database' and 'schema'. "
+            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
         )
 
     STAGE_NAME = x.get("stage", "s3_stage")
@@ -78,6 +83,9 @@ def polygon_options_greeks_load_dag():
     if not BUCKET_NAME:
         raise AirflowFailException("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
+    # ────────────────────────────────────────────────────────────────────────────
+    # Tasks
+    # ────────────────────────────────────────────────────────────────────────────
     @task
     def create_snowflake_tables():
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
@@ -93,14 +101,14 @@ def polygon_options_greeks_load_dag():
             contract_symbol   TEXT,
             as_of_ts          TIMESTAMP_NTZ,
             trade_date        DATE,
-            delta             FLOAT,
-            gamma             FLOAT,
-            theta             FLOAT,
-            vega              FLOAT,
-            implied_vol       FLOAT,
+            delta             NUMERIC(19, 6),
+            gamma             NUMERIC(19, 6),
+            theta             NUMERIC(19, 6),
+            vega              NUMERIC(19, 6),
+            implied_vol       NUMERIC(19, 6),
             open_interest     BIGINT,
-            bid_price         FLOAT,
-            ask_price         FLOAT,
+            bid_price         NUMERIC(19, 6),
+            ask_price         NUMERIC(19, 6),
             source_file       TEXT,
             source_row_number BIGINT,
             inserted_at       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
@@ -115,7 +123,8 @@ def polygon_options_greeks_load_dag():
             hook.run(f"DESC STAGE {FQ_STAGE_NO_AT}")
         except Exception as e:
             raise AirflowFailException(
-                f"Stage {FQ_STAGE_NO_AT} not found or not accessible. {e}"
+                f"Stage {FQ_STAGE_NO_AT} not found or not accessible. "
+                f"Verify existence and privileges. Original error: {e}"
             )
 
     @task
@@ -153,7 +162,7 @@ def polygon_options_greeks_load_dag():
 
         if not deduped:
             raise AirflowSkipException("No eligible options_greeks files in manifest after filtering.")
-        print(f"Manifest files (options_greeks/*): {len(deduped)}")
+        print(f"Manifest files (options_greeks/*): {len(deduped)} (from {len(lines)} raw entries)")
         return deduped
 
     @task
@@ -177,6 +186,7 @@ def polygon_options_greeks_load_dag():
         already = {r[0] for r in rows if r and r[0]}
         if not already:
             return keys
+
         remaining = [k for k in keys if k not in already]
         print(f"Prefiltered {len(keys) - len(remaining)} already-copied (lookback {lookback}h).")
         return remaining
@@ -226,7 +236,7 @@ def polygon_options_greeks_load_dag():
         return len(batch)
 
     def _insert_parsed_sql() -> str:
-        # NOTE: contract symbol is primarily under details.ticker; fallbacks included.
+        # All numeric fields: VARIANT -> ::STRING -> TRY_TO_NUMBER(…, 38, 12) to avoid VARIANT→FLOAT try-cast path.
         return f"""
         INSERT INTO {FQ_TYPED_TBL} (
             underlying_ticker, contract_symbol, as_of_ts, trade_date,
@@ -245,29 +255,35 @@ def polygon_options_greeks_load_dag():
             TRY_TO_TIMESTAMP_NTZ(s.raw:_meta:as_of::TEXT)                                    AS as_of_ts,
             TO_DATE(TRY_TO_TIMESTAMP_NTZ(s.raw:_meta:as_of::TEXT))                           AS trade_date,
 
-            TRY_TO_NUMBER(f.value:greeks:delta::STRING)                                      AS delta,
-            TRY_TO_NUMBER(f.value:greeks:gamma::STRING)                                      AS gamma,
-            TRY_TO_NUMBER(f.value:greeks:theta::STRING)                                      AS theta,
-            TRY_TO_NUMBER(f.value:greeks:vega::STRING)                                       AS vega,
+            TRY_TO_NUMBER(f.value:greeks:delta::STRING, 38, 12)                              AS delta,
+            TRY_TO_NUMBER(f.value:greeks:gamma::STRING, 38, 12)                              AS gamma,
+            TRY_TO_NUMBER(f.value:greeks:theta::STRING, 38, 12)                              AS theta,
+            TRY_TO_NUMBER(f.value:greeks:vega::STRING, 38, 12)                               AS vega,
 
             COALESCE(
-              TRY_TO_NUMBER(f.value:implied_volatility::STRING),
-              TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING)
-            )                                                                                AS implied_vol,
+              TRY_TO_NUMBER(f.value:implied_volatility::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:greeks:implied_volatility::STRING, 38, 12)
+            )                                                                               AS implied_vol,
 
-            TRY_TO_NUMBER(f.value:open_interest::STRING)                                     AS open_interest,
+            TRY_TO_NUMBER(f.value:open_interest::STRING)::BIGINT                             AS open_interest,
+
+            -- Quotes: prefer last_quote.bid / last_quote.ask; include common fallbacks (cast via STRING first)
+            COALESCE(
+              TRY_TO_NUMBER(f.value:last_quote:bid::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:bid_price::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:bid::STRING, 38, 12)
+            )                                                                               AS bid_price,
 
             COALESCE(
-              TRY_TO_NUMBER(f.value:last_quote:bid_price::STRING),
-              TRY_TO_NUMBER(f.value:bid_price::STRING)
-            )                                                                                AS bid_price,
-            COALESCE(
-              TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING),
-              TRY_TO_NUMBER(f.value:ask_price::STRING)
-            )                                                                                AS ask_price,
+              TRY_TO_NUMBER(f.value:last_quote:ask::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:last_quote:ask_price::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:ask_price::STRING, 38, 12),
+              TRY_TO_NUMBER(f.value:ask::STRING, 38, 12)
+            )                                                                               AS ask_price,
 
-            s.source_file                                                                     AS source_file,
-            f.index                                                                            AS source_row_number
+            s.source_file                                                                    AS source_file,
+            f.index                                                                           AS source_row_number
         FROM {FQ_STAGE_TBL} AS s,
              LATERAL FLATTEN(INPUT => COALESCE(s.raw:data:results, s.raw:data:options)) AS f
         WHERE NOT EXISTS (
@@ -290,6 +306,9 @@ def polygon_options_greeks_load_dag():
         print(f"Total greeks files copied to staging: {total}")
         return total
 
+    # ────────────────────────────────────────────────────────────────────────────
+    # Flow
+    # ────────────────────────────────────────────────────────────────────────────
     create = create_snowflake_tables()
     stage_ok = check_stage_exists()
     rel_keys = get_stage_relative_keys_from_manifest()
