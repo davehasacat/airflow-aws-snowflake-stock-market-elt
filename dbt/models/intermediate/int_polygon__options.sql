@@ -5,8 +5,6 @@
     )
 }}
 
-with source as (
-    select * from {{ ref('snapshot_polygon_options') }} where dbt_valid_to is null
-)
+with source as ( select * from {{ ref('stg_polygon__options') }} )
 
 select * from source

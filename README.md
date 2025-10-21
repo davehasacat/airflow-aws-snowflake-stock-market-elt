@@ -7,10 +7,10 @@
 
 ## 📈 Overview
 
-The **Stock Market ELT Pipeline** is a cloud-native data engineering project that ingests, stores, transforms, and models historical and daily market data from **Polygon.io** (stocks and options, including Greeks).  
+The **Stock Market ELT Pipeline** is a cloud-native data engineering project that ingests, stores, transforms, and models historical and daily market data from **Polygon.io** (stocks and options).  
 It demonstrates a **production-grade ELT stack** using **Airflow**, **AWS**, **Snowflake**, and **dbt Core**, all containerized and orchestrated via **Astronomer**.
 
-This project is designed for **data engineering skill development** and to mirror an enterprise-grade data platform—secure, modular, and fully automated.
+This project is designed for **data engineering skill development** and mirrors an enterprise-grade data platform—secure, modular, and fully automated.
 
 ---
 

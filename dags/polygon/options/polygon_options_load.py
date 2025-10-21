@@ -45,7 +45,7 @@ COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOU
 
 @dag(
     dag_id="polygon_options_load",
-    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=[S3_OPTIONS_MANIFEST_DATASET],   # fires when options manifest updates
     catchup=False,
     tags=["load", "polygon", "snowflake", "options"],
