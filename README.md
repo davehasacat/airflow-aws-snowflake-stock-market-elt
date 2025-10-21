@@ -16,7 +16,7 @@ The project is structured in **phases**:
 | Version | Status | Goal / Acceptance Criteria | Key Components |
 |----------|---------|-----------------------------|----------------|
 | **v0.1.0 — MVP (Local)** | ✅ Complete | Pipeline runs full end-to-end **locally** with data flowing Polygon → S3 → Snowflake → dbt models → marts. | Airflow (local), AWS S3 (dev), Snowflake (dev), dbt Core, Secrets Manager, IAM roles/policies |
-| **v1.0.0 — Fully Cloud Operational** | 🚧 Next Milestone | Pipeline runs **fully in the cloud**, no local dependencies. Infrastructure as code + CI/CD, monitoring, and cost/ops readiness. | Managed Airflow (MWAA or Astro Cloud), AWS S3 (lifecycle policies), Snowflake (prod), dbt Cloud/containerized, observability + IAM governance |
+| **v1.0.0 — Fully Cloud Operational** | 🚧 Next Milestone | Pipeline runs **fully in the cloud**, no local dependencies. Infrastructure as code + CI/CD, monitoring, and cost/ops readiness. | Managed Airflow (MWAA), AWS S3 (lifecycle policies), Snowflake (prod), dbt Cloud, observability + IAM governance |
 | **v2.0.0 — Analytics Dashboard (Plotly Dash)** | 🔜 Future | Adds interactive dashboards hosted on AWS (App Runner / ECS) powered by Snowflake marts. | Dash app, Snowflake connector, authN/authZ, deployment pipeline, optional API gateway |
 
 ---
@@ -59,9 +59,9 @@ cp .env_example .env
 ## Deployment (v1.0.0 Preview)
 
 - Provision AWS resources (S3 buckets, IAM roles, VPC, networking).  
-- Configure Managed Airflow (MWAA or Astro Cloud).  
+- Configure Managed Airflow (MWAA).  
 - Deploy Snowflake (prod) with optimized warehouse sizing and role hierarchies.  
-- Configure dbt (Cloud or containerized) to run transformations.  
+- Configure dbt Cloud to run transformations.  
 - Implement CI/CD for DAG + dbt code promotion.  
 - Add monitoring, alerting, cost tracking and documentation.
 
@@ -86,7 +86,7 @@ Open a GitHub Issue for bugs/features or submit a Pull Request with proposed cha
 ## License / Licensure
 
 © 2025 **[DaveHasACat LLC]**. All rights reserved.  
-This project and its contents are owned and maintained by DaveHasACat.  
+This project and its contents are owned and maintained by davehasacat.  
 
 Unless explicitly stated otherwise, no part of this repository may be copied, modified, or distributed without written permission.  
 If you intend to open-source the project, replace this section with your chosen license (e.g. MIT, Apache 2.0, etc.) and include a `LICENSE` file.
