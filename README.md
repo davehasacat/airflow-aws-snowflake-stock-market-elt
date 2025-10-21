@@ -29,16 +29,16 @@ This project is designed for **data engineering skill development** and mirrors 
 
 **Data Flow:**
 
-```txt
+``` txt
 Polygon API → Airflow → S3 (raw) → Snowflake (load) → dbt (models) → Dashboard (v1.0.0)
 ```
 
 **Key Integrations:**
 
 - Airflow retrieves API keys and credentials from **AWS Secrets Manager**
-- Ingestion DAGs use **HTTP retries + API Pools** for rate-limit control
+- Ingestion DAGs use **HTTP retries + API Pools** for rate limit control
 - Snowflake external stages point to **S3** for raw data ingestion
-- dbt models are **incremental**, ensuring efficient daily refreshes
+- dbt runs are **incremental**, ensuring efficient daily refreshes
 - Future dashboard (v1.0.0) will query Snowflake marts directly
 
 ---
@@ -47,19 +47,19 @@ Polygon API → Airflow → S3 (raw) → Snowflake (load) → dbt (models) → D
 
 The project follows a **layered dbt structure** aligned with best practices:
 
-```txt
+``` txt
 raw → staging → intermediate → marts
 ```
 
 | Layer | Example Model | Description |
 |--------|----------------|-------------|
 | **Staging (`stg_`)** | `stg_polygon__stocks`, `stg_polygon__options` | Typed + cleaned data from Snowflake landing tables |
-| **Intermediate (`int_`)** | `int_polygon__options_stocks_joined` | Joins stocks and options data into a unified dataset |
+| **Intermediate (`int_`)** | `int_polygon__options_stocks_joined` | Joins stocks and options (including Greeks) into a unified dataset |
 | **Mart (`mart_`)** | `mart_polygon__options_stocks_joined` | Final queryable dataset optimized for dashboards |
 
 **Incremental Models:**
 
-- All dbt models downstream of staging are **incremental**, leveraging `is_incremental()` filters and unique keys.  
+- All dbt models downstream of staging are **incremental**, leveraging `is_incremental()` filters and unique keys.
 - Enables fast re-runs and minimal recomputation during daily refreshes.
 
 ---
@@ -73,7 +73,7 @@ raw → staging → intermediate → marts
 - ✅ Snowflake tables for both datasets loaded via Airflow Load DAGs
 - ✅ dbt Core connected via `profiles.yml` (auto-generated)
 - ✅ One dbt mart model (`mart_polygon__options_stocks_joined.sql`) fully queryable
-- ✅ Sample queries returning joined Stocks + Options data
+- ✅ Sample queries returning joined Stocks + Options (Greeks) data
 
 ---
 
@@ -99,7 +99,7 @@ raw → staging → intermediate → marts
 2. Files are compressed and stored in S3 (raw layer)  
 3. Load DAGs move data into Snowflake typed tables  
 4. dbt transforms data incrementally into marts  
-5. Analysts query joined Stocks + Options data in Snowflake  
+5. Analysts query joined Stocks + Options + Greeks data in Snowflake  
 6. *(Upcoming v1.0.0)* Plotly Dash visualizes mart results interactively  
 
 ---
@@ -117,7 +117,7 @@ raw → staging → intermediate → marts
 
 ## 📂 Repository Structure
 
-```txt
+``` txt
 .
 ├── dags/
 │   ├── polygon/
