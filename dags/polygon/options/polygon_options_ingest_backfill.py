@@ -2,13 +2,16 @@
 # =============================================================================
 # Polygon Options Backfill (Ingestion)
 # -----------------------------------------------------------------------------
-# Updates applied:
-#  1) S3 layout: raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
-#  2) Per-day manifests at raw/manifests/options/YYYY-MM-DD.txt + "latest" pointer (content)
-#  4) Filter contracts to those alive on target day (list_date ≤ day ≤ expiration_date)
-#  5) XCom-size safety: workers return small per-day counts; manifests built via S3 listing
-#  6) Bulletproof pagination auth: Authorization: Bearer <key> + apiKey param; 401 guard
-#  7) Observability worklogs per (day, underlying) under raw/manifests/options/worklogs/...
+# Enterprise updates aligned to the new stream/backfill split:
+#   1) S3 layout (Hive-style): raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
+#   2) Per-day manifests (immutable): raw/manifests/options/YYYY-MM-DD/manifest.txt
+#      - NOTE: This backfill DAG does NOT update the "latest" pointer and does NOT emit a Dataset.
+#        Daily stream loading is triggered only by the daily ingest DAG.
+#   3) Contract filter: only contracts "alive" on target day (list_date ≤ day ≤ expiration_date)
+#   4) XCom-safety: workers return small {day:count} maps; manifests are built via S3 listing
+#   5) Retry & rate-limit hardened: Bearer auth + apiKey param, 429/5xx handling
+#   6) Observability: per-(day,underlying) worklogs under raw/manifests/options/worklogs/YYYY-MM-DD/<U>.log
+#   7) Encrypted S3 writes by default (encrypt=True)
 # =============================================================================
 from __future__ import annotations
 
@@ -19,19 +22,18 @@ import time
 import gzip
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
+from datetime import timedelta
 
 import pendulum
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import timedelta
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-
-from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
+from airflow.hooks.base import BaseHook
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config / Constants
@@ -39,7 +41,7 @@ from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
-BUCKET_NAME = os.getenv("BUCKET_NAME", "test")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
@@ -47,68 +49,48 @@ USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-backfill (
 API_POOL = os.getenv("API_POOL", "api_pool")
 
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
+REQUEST_JITTER_SECONDS = float(os.getenv("POLYGON_REQUEST_JITTER_SECONDS", "0.05"))
 CONTRACTS_BATCH_SIZE  = int(os.getenv("BACKFILL_CONTRACTS_BATCH_SIZE", "300"))
 REPLACE_FILES        = os.getenv("BACKFILL_REPLACE", "false").lower() == "true"
 MAP_CHUNK_SIZE       = int(os.getenv("BACKFILL_MAP_CHUNK_SIZE", "2000"))
 
 # Toggle the date-alive filter if needed
-DISABLE_CONTRACT_DATE_FILTER = os.getenv("POLYGON_DISABLE_CONTRACT_DATE_FILTER", "false").lower() in ("1","true","yes")
+DISABLE_CONTRACT_DATE_FILTER = os.getenv(
+    "POLYGON_DISABLE_CONTRACT_DATE_FILTER", "false"
+).lower() in ("1","true","yes")
+
+DAY_MANIFEST_PREFIX = "raw/manifests/options"  # per-day manifests live under: <prefix>/<YYYY-MM-DD>/manifest.txt
+
+if not BUCKET_NAME:
+    raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_options_key() -> str:
     """
-    Resolve the Polygon Options API key (connection → variable → env).
-    Airflow Connection ID: polygon_options_api_key
+    Resolve the Polygon Options API key from an Airflow Connection 'polygon_options_api_key',
+    falling back to env POLYGON_OPTIONS_API_KEY.
     """
-    # 1) Airflow Connection
     try:
-        from airflow.hooks.base import BaseHook
         conn = BaseHook.get_connection("polygon_options_api_key")
         if conn:
-            if conn.password and conn.password.strip():
-                return conn.password.strip()
+            for candidate in (conn.password, conn.login):
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
             extra = (conn.extra_dejson or {})
-            v = extra.get("api_key")
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+            for k in ("api_key", "key", "token", "password", "polygon_options_api_key", "value"):
+                v = extra.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
     except Exception:
         pass
-
-    # 2) Airflow Variable (string or tiny JSON)
-    try:
-        from airflow.models import Variable
-        raw = Variable.get("polygon_options_api_key")
-        if raw:
-            raw = raw.strip()
-            if raw.startswith("{"):
-                import json as _json
-                try:
-                    obj = _json.loads(raw)
-                    if isinstance(obj, dict):
-                        for k in ("polygon_options_api_key", "api_key", "key", "value"):
-                            vv = obj.get(k)
-                            if isinstance(vv, str) and vv.strip():
-                                return vv.strip()
-                        if len(obj) == 1:
-                            only = next(iter(obj.values()))
-                            if isinstance(only, str) and only.strip():
-                                return only.strip()
-                except Exception:
-                    pass
-            return raw
-    except Exception:
-        pass
-
-    # 3) ENV
     env = os.getenv("POLYGON_OPTIONS_API_KEY", "").strip()
     if env:
         return env
-
     raise RuntimeError(
-        "Polygon Options API key not found. Provide via Airflow connection 'polygon_options_api_key', "
-        "Variable 'polygon_options_api_key', or env POLYGON_OPTIONS_API_KEY."
+        "Polygon Options API key not found. Define Airflow connection 'polygon_options_api_key' "
+        "or set env POLYGON_OPTIONS_API_KEY."
     )
 
 def _session(api_key: str) -> requests.Session:
@@ -185,8 +167,9 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────────
 @dag(
     dag_id="polygon_options_ingest_backfill",
+    description="Polygon options backfill ingest — writes raw JSON.gz & immutable per-day manifests (no latest pointer updates).",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=None,
+    schedule=None,           # manual runs only
     catchup=False,
     tags=["ingestion", "polygon", "options", "backfill", "aws"],
     params={
@@ -198,8 +181,12 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
 )
 def polygon_options_ingest_backfill_dag():
 
+    # ───────────────────────────────
+    # Inputs
+    # ───────────────────────────────
     @task
     def read_underlyings() -> List[str]:
+        """Seed underlyings from dbt seeds."""
         path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers: List[str] = []
         with open(path, mode="r") as f:
@@ -214,6 +201,10 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def compute_trading_dates(**kwargs) -> List[str]:
+        """
+        Compute trading dates (weekdays only) inclusive of [start_date, end_date].
+        Note: market holidays are not filtered here.
+        """
         start = pendulum.parse(kwargs["params"]["start_date"])
         end   = pendulum.parse(kwargs["params"]["end_date"])
         if start > end:
@@ -221,17 +212,21 @@ def polygon_options_ingest_backfill_dag():
         dates: List[str] = []
         cur = start
         while cur <= end:
-            if cur.day_of_week not in (5, 6):  # Sat/Sun
+            if cur.day_of_week not in (5, 6):  # 5=Sat, 6=Sun
                 dates.append(cur.to_date_string())
             cur = cur.add(days=1)
         if not dates:
-            raise AirflowSkipException("No trading dates in the given range.")
+            raise AirflowSkipException("No weekdays in the given range.")
         return dates
 
     @task
     def make_pairs(underlyings: List[str], trading_days: List[str]) -> List[Dict[str, str]]:
+        """Cartesian of underlyings × days."""
         return [{"ticker": u, "target_date": d} for d in trading_days for u in underlyings]
 
+    # ───────────────────────────────
+    # Discovery: contracts per (underlying, day)
+    # ───────────────────────────────
     @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
     def discover_for_pair(pair: Dict[str, str]) -> Dict[str, Any]:
         """
@@ -282,6 +277,7 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def batch_contracts_for_pair(discovery: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Split discovered contracts into batches for the fetch step."""
         underlying  = discovery["underlying"]
         target_date = discovery["target_date"]
         contracts: List[str] = discovery.get("contracts") or []
@@ -296,11 +292,15 @@ def polygon_options_ingest_backfill_dag():
 
     @task
     def chunk_batch_specs(batch_specs: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Optional: map-of-maps chunking to prevent extremely large mapped graphs."""
         if not batch_specs:
             return []
         sz = MAP_CHUNK_SIZE
         return [batch_specs[i:i+sz] for i in range(0, len(batch_specs), sz)]
 
+    # ───────────────────────────────
+    # Fetch bars & write raw files (only when non-empty)
+    # ───────────────────────────────
     @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
     def process_chunk(specs: List[Dict[str, Any]]) -> Dict[str, int]:
         """
@@ -330,9 +330,12 @@ def polygon_options_ingest_backfill_dag():
 
             for contract in (item.get("contract_batch") or []):
                 bump(target_date, underlying, "attempted")
-                key = f"raw/options/year={yyyy}/month={mm}/day={dd}/underlying={underlying}/contract={contract}.json.gz"
+                s3_key = (
+                    f"raw/options/year={yyyy}/month={mm}/day={dd}/"
+                    f"underlying={underlying}/contract={contract}.json.gz"
+                )
 
-                if not REPLACE_FILES and s3.check_for_key(key, bucket_name=BUCKET_NAME):
+                if not REPLACE_FILES and s3.check_for_key(s3_key, bucket_name=BUCKET_NAME):
                     # Treat existing as already "wrote" for sane accounting
                     wrote += 1
                     bump(target_date, underlying, "wrote")
@@ -361,7 +364,15 @@ def polygon_options_ingest_backfill_dag():
                     buf = BytesIO()
                     with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
                         gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
-                    s3.load_bytes(buf.getvalue(), key=key, bucket_name=BUCKET_NAME, replace=True)
+
+                    # Encrypted write for enterprise defaults
+                    s3.load_bytes(
+                        buf.getvalue(),
+                        key=s3_key,
+                        bucket_name=BUCKET_NAME,
+                        replace=True,
+                        encrypt=True,
+                    )
 
                     wrote += 1
                     bump(target_date, underlying, "wrote")
@@ -375,18 +386,21 @@ def polygon_options_ingest_backfill_dag():
             if wrote:
                 counts_by_day[target_date] = counts_by_day.get(target_date, 0) + wrote
 
-        # Write worklogs
+        # Write worklogs (encrypted)
         for (iso, und), stats in wl.items():
-            log_key = f"raw/manifests/options/worklogs/{iso}/{und}.log"
+            log_key = f"{DAY_MANIFEST_PREFIX}/worklogs/{iso}/{und}.log"
             header = (
                 f"# as_of={iso} underlying={und}\n"
                 f"# attempted={stats['attempted']} wrote={stats['wrote']} "
                 f"empty={stats['empty']} err_404={stats['err_404']} err_other={stats['err_other']}\n"
             )
-            s3.load_string(header, key=log_key, bucket_name=BUCKET_NAME, replace=True)
+            s3.load_string(header, key=log_key, bucket_name=BUCKET_NAME, replace=True, encrypt=True)
 
         return counts_by_day
 
+    # ───────────────────────────────
+    # Build immutable per-day manifests (via S3 listing)
+    # ───────────────────────────────
     @task
     def merge_day_counts(list_of_maps: List[Dict[str, int]]) -> Dict[str, int]:
         out: Dict[str, int] = {}
@@ -400,6 +414,7 @@ def polygon_options_ingest_backfill_dag():
         """
         Build per-day manifests by LISTING S3 prefixes (no big XComs).
         Only write a manifest if the day has files.
+        Writes to: raw/manifests/options/YYYY-MM-DD/manifest.txt
         """
         s3 = S3Hook()
         manifest_keys: List[str] = []
@@ -412,24 +427,14 @@ def polygon_options_ingest_backfill_dag():
             if not keys:
                 continue
 
-            mkey = f"raw/manifests/options/{iso}.txt"
-            s3.load_string("\n".join(sorted(set(keys))) + "\n",
-                           key=mkey, bucket_name=BUCKET_NAME, replace=True)
+            mkey = f"{DAY_MANIFEST_PREFIX}/{iso}/manifest.txt"
+            body = "\n".join(sorted(set(keys))) + "\n"
+            s3.load_string(body, key=mkey, bucket_name=BUCKET_NAME, replace=True, encrypt=True)
             manifest_keys.append(mkey)
 
-        return manifest_keys
-
-    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def update_latest_pointer(manifest_keys: List[str]) -> None:
         if not manifest_keys:
-            raise AirflowSkipException("No non-empty per-day manifests; skipping latest pointer update.")
-        latest_mkey = sorted(manifest_keys)[-1]
-        s3 = S3Hook()
-        content = s3.read_key(key=latest_mkey, bucket_name=BUCKET_NAME) or ""
-        if not content.strip():
-            raise AirflowSkipException(f"Latest day manifest {latest_mkey} is empty.")
-        latest_ptr = "raw/manifests/polygon_options_manifest_latest.txt"
-        s3.load_string(content, key=latest_ptr, bucket_name=BUCKET_NAME, replace=True)
+            raise AirflowSkipException("No non-empty per-day manifests produced.")
+        return manifest_keys
 
     # ───────────────────────────────
     # Wiring
@@ -447,11 +452,9 @@ def polygon_options_ingest_backfill_dag():
     day_counts_list    = process_chunk.expand(specs=chunked_specs)
     counts_by_day      = merge_day_counts(day_counts_list)
 
-    # Build per-day manifests by listing S3
-    day_manifests      = write_day_manifests_from_s3(trading_days, counts_by_day)
+    # Build immutable per-day manifests (NO pointer update)
+    _day_manifests     = write_day_manifests_from_s3(trading_days, counts_by_day)
 
-    # Update 'latest' with the content of most recent non-empty day manifest
-    update_latest_pointer(day_manifests)
 
 # Instantiate
 polygon_options_ingest_backfill_dag()

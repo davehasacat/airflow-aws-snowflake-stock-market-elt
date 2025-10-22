@@ -5,6 +5,16 @@
 # Loads raw JSON(.gz) produced by the options ingest DAG from S3 (external stage)
 # into a typed landing table. Supports flat and pointer manifests.
 # Adds lineage columns for dbt incremental models.
+#
+# Enterprise updates:
+# - Pointer-style "latest" manifest support:
+#     raw/manifests/polygon_options_manifest_latest.txt
+#     BODY: "POINTER=raw/manifests/options/YYYY-MM-DD/manifest.txt"
+# - Per-day manifest (immutable) lists keys under Hive-style partitions:
+#     raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
+# - Dynamic task mapping (no parse-time len(XComArg) calls)
+# - Optional prefilter vs information_schema.copy_history
+# - Secrets/IaC-driven Snowflake context via connection extras
 # =============================================================================
 
 from __future__ import annotations
@@ -29,7 +39,7 @@ from dags.utils.polygon_datasets import (
 # ────────────────────────────────────────────────────────────────────────────────
 MANIFEST_KEY = os.getenv(
     "OPTIONS_MANIFEST_KEY",
-    "raw/manifests/polygon_options_manifest_latest.txt"  # compatible with your current ingest DAG
+    "raw/manifests/polygon_options_manifest_latest.txt"  # pointer (preferred) or flat manifest
 )
 BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
@@ -45,15 +55,24 @@ COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOU
 # Optional: non-transform probe validation (fast-fail for JSON/compression/access)
 DO_PROBE_VALIDATE = os.getenv("SNOWFLAKE_PROBE_VALIDATE", "FALSE").upper() == "TRUE"
 
+# Optional: dedicate capacity for loaders (create the pool in airflow-settings.yaml)
+DEFAULT_ARGS = {
+    "owner": "data-platform",
+    "retries": 2,
+    "retry_delay": pendulum.duration(minutes=5),
+    "pool": os.getenv("LOAD_POOL_NAME", "load_pool"),
+}
+
 
 @dag(
     dag_id="polygon_options_load",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=[S3_OPTIONS_MANIFEST_DATASET],   # fires when options manifest updates
+    schedule=[S3_OPTIONS_MANIFEST_DATASET],   # fires when options manifest (latest pointer) updates
     catchup=False,
     tags=["load", "polygon", "snowflake", "options"],
     dagrun_timeout=timedelta(hours=2),
     max_active_runs=1,
+    default_args=DEFAULT_ARGS,
 )
 def polygon_options_load_dag():
 
@@ -64,7 +83,7 @@ def polygon_options_load_dag():
     x = conn.extra_dejson or {}
 
     SF_DB = x.get("database")
-    # NEW: allow different schemas for stage vs target table
+    # allow different schemas for stage vs target table
     RAW_SCHEMA = x.get("raw_schema", "RAW")
     STAGE_SCHEMA = x.get("stage_schema", x.get("schema", "STAGES"))
 
@@ -90,7 +109,7 @@ def polygon_options_load_dag():
     def create_snowflake_table():
         """Create/ensure the typed landing table (lineage-friendly for dbt incremental)."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        sql = f"""
+        hook.run(f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             -- Business columns
             option_symbol TEXT,
@@ -109,8 +128,7 @@ def polygon_options_load_dag():
             source_row_number BIGINT,
             inserted_at TIMESTAMP_NTZ DEFAULT (CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
         );
-        """
-        hook.run(sql)
+        """)
 
     @task
     def check_stage_exists():
@@ -129,19 +147,19 @@ def polygon_options_load_dag():
         """
         Read the S3 manifest and normalize keys into stage-relative paths.
         Supports:
-          a) Flat manifest — one 'raw/options/.../*.json[.gz]' key per line.
-          b) Pointer manifest — first line 'POINTER=<s3_key>' → flat manifest.
-        Filters to 'options/', dedupes while preserving order.
+          a) Flat manifest — each line: 'raw/options/.../*.json[.gz]'
+          b) Pointer manifest — first line 'POINTER=<s3_key>' → dereference to per-day manifest.
+        Filters to 'options/', de-dupes while preserving order.
         """
         s3 = S3Hook()
 
-        def _read_lines(key: str) -> list[str]:
+        def _read(key: str) -> list[str]:
             if not s3.check_for_key(key, bucket_name=BUCKET_NAME):
                 raise FileNotFoundError(f"Manifest not found: s3://{BUCKET_NAME}/{key}")
             content = s3.read_key(key=key, bucket_name=BUCKET_NAME) or ""
             return [ln.strip() for ln in content.splitlines() if ln.strip()]
 
-        lines = _read_lines(MANIFEST_KEY)
+        lines = _read(MANIFEST_KEY)
         if not lines:
             raise AirflowSkipException("Manifest is empty; nothing to load.")
 
@@ -150,7 +168,7 @@ def polygon_options_load_dag():
             pointed_key = first.split("=", 1)[1].strip()
             if not pointed_key:
                 raise ValueError(f"Pointer manifest has empty target in {MANIFEST_KEY}")
-            lines = _read_lines(pointed_key)
+            lines = _read(pointed_key)
             if not lines:
                 raise AirflowSkipException(f"Pointer target is empty: {pointed_key}")
 
@@ -184,7 +202,7 @@ def polygon_options_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         lookback = COPY_HISTORY_LOOKBACK_HOURS
-        sql = f"""
+        rows = hook.get_records(f"""
         with hist as (
           select FILE_NAME
           from table(information_schema.copy_history(
@@ -193,8 +211,7 @@ def polygon_options_load_dag():
           ))
         )
         select FILE_NAME from hist;
-        """
-        rows = hook.get_records(sql) or []
+        """) or []
         already = {r[0] for r in rows if r and r[0]}
         if not already:
             return keys
@@ -210,7 +227,7 @@ def polygon_options_load_dag():
             raise AirflowSkipException("No files to load after prefiltering.")
         return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
 
-    def _copy_sql(files: list[str], validation_only: bool = False) -> str:
+    def _copy_sql(files: list[str]) -> str:
         """
         Compose COPY SQL using transformed SELECT.
         - projects JSON fields into typed columns
@@ -225,23 +242,21 @@ def polygon_options_load_dag():
           (option_symbol, polygon_trade_date, polygon_bar_ts, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
         FROM (
             SELECT
-                $1:ticker::TEXT                                                      AS option_symbol,
+                $1:ticker::TEXT                                                        AS option_symbol,
                 /* Event ms → TIMESTAMP_NTZ → DATE (keep raw ts below) */
-                TO_DATE(
-                  TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)
-                )                                                                     AS polygon_trade_date,
-                TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)       AS polygon_bar_ts,
+                TO_DATE(TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)) AS polygon_trade_date,
+                TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)           AS polygon_bar_ts,
 
-                TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                        AS volume,
-                TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)        AS vwap,
-                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS "open",
-                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS "close",
-                TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
-                TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
-                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                        AS transactions,
+                TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                          AS volume,
+                TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)          AS vwap,
+                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)           AS "open",
+                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)           AS "close",
+                TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)           AS high,
+                TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)           AS low,
+                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                          AS transactions,
 
-                METADATA$FILENAME::TEXT                                               AS source_file,
-                METADATA$FILE_ROW_NUMBER::BIGINT                                       AS source_row_number
+                METADATA$FILENAME::TEXT                                                 AS source_file,
+                METADATA$FILE_ROW_NUMBER::BIGINT                                         AS source_row_number
             FROM {FQ_STAGE}
         )
         FILES = ({files_clause})
@@ -277,14 +292,13 @@ def polygon_options_load_dag():
         # Ensure temp table exists (target for COPY; data won't be loaded due to VALIDATION_MODE)
         hook.run("CREATE TEMP TABLE IF NOT EXISTS TMP_JSON_VALIDATION (v VARIANT);")
 
-        validate_sql = f"""
+        rows = hook.get_records(f"""
             COPY INTO TMP_JSON_VALIDATION
             FROM {FQ_STAGE}
             FILES = ({files_clause})
             FILE_FORMAT = (TYPE = 'JSON')
             VALIDATION_MODE = 'RETURN_ERRORS';
-        """
-        rows = hook.get_records(validate_sql) or []
+        """) or []
 
         if rows:
             # Each row describes an error (row/file/error). Raise with first error for brevity.
@@ -302,7 +316,7 @@ def polygon_options_load_dag():
         if not batch:
             return 0
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(batch, validation_only=False))
+        hook.run(_copy_sql(batch))
         print(f"Loaded batch of {len(batch)} files into {FQ_TABLE}.")
         return len(batch)
 
@@ -314,7 +328,7 @@ def polygon_options_load_dag():
         return total
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Flow (dependency fix + optional probe)
+    # Flow (dependency fix + optional probe) — dynamic mapping (no parse-time len())
     # ────────────────────────────────────────────────────────────────────────────
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
@@ -322,12 +336,12 @@ def polygon_options_load_dag():
     remaining = prefilter_already_loaded(rel_keys)
     batches = chunk_keys(remaining)
 
-    validated_counts = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
-    probe_counts = probe_validate_batch.expand(batch=batches)             # gated by DO_PROBE_VALIDATE
+    _validated = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
+    _probed = probe_validate_batch.expand(batch=batches)            # gated by DO_PROBE_VALIDATE
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
     total = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> rel_keys >> remaining >> batches >> validated_counts >> probe_counts >> loaded_counts >> total
+    tbl >> stage_ok >> rel_keys >> remaining >> batches >> _validated >> _probed >> loaded_counts >> total
 
 
 # Instantiate the DAG
