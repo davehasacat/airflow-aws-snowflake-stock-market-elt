@@ -299,7 +299,7 @@ def polygon_options_load_stream_dag():
         return total
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Flow
+    # Flow (FIXED dynamic mapping usage)
     # ────────────────────────────────────────────────────────────────────────────
     ctx = resolve_snowflake_ctx()
     _tbl = ensure_table(ctx)
@@ -310,8 +310,9 @@ def polygon_options_load_stream_dag():
     remaining = prefilter_loaded(ctx, keys)
     batches = chunk_keys(remaining)
 
-    _probe = probe_validate.expand(ctx=[ctx] * len(batches), batch=batches)  # gated by DO_PROBE_VALIDATE
-    loaded = copy_batch.expand(ctx=[ctx] * len(batches), batch=batches)
+    # ✅ Use .partial(...).expand(...) so Airflow can map dynamically without needing len(XComArg)
+    _probe = probe_validate.partial(ctx=ctx).expand(batch=batches)  # gated by DO_PROBE_VALIDATE
+    loaded = copy_batch.partial(ctx=ctx).expand(batch=batches)
     _total = summarize(loaded)
 
     _tbl >> _stg >> ptr >> keys >> remaining >> batches >> loaded >> _total
