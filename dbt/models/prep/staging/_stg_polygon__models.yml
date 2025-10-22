@@ -1,7 +1,7 @@
 version: 2
 
 sources:
-  - name: public
+  - name: raw
     description: "Raw data loaded from the stock market ELT pipeline."
     tables:
       - name: source_polygon_stocks_raw
