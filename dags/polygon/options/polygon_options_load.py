@@ -24,7 +24,7 @@
 from __future__ import annotations
 import os
 from datetime import timedelta
-from typing import List
+from typing import List, Tuple, Optional
 
 import pendulum
 
@@ -49,7 +49,9 @@ ON_ERROR = os.getenv("SNOWFLAKE_COPY_ON_ERROR", "ABORT_STATEMENT")   # or 'CONTI
 FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()           # TRUE to bypass load history
 DO_VALIDATE = os.getenv("SNOWFLAKE_COPY_VALIDATE", "FALSE").upper() == "TRUE"
 PREFILTER_LOADED = os.getenv("SNOWFLAKE_PREFILTER_LOADED", "TRUE").upper() == "TRUE"
-COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # 7d
+
+# IMPROVEMENT #2: dynamic lookback — minimum from env, but auto-extends for deep backfills
+COPY_HISTORY_LOOKBACK_HOURS_MIN = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # default 7d (min)
 
 # Optional: non-transform probe validation (fast-fail for JSON/compression/access)
 DO_PROBE_VALIDATE = os.getenv("SNOWFLAKE_PROBE_VALIDATE", "FALSE").upper() == "TRUE"
@@ -113,6 +115,45 @@ def polygon_options_load_dag():
     # Stage stays in STAGES (or whatever you set in extras)
     FQ_STAGE = f"@{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
     FQ_STAGE_NO_AT = f"{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Helpers (local)
+    # ────────────────────────────────────────────────────────────────────────────
+    def _parse_minmax_date_from_keys(keys: List[str]) -> Tuple[Optional[pendulum.Date], Optional[pendulum.Date]]:
+        """
+        Inspect stage-relative keys like:
+          options/year=YYYY/month=MM/day=DD/underlying=.../contract=....json.gz
+        Return (min_date, max_date) or (None, None) if not parseable.
+        """
+        mins: Optional[pendulum.Date] = None
+        maxs: Optional[pendulum.Date] = None
+        for k in keys or []:
+            try:
+                # quick split lookup; resilient to extra segments
+                parts = k.split("/")
+                y = next(int(p.split("=")[1]) for p in parts if p.startswith("year="))
+                m = next(int(p.split("=")[1]) for p in parts if p.startswith("month="))
+                d = next(int(p.split("=")[1]) for p in parts if p.startswith("day="))
+                dt = pendulum.date(y, m, d)
+                mins = dt if mins is None or dt < mins else mins
+                maxs = dt if maxs is None or dt > maxs else maxs
+            except Exception:
+                continue
+        return mins, maxs
+
+    def _dynamic_copy_history_lookback_hours(keys: List[str]) -> int:
+        """
+        IMPROVEMENT #2: Increase copy_history lookback automatically for deep backfills.
+        We compute (now - min_file_date) in hours and take the max with the configured minimum.
+        """
+        min_dt, _ = _parse_minmax_date_from_keys(keys)
+        if not min_dt:
+            return COPY_HISTORY_LOOKBACK_HOURS_MIN
+        now = pendulum.now("UTC").date()
+        delta_days = max((now - min_dt).days, 0)
+        derived_hours = max(delta_days * 24, COPY_HISTORY_LOOKBACK_HOURS_MIN)
+        print(f"Dynamic copy_history lookback hours = {derived_hours} (min={min_dt.to_date_string()}, now={now})")
+        return derived_hours
 
     # ────────────────────────────────────────────────────────────────────────────
     # Tasks
@@ -201,37 +242,6 @@ def polygon_options_load_dag():
         print(f"Eligible files (options/*): {len(deduped)}")
         return deduped
 
-    @task(pool=SNOWFLAKE_POOL)
-    def prefilter_already_loaded(keys: List[str]) -> List[str]:
-        """
-        Optional: prefilter keys that Snowflake already loaded into {FQ_TABLE}
-        (based on information_schema.copy_history). Defaults on; disable with
-        SNOWFLAKE_PREFILTER_LOADED=FALSE.
-        """
-        if not PREFILTER_LOADED or not keys:
-            return keys
-
-        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        lookback = COPY_HISTORY_LOOKBACK_HOURS
-        sql = f"""
-        with hist as (
-          select FILE_NAME
-          from table(information_schema.copy_history(
-            table_name => '{FQ_TABLE}',
-            start_time => dateadd('hour', -{lookback}, current_timestamp())
-          ))
-        )
-        select FILE_NAME from hist;
-        """
-        rows = hook.get_records(sql) or []
-        already = {r[0] for r in rows if r and r[0]}
-        if not already:
-            return keys
-
-        remaining = [k for k in keys if k not in already]
-        print(f"Prefiltered {len(keys) - len(remaining)} already-loaded files (lookback {lookback}h).")
-        return remaining
-
     @task
     def chunk_keys(keys: List[str]) -> List[List[str]]:
         """Split keys into FILES=() batches to keep COPY statements predictable."""
@@ -278,23 +288,50 @@ def polygon_options_load_dag():
         FORCE = {FORCE};
         """
 
-    @task(retries=1, pool=SNOWFLAKE_POOL)
-    def validate_batch_in_snowflake(batch: List[str]) -> int:
+    @task(pool=SNOWFLAKE_POOL)
+    def compute_dynamic_lookback(keys: List[str]) -> int:
         """
-        Validation step (transformed COPY) is a no-op: Snowflake doesn't support VALIDATION_MODE here.
-        We keep this for interface symmetry and logging.
+        IMPROVEMENT #2 (cont.): compute a dynamic lookback for copy_history
+        based on the earliest partition date in the manifest keys.
         """
-        if not DO_VALIDATE or not batch:
-            return 0
-        print("Skipping transformed COPY validation: VALIDATION_MODE not supported with SELECT loads.")
-        return 0
+        return _dynamic_copy_history_lookback_hours(keys)
+
+    @task(pool=SNOWFLAKE_POOL)
+    def prefilter_already_loaded(keys: List[str], lookback_hours: int) -> List[str]:
+        """
+        Optional: prefilter keys that Snowflake already loaded into {FQ_TABLE}
+        using information_schema.copy_history. We auto-extend the lookback
+        for deep backfills so we skip more already-loaded files up-front.
+        """
+        if not PREFILTER_LOADED or not keys:
+            return keys
+
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        sql = f"""
+        with hist as (
+          select FILE_NAME
+          from table(information_schema.copy_history(
+            table_name => '{FQ_TABLE}',
+            start_time => dateadd('hour', -{lookback_hours}, current_timestamp())
+          ))
+        )
+        select FILE_NAME from hist;
+        """
+        rows = hook.get_records(sql) or []
+        already = {r[0] for r in rows if r and r[0]}
+        if not already:
+            return keys
+
+        remaining = [k for k in keys if k not in already]
+        print(f"Prefiltered {len(keys) - len(remaining)} files using lookback {lookback_hours}h.")
+        return remaining
 
     @task(retries=1, pool=SNOWFLAKE_POOL)
     def probe_validate_batch(batch: List[str]) -> int:
         """
-        Optional non-transform JSON validation: dry-run COPY that returns errors.
-        Checks JSON/compression/access before the transformed load.
-        Enabled when SNOWFLAKE_PROBE_VALIDATE=TRUE.
+        IMPROVEMENT #1 (enforced): Optional non-transform JSON validation.
+        When enabled (SNOWFLAKE_PROBE_VALIDATE=TRUE), downstream COPY will
+        wait for this probe to complete.
         """
         if not DO_PROBE_VALIDATE or not batch:
             return 0
@@ -313,9 +350,7 @@ def polygon_options_load_dag():
             VALIDATION_MODE = 'RETURN_ERRORS';
         """
         rows = hook.get_records(validate_sql) or []
-
         if rows:
-            # Each row describes an error (row/file/error). Raise with first error for brevity.
             raise RuntimeError(f"Probe validation failed for {len(rows)} row(s); first error: {rows[0]}")
         print(f"Probe validated batch of {len(batch)} files (no errors).")
         return len(batch)
@@ -342,20 +377,28 @@ def polygon_options_load_dag():
         return total
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Flow (dependency order + optional probe)
+    # Flow (dependency order + optional probe dependency)
     # ────────────────────────────────────────────────────────────────────────────
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
     manifest_keys = read_manifest_keys()
-    remaining = prefilter_already_loaded(manifest_keys)
+
+    # Compute a dynamic copy_history lookback (IMPROVEMENT #2)
+    lookback_hours = compute_dynamic_lookback(manifest_keys)
+
+    remaining = prefilter_already_loaded(manifest_keys, lookback_hours)
     batches = chunk_keys(remaining)
 
-    _ = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
-    _ = probe_validate_batch.expand(batch=batches)         # gated by DO_PROBE_VALIDATE
+    # IMPROVEMENT #1: Ensure COPY waits for PROBE when enabled
+    probe_counts = probe_validate_batch.expand(batch=batches)          # gated by DO_PROBE_VALIDATE
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
+    if DO_PROBE_VALIDATE:
+        # Explicit dependency so mapped COPY waits for mapped PROBE
+        probe_counts >> loaded_counts
+
     _ = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> manifest_keys >> remaining >> batches >> loaded_counts
+    tbl >> stage_ok >> manifest_keys >> lookback_hours >> remaining >> batches >> loaded_counts
 
 # Instantiate the DAG
 polygon_options_load_dag()
