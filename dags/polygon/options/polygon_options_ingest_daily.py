@@ -2,12 +2,16 @@
 # =============================================================================
 # Polygon Options Ingest (Daily) — backfill-parity raw ingest
 # -----------------------------------------------------------------------------
-# Parity with backfill:
-#  - S3 layout: raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
-#  - Write only when Polygon returns non-empty `results` (skip 404/empty)
-#  - Keep Authorization header + apiKey param
-#  - Filter contracts to those alive on target day (toggle via env)
-#  - Per-day manifest at raw/manifests/options/YYYY-MM-DD.txt + “latest” pointer
+# Enterprise/modern updates:
+#   • S3 layout (Hive-style): raw/options/year=YYYY/month=%m/day=%d/underlying=<U>/contract=<C>.json.gz
+#   • Per-day manifest is immutable at: raw/manifests/options/YYYY-MM-DD/manifest.txt
+#   • “Latest” manifest is a POINTER file (not a copy of the manifest contents):
+#         raw/manifests/polygon_options_manifest_latest.txt
+#         → contains a single line: POINTER=raw/manifests/options/YYYY-MM-DD/manifest.txt
+#   • Dataset emit happens only after the pointer is atomically updated
+#   • All S3 writes encrypted at rest (encrypt=True)
+#   • Static start_date, catchup=False, and pool inheritance for uniform throttling
+#   • Idempotent file writes via deterministic keys; skip on empty/404 responses
 # =============================================================================
 
 from __future__ import annotations
@@ -57,14 +61,20 @@ DISABLE_CONTRACT_DATE_FILTER = os.getenv(
     "POLYGON_DISABLE_CONTRACT_DATE_FILTER", "false"
 ).lower() in ("1", "true", "yes")
 
+# Manifests: immutable per-day + mutable pointer
+DAY_MANIFEST_PREFIX = "raw/manifests/options"
+LATEST_POINTER_KEY = "raw/manifests/polygon_options_manifest_latest.txt"
+
+if not BUCKET_NAME:
+    raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
+
+# Airflow defaults (enterprise-safe)
 default_args = {
     "owner": "data-platform",
     "retries": 3,
     "retry_delay": pendulum.duration(minutes=5),
+    "pool": API_POOL,  # all tasks inherit; heavy ones may still specify pool explicitly
 }
-
-if not BUCKET_NAME:
-    raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -159,9 +169,9 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
 @dag(
     dag_id="polygon_options_ingest_daily",
     description="Polygon options daily ingest (backfill-parity): raw JSON.gz to S3 + per-day & latest manifests.",
-    start_date=pendulum.now(tz="UTC"),
-    schedule="0 0 * * 1-5",
-    catchup=False,   # set to True temporarily when you want a rolling backfill from start_date
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),  # static start; daily ops don’t use catchup
+    schedule="0 0 * * 1-5",  # weekdays; compute_target_date handles previous biz day logic
+    catchup=False,            # backfills are handled by the dedicated backfill DAG
     default_args=default_args,
     dagrun_timeout=pendulum.duration(hours=12),
     tags=["ingestion", "polygon", "options", "daily", "aws"],
@@ -189,7 +199,10 @@ def polygon_options_ingest_daily_dag():
 
     @task
     def compute_target_date() -> str:
-        """Target the previous business day (Fri for Sat/Sun)."""
+        """
+        Target the previous business day (Fri for Sat/Sun).
+        Later we can swap to an exchange/market calendar.
+        """
         ctx = get_current_context()
         d = ctx["logical_date"].subtract(days=1)
         while d.day_of_week in (5, 6):  # 5=Sat, 6=Sun
@@ -206,8 +219,8 @@ def polygon_options_ingest_daily_dag():
         def discover_for_ticker(ticker: str, target_date: str) -> Dict[str, Any]:
             """
             Return {'underlying': <seed ticker>, 'contracts': [tickers...]} after:
-            - Pagination
-            - Alive-on-day filtering (aligned with backfill)
+              • Pagination
+              • Alive-on-day filtering (aligned with backfill)
             """
             api_key = _get_polygon_options_key()
             sess = _session(api_key)
@@ -274,6 +287,10 @@ def polygon_options_ingest_daily_dag():
 
     @task(retries=3, retry_delay=pendulum.duration(minutes=5), pool=API_POOL)
     def process_batch(batch: List[Dict[str, str]]) -> List[str]:
+        """
+        Fetch daily bars per contract and write gzipped JSON to S3.
+        Idempotent by key; only writes when Polygon returns non-empty 'results'.
+        """
         if not batch:
             return []
 
@@ -283,7 +300,7 @@ def polygon_options_ingest_daily_dag():
         written: List[str] = []
 
         for rec in batch:
-            underlying = rec["underlying"]           # ← seed underlying (matches backfill)
+            underlying = rec["underlying"]           # seed underlying (matches backfill)
             contract = rec["contract"]
             target_date = rec["target_date"]
             yyyy, mm, dd = target_date.split("-")
@@ -317,14 +334,21 @@ def polygon_options_ingest_daily_dag():
             buf = BytesIO()
             with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
                 gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
-            s3.load_bytes(buf.getvalue(), key=s3_key, bucket_name=BUCKET_NAME, replace=True)
+            # Encrypted PUT for enterprise defaults
+            s3.load_bytes(
+                buf.getvalue(),
+                key=s3_key,
+                bucket_name=BUCKET_NAME,
+                replace=True,
+                encrypt=True,
+            )
             written.append(s3_key)
             _sleep()
 
         return written
 
     # ───────────────────────────────
-    # Manifest
+    # Manifest writing (immutable per-day + mutable pointer)
     # ───────────────────────────────
     @task
     def flatten_keys(list_of_lists: List[List[str]]) -> List[str]:
@@ -332,25 +356,42 @@ def polygon_options_ingest_daily_dag():
 
     @task
     def write_day_manifest(all_keys: List[str], target_date: str) -> Optional[str]:
+        """
+        Write an immutable per-day manifest listing all S3 keys written for the day.
+        Stored at: raw/manifests/options/YYYY-MM-DD/manifest.txt
+        """
         if not all_keys:
             return None
         s3 = S3Hook()
-        manifest_key = f"raw/manifests/options/{target_date}.txt"
-        s3.load_string("\n".join(sorted(set(all_keys))) + "\n",
-                       key=manifest_key, bucket_name=BUCKET_NAME, replace=True)
+        manifest_key = f"{DAY_MANIFEST_PREFIX}/{target_date}/manifest.txt"
+        body = "\n".join(sorted(set(all_keys))) + "\n"
+        s3.load_string(
+            body,
+            key=manifest_key,
+            bucket_name=BUCKET_NAME,
+            replace=True,
+            encrypt=True,
+        )
         return manifest_key
 
     @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
     def update_latest_pointer(day_manifest_key: Optional[str]) -> Optional[str]:
+        """
+        Atomically point 'latest' to the immutable per-day manifest via a POINTER file.
+        This is what the stream loader subscribes to.
+        """
         if not day_manifest_key:
-            raise AirflowSkipException("No per-day manifest; skipping.")
+            raise AirflowSkipException("No per-day manifest; skipping latest pointer.")
+        pointer_body = f"POINTER={day_manifest_key}\n"
         s3 = S3Hook()
-        content = s3.read_key(key=day_manifest_key, bucket_name=BUCKET_NAME) or ""
-        if not content.strip():
-            raise AirflowSkipException("Manifest empty; skipping latest pointer.")
-        latest_key = "raw/manifests/polygon_options_manifest_latest.txt"
-        s3.load_string(content, key=latest_key, bucket_name=BUCKET_NAME, replace=True)
-        return latest_key
+        s3.load_string(
+            pointer_body,
+            key=LATEST_POINTER_KEY,
+            bucket_name=BUCKET_NAME,
+            replace=True,
+            encrypt=True,
+        )
+        return LATEST_POINTER_KEY
 
     # ───────────────────────────────
     # Wiring
