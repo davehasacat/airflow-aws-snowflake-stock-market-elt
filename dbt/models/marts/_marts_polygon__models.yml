@@ -122,9 +122,3 @@ models:
               min_value: 0
               config:
                 where: underlying_moving_avg_120d is not null
-
-      - name: moneyness
-        description: Relative value of the option vs. underlying (in_the_money, at_the_money, out_of_the_money).
-        tests:
-          - accepted_values:
-              values: ["in_the_money", "at_the_money", "out_of_the_money"]
