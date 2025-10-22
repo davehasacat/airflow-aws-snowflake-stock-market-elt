@@ -27,7 +27,10 @@ from dags.utils.polygon_datasets import (
 # ────────────────────────────────────────────────────────────────────────────────
 # Config (env-first; sensible defaults)
 # ────────────────────────────────────────────────────────────────────────────────
-MANIFEST_KEY = os.getenv("STOCKS_MANIFEST_KEY", "raw/manifests/manifest_latest.txt")
+MANIFEST_KEY = os.getenv(
+    "STOCKS_MANIFEST_KEY",
+    "raw/manifests/polygon_stocks_manifest_latest.txt"  # pointer (preferred) or flat manifest
+)
 BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
 
@@ -39,41 +42,52 @@ DO_VALIDATE = os.getenv("SNOWFLAKE_COPY_VALIDATE", "FALSE").upper() == "TRUE"
 PREFILTER_LOADED = os.getenv("SNOWFLAKE_PREFILTER_LOADED", "TRUE").upper() == "TRUE"
 COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # 7d
 
+# Optional: non-transform probe validation (fast-fail for JSON/compression/access)
+DO_PROBE_VALIDATE = os.getenv("SNOWFLAKE_PROBE_VALIDATE", "FALSE").upper() == "TRUE"
+
+# Optional: dedicate capacity for loaders (create the pool in airflow-settings.yaml)
+DEFAULT_ARGS = {
+    "owner": "data-platform",
+    "retries": 2,
+    "retry_delay": pendulum.duration(minutes=5),
+    "pool": os.getenv("LOAD_POOL_NAME", "load_pool"),
+}
+
+
 @dag(
     dag_id="polygon_stocks_load",
-    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule=[S3_STOCKS_MANIFEST_DATASET],   # fires when stocks manifest updates
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
+    schedule=[S3_STOCKS_MANIFEST_DATASET],   # fires when stocks "latest" manifest updates
     catchup=False,
     tags=["load", "polygon", "snowflake", "stocks"],
     dagrun_timeout=timedelta(hours=2),
     max_active_runs=1,
+    default_args=DEFAULT_ARGS,
 )
 def polygon_stocks_load_dag():
 
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────────
     # Resolve Snowflake context (from Secrets-backed connection extras)
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
 
     SF_DB = x.get("database")
-    if not SF_DB:
-        raise ValueError(
-            "Snowflake connection extras must include 'database'. "
-            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
-        )
-
-    # NEW: separate schemas for target table (RAW) and stage (STAGES)
+    # allow different schemas for stage vs target table
     RAW_SCHEMA = x.get("raw_schema", "RAW")
     STAGE_SCHEMA = x.get("stage_schema", x.get("schema", "STAGES"))
 
-    STAGE_NAME = x.get("stage", "s3_stage")                       # external stage already configured
-    TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
+    if not SF_DB:
+        raise ValueError("Snowflake connection extras must include 'database'.")
 
-    # Table goes to RAW schema; Stage stays in STAGES (or as configured)
+    STAGE_NAME = x.get("stage", "s3_stage")                          # external stage name
+    TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")   # landing table name
+
+    # Table goes to RAW schema
     FQ_TABLE = f"{SF_DB}.{RAW_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"            # for COPY
-    FQ_STAGE_NO_AT = f"{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"       # for DESC/SHOW
+    # Stage stays in STAGES schema (or whatever you set in extras)
+    FQ_STAGE = f"@{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
+    FQ_STAGE_NO_AT = f"{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -85,11 +99,12 @@ def polygon_stocks_load_dag():
     def create_snowflake_table():
         """Create/ensure the typed landing table (lineage-friendly for dbt incremental)."""
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        sql = f"""
+        hook.run(f"""
         CREATE TABLE IF NOT EXISTS {FQ_TABLE} (
             -- Business columns
-            ticker TEXT,
+            stock_symbol TEXT,
             polygon_trade_date DATE,
+            polygon_bar_ts TIMESTAMP_NTZ,
             "open" NUMERIC(19, 4),
             high NUMERIC(19, 4),
             low NUMERIC(19, 4),
@@ -103,8 +118,7 @@ def polygon_stocks_load_dag():
             source_row_number BIGINT,
             inserted_at TIMESTAMP_NTZ DEFAULT (CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
         );
-        """
-        hook.run(sql)
+        """)
 
     @task
     def check_stage_exists():
@@ -123,19 +137,19 @@ def polygon_stocks_load_dag():
         """
         Read the S3 manifest and normalize keys into stage-relative paths.
         Supports:
-          a) Flat manifest — one 'raw/stocks/.../*.json[.gz]' key per line.
-          b) Pointer manifest — first line 'POINTER=<s3_key>' → flat manifest.
-        Filters to 'stocks/', dedupes while preserving order.
+          a) Flat manifest — each line: 'raw/stocks/.../*.json[.gz]'
+          b) Pointer manifest — first line 'POINTER=<s3_key>' → dereference to per-day manifest.
+        Filters to 'stocks/', de-dupes while preserving order.
         """
         s3 = S3Hook()
 
-        def _read_lines(key: str) -> list[str]:
+        def _read(key: str) -> list[str]:
             if not s3.check_for_key(key, bucket_name=BUCKET_NAME):
                 raise FileNotFoundError(f"Manifest not found: s3://{BUCKET_NAME}/{key}")
             content = s3.read_key(key=key, bucket_name=BUCKET_NAME) or ""
             return [ln.strip() for ln in content.splitlines() if ln.strip()]
 
-        lines = _read_lines(MANIFEST_KEY)
+        lines = _read(MANIFEST_KEY)
         if not lines:
             raise AirflowSkipException("Manifest is empty; nothing to load.")
 
@@ -144,7 +158,7 @@ def polygon_stocks_load_dag():
             pointed_key = first.split("=", 1)[1].strip()
             if not pointed_key:
                 raise ValueError(f"Pointer manifest has empty target in {MANIFEST_KEY}")
-            lines = _read_lines(pointed_key)
+            lines = _read(pointed_key)
             if not lines:
                 raise AirflowSkipException(f"Pointer target is empty: {pointed_key}")
 
@@ -161,7 +175,7 @@ def polygon_stocks_load_dag():
                 deduped.append(k)
 
         if not deduped:
-            raise AirflowSkipException("No eligible stocks files in manifest after filtering.")
+            raise AirflowSkipException("No eligible stock files in manifest after filtering.")
 
         print(f"Manifest files (stocks/*): {len(deduped)} (from {len(lines)} raw entries)")
         return deduped
@@ -178,7 +192,7 @@ def polygon_stocks_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         lookback = COPY_HISTORY_LOOKBACK_HOURS
-        sql = f"""
+        rows = hook.get_records(f"""
         with hist as (
           select FILE_NAME
           from table(information_schema.copy_history(
@@ -187,8 +201,7 @@ def polygon_stocks_load_dag():
           ))
         )
         select FILE_NAME from hist;
-        """
-        rows = hook.get_records(sql) or []
+        """) or []
         already = {r[0] for r in rows if r and r[0]}
         if not already:
             return keys
@@ -206,35 +219,34 @@ def polygon_stocks_load_dag():
 
     def _copy_sql(files: list[str]) -> str:
         """
-        Compose transformed COPY SQL:
+        Compose COPY SQL using transformed SELECT.
         - projects JSON fields into typed columns
         - includes lineage via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
         - supports .json and .json.gz
         - relies on load history for idempotency (FORCE={FORCE})
+        NOTE: VALIDATION_MODE is not supported with transformed loads; caller should skip.
         """
         files_clause = ", ".join(f"'{k}'" for k in files)
         return f"""
         COPY INTO {FQ_TABLE}
-          (ticker, polygon_trade_date, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
+          (stock_symbol, polygon_trade_date, polygon_bar_ts, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
         FROM (
             SELECT
-                $1:ticker::TEXT                                                      AS ticker,
+                $1:ticker::TEXT                                                        AS stock_symbol,
+                /* Event ms → TIMESTAMP_NTZ → DATE (keep raw ts below) */
+                TO_DATE(TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)) AS polygon_trade_date,
+                TO_TIMESTAMP_NTZ(TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000)           AS polygon_bar_ts,
 
-                /* Event ms → TIMESTAMP_NTZ → DATE */
-                TO_DATE(
-                  TO_TIMESTAMP_NTZ( TRY_TO_NUMBER($1:results[0]:t::STRING) / 1000 )
-                )                                                                     AS polygon_trade_date,
+                TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                          AS volume,
+                TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)          AS vwap,
+                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)           AS "open",
+                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)           AS "close",
+                TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)           AS high,
+                TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)           AS low,
+                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                          AS transactions,
 
-                TRY_TO_NUMBER($1:results[0]:v::STRING)::BIGINT                        AS volume,
-                TRY_TO_NUMBER($1:results[0]:vw::STRING, 38, 12)::NUMERIC(19,4)        AS vwap,
-                TRY_TO_NUMBER($1:results[0]:o::STRING, 38, 12)::NUMERIC(19,4)         AS "open",
-                TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS "close",
-                TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
-                TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
-                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                         AS transactions,
-
-                METADATA$FILENAME::TEXT                                               AS source_file,
-                METADATA$FILE_ROW_NUMBER::BIGINT                                       AS source_row_number
+                METADATA$FILENAME::TEXT                                                 AS source_file,
+                METADATA$FILE_ROW_NUMBER::BIGINT                                         AS source_row_number
             FROM {FQ_STAGE}
         )
         FILES = ({files_clause})
@@ -253,6 +265,36 @@ def polygon_stocks_load_dag():
             return 0
         print("Skipping transformed COPY validation: VALIDATION_MODE not supported with SELECT loads.")
         return 0
+
+    @task(retries=1)
+    def probe_validate_batch(batch: list[str]) -> int:
+        """
+        Optional non-transform JSON validation: dry-run COPY that returns errors.
+        Checks JSON/compression/access before the transformed load.
+        Enabled when SNOWFLAKE_PROBE_VALIDATE=TRUE.
+        """
+        if not DO_PROBE_VALIDATE or not batch:
+            return 0
+
+        files_clause = ", ".join(f"'{k}'" for k in batch)
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+
+        # Ensure temp table exists (target for COPY; data won't be loaded due to VALIDATION_MODE)
+        hook.run("CREATE TEMP TABLE IF NOT EXISTS TMP_JSON_VALIDATION (v VARIANT);")
+
+        rows = hook.get_records(f"""
+            COPY INTO TMP_JSON_VALIDATION
+            FROM {FQ_STAGE}
+            FILES = ({files_clause})
+            FILE_FORMAT = (TYPE = 'JSON')
+            VALIDATION_MODE = 'RETURN_ERRORS';
+        """) or []
+
+        if rows:
+            # Each row describes an error (row/file/error). Raise with first error for brevity.
+            raise RuntimeError(f"Probe validation failed for {len(rows)} row(s); first error: {rows[0]}")
+        print(f"Probe validated batch of {len(batch)} files (no errors).")
+        return len(batch)
 
     @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET], retries=2)
     def copy_batch_to_snowflake(batch: list[str]) -> int:
@@ -276,7 +318,7 @@ def polygon_stocks_load_dag():
         return total
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Flow
+    # Flow (dependency fix + optional probe) — dynamic mapping (no parse-time len())
     # ────────────────────────────────────────────────────────────────────────────
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
@@ -284,11 +326,12 @@ def polygon_stocks_load_dag():
     remaining = prefilter_already_loaded(rel_keys)
     batches = chunk_keys(remaining)
 
-    validated_counts = validate_batch_in_snowflake.expand(batch=batches)
+    _validated = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
+    _probed = probe_validate_batch.expand(batch=batches)            # gated by DO_PROBE_VALIDATE
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
     total = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> rel_keys >> remaining >> batches >> validated_counts >> loaded_counts >> total
+    tbl >> stage_ok >> rel_keys >> remaining >> batches >> _validated >> _probed >> loaded_counts >> total
 
 
 # Instantiate the DAG
