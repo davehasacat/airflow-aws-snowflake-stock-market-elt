@@ -3,7 +3,7 @@
 # Polygon Stocks → Snowflake (Loader) — lineage-aware & dbt-incremental friendly
 # -----------------------------------------------------------------------------
 # Loads raw JSON(.gz) produced by the stocks ingest DAG from S3 (external stage)
-# into a typed landing table. Supports flat and pointer manifests.
+# into a typed landing table (RAW schema). Supports flat and pointer manifests.
 # Adds lineage columns for dbt incremental models.
 # =============================================================================
 
@@ -39,6 +39,7 @@ DO_VALIDATE = os.getenv("SNOWFLAKE_COPY_VALIDATE", "FALSE").upper() == "TRUE"
 PREFILTER_LOADED = os.getenv("SNOWFLAKE_PREFILTER_LOADED", "TRUE").upper() == "TRUE"
 COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # 7d
 
+
 @dag(
     dag_id="polygon_stocks_load",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
@@ -54,22 +55,28 @@ def polygon_stocks_load_dag():
     # Resolve Snowflake context (from Secrets-backed connection extras)
     # ────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
-    x = conn.extra_dejson or {}
+    x = (conn.extra_dejson or {})
 
+    # Required
     SF_DB = x.get("database")
-    SF_SCHEMA = x.get("schema")
-    if not SF_DB or not SF_SCHEMA:
+    if not SF_DB:
         raise ValueError(
-            "Snowflake connection extras must include 'database' and 'schema'. "
-            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
+            "Snowflake connection extras must include 'database' in secret "
+            "'airflow/connections/snowflake_default' (extras)."
         )
 
-    STAGE_NAME = x.get("stage", "s3_stage")                      # external stage already configured
+    # Table target (RAW by default)
+    TABLE_SCHEMA = x.get("table_schema", x.get("raw_schema", "RAW"))
     TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
 
-    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"              # for COPY
-    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"         # for DESC/SHOW
+    # Stage location (PUBLIC.S3_STAGE by default per setup script)
+    STAGE_DB = x.get("stage_db", SF_DB)
+    STAGE_SCHEMA = x.get("stage_schema", "PUBLIC")
+    STAGE_NAME = x.get("stage", "S3_STAGE")
+
+    FQ_TABLE = f"{SF_DB}.{TABLE_SCHEMA}.{TABLE_NAME}"
+    FQ_STAGE = f"@{STAGE_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"        # for COPY
+    FQ_STAGE_NO_AT = f"{STAGE_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"    # for DESC/SHOW
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -174,7 +181,6 @@ def polygon_stocks_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         lookback = COPY_HISTORY_LOOKBACK_HOURS
-        # NOTE: copy_history returns FILE_NAME values that match FILES=() paths (stage-relative).
         sql = f"""
         with hist as (
           select FILE_NAME
@@ -228,7 +234,7 @@ def polygon_stocks_load_dag():
                 TRY_TO_NUMBER($1:results[0]:c::STRING, 38, 12)::NUMERIC(19,4)         AS "close",
                 TRY_TO_NUMBER($1:results[0]:h::STRING, 38, 12)::NUMERIC(19,4)         AS high,
                 TRY_TO_NUMBER($1:results[0]:l::STRING, 38, 12)::NUMERIC(19,4)         AS low,
-                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                         AS transactions,
+                TRY_TO_NUMBER($1:results[0]:n::STRING)::BIGINT                        AS transactions,
 
                 METADATA$FILENAME::TEXT                                               AS source_file,
                 METADATA$FILE_ROW_NUMBER::BIGINT                                       AS source_row_number
@@ -287,7 +293,7 @@ def polygon_stocks_load_dag():
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
     total = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> remaining >> batches >> validated_counts >> loaded_counts >> total
+    tbl >> stage_ok >> rel_keys >> remaining >> batches >> validated_counts >> loaded_counts >> total
 
 
 # Instantiate the DAG

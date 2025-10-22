@@ -3,7 +3,7 @@
 # Polygon Options → Snowflake (Loader) — lineage-aware & dbt-incremental friendly
 # -----------------------------------------------------------------------------
 # Loads raw JSON(.gz) produced by the options ingest DAG from S3 (external stage)
-# into a typed landing table. Supports flat and pointer manifests.
+# into a typed landing table (RAW schema). Supports flat and pointer manifests.
 # Adds lineage columns for dbt incremental models.
 # =============================================================================
 
@@ -61,22 +61,28 @@ def polygon_options_load_dag():
     # Resolve Snowflake context (from Secrets-backed connection extras)
     # ────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
-    x = conn.extra_dejson or {}
+    x = (conn.extra_dejson or {})
 
+    # Required
     SF_DB = x.get("database")
-    SF_SCHEMA = x.get("schema")
-    if not SF_DB or not SF_SCHEMA:
+    if not SF_DB:
         raise ValueError(
-            "Snowflake connection extras must include 'database' and 'schema'. "
-            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
+            "Snowflake connection extras must include 'database' in secret "
+            "'airflow/connections/snowflake_default' (extras)."
         )
 
-    STAGE_NAME = x.get("stage", "s3_stage")                           # external stage already configured
-    TABLE_NAME = x.get("options_table", "source_polygon_options_raw")  # landing table name overrideable via extras
+    # Table target (RAW by default)
+    TABLE_SCHEMA = x.get("table_schema", x.get("raw_schema", "RAW"))
+    TABLE_NAME = x.get("options_table", "source_polygon_options_raw")
 
-    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"                    # for COPY
-    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"               # for DESC/SHOW
+    # Stage location (PUBLIC.S3_STAGE by default per setup script)
+    STAGE_DB = x.get("stage_db", SF_DB)
+    STAGE_SCHEMA = x.get("stage_schema", "PUBLIC")
+    STAGE_NAME = x.get("stage", "S3_STAGE")
+
+    FQ_TABLE = f"{SF_DB}.{TABLE_SCHEMA}.{TABLE_NAME}"
+    FQ_STAGE = f"@{STAGE_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"     # for COPY
+    FQ_STAGE_NO_AT = f"{STAGE_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"  # for DESC/SHOW
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
