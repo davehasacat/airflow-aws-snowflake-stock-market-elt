@@ -2,6 +2,16 @@
 # =============================================================================
 # Polygon Stocks → S3 (Daily) — Connection-aware key lookup + header auth
 # Incremental-friendly: gzip output + audit/lineage fields at root.
+#
+# Enterprise/modern updates:
+#   • S3 layout (Hive-style): raw/stocks/year=YYYY/month=MM/day=DD/ticker=<T>.json.gz
+#   • Per-day manifest (immutable): raw/manifests/stocks/YYYY-MM-DD/manifest.txt
+#   • “Latest” manifest is a POINTER file (not a copy of the manifest contents):
+#         raw/manifests/polygon_stocks_manifest_latest.txt
+#         → contains a single line: POINTER=raw/manifests/stocks/YYYY-MM-DD/manifest.txt
+#   • Dataset emit happens only after the pointer is atomically updated
+#   • All S3 writes encrypted at rest (encrypt=True)
+#   • Static start_date, catchup=False, and pool inheritance for uniform throttling
 # =============================================================================
 from __future__ import annotations
 import os
@@ -21,99 +31,59 @@ from urllib3.util.retry import Retry
 from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.exceptions import AirflowSkipException
-from airflow.models import Variable
 from airflow.hooks.base import BaseHook
 
 from dags.utils.polygon_datasets import S3_STOCKS_MANIFEST_DATASET
 
 POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Config / Constants
+# ────────────────────────────────────────────────────────────────────────────────
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-stocks-daily (auto)")
 API_POOL = os.getenv("API_POOL", "api_pool")
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
+REQUEST_JITTER_SECONDS = float(os.getenv("POLYGON_REQUEST_JITTER_SECONDS", "0.05"))
 
-LATEST_MANIFEST_KEY = os.getenv("STOCKS_MANIFEST_KEY", "raw/manifests/manifest_latest.txt")
-DAILY_MANIFEST_PREFIX = os.getenv("STOCKS_DAILY_MANIFEST_PREFIX", "raw/manifests/stocks/daily")
+# Manifests: immutable per-day + mutable pointer
+DAY_MANIFEST_PREFIX = os.getenv("STOCKS_DAY_MANIFEST_PREFIX", "raw/manifests/stocks")
+LATEST_POINTER_KEY  = os.getenv("STOCKS_LATEST_POINTER_KEY", "raw/manifests/polygon_stocks_manifest_latest.txt")
 
-
-def _extract_api_key_from_conn(conn) -> str | None:
-    if conn and conn.password and conn.password.strip():
-        return conn.password.strip()
-    if conn and conn.login and conn.login.strip():
-        return conn.login.strip()
-    try:
-        extra = (conn.extra_dejson or {}) if conn else {}
-        v = extra.get("api_key")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    except Exception:
-        pass
-    return None
-
-
+# ────────────────────────────────────────────────────────────────────────────────
+# Auth helpers (connection-first; env fallback)
+# ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_stocks_key() -> str:
-    # 1) Connection: airflow/connections/polygon_stocks_api_key
+    """
+    Retrieve Polygon Stocks API key from Airflow Connection 'polygon_stocks_api_key'
+    (password/login/extras.api_key), else env POLYGON_STOCKS_API_KEY.
+    """
     try:
         conn = BaseHook.get_connection("polygon_stocks_api_key")
-        s = _extract_api_key_from_conn(conn)
-        if s:
-            return s
+        for candidate in (conn.password, conn.login):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        extra = (conn.extra_dejson or {})
+        for k in ("api_key", "key", "token", "password", "polygon_stocks_api_key", "value"):
+            v = extra.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
     except Exception:
         pass
 
-    # 2) Variable: airflow/variables/polygon_stocks_api_key
-    try:
-        v = Variable.get("polygon_stocks_api_key", deserialize_json=True)
-        if isinstance(v, dict):
-            for k in ("polygon_stocks_api_key", "api_key", "key", "value"):
-                s = v.get(k)
-                if isinstance(s, str) and s.strip():
-                    return s.strip()
-            if len(v) == 1:
-                s = next(iter(v.values()))
-                if isinstance(s, str) and s.strip():
-                    return s.strip()
-    except Exception:
-        pass
-    try:
-        s = Variable.get("polygon_stocks_api_key")
-        if s:
-            s = s.strip()
-            if s.startswith("{"):
-                try:
-                    obj = json.loads(s)
-                    if isinstance(obj, dict):
-                        for k in ("polygon_stocks_api_key", "api_key", "key", "value"):
-                            v2 = obj.get(k)
-                            if isinstance(v2, str) and v2.strip():
-                                return v2.strip()
-                        if len(obj) == 1:
-                            v2 = next(iter(obj.values()))
-                            if isinstance(v2, str) and v2.strip():
-                                return v2.strip()
-                except Exception:
-                    pass
-            return s
-    except Exception:
-        pass
-
-    # 3) Env
     env = os.getenv("POLYGON_STOCKS_API_KEY", "").strip()
     if env:
         return env
-
     raise RuntimeError(
         "Missing Polygon API key. Provide one via either:\n"
         "- Connection: airflow/connections/polygon_stocks_api_key (password/login/extra.api_key), or\n"
-        "- Variable:   airflow/variables/polygon_stocks_api_key, or\n"
         "- Env:        POLYGON_STOCKS_API_KEY"
     )
 
-
 def _session_with_auth(api_key: str) -> requests.Session:
+    """HTTP session with retry + Bearer token auth (apiKey not required for grouped endpoint)."""
     s = requests.Session()
     retries = Retry(
         total=6,
@@ -123,36 +93,51 @@ def _session_with_auth(api_key: str) -> requests.Session:
         raise_on_status=False,
         respect_retry_after_header=True,
     )
-    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
+    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=64, pool_maxsize=64))
     s.headers.update({
         "User-Agent": USER_AGENT,
         "Authorization": f"Bearer {api_key}",
     })
     return s
 
-
-def _previous_trading_day(iso_date_str: str) -> str:
-    d = pendulum.parse(iso_date_str).subtract(days=1)
-    while d.day_of_week in (5, 6):  # Sat/Sun
+def _previous_trading_day_from_logical(logical: pendulum.DateTime) -> str:
+    """Previous business day (Fri for Sat/Sun); holidays handled by empty manifest skip."""
+    d = logical.subtract(days=1)
+    while d.day_of_week in (5, 6):  # 5=Sat, 6=Sun
         d = d.subtract(days=1)
     return d.to_date_string()
 
+# ────────────────────────────────────────────────────────────────────────────────
+# DAG
+# ────────────────────────────────────────────────────────────────────────────────
+default_args = {
+    "owner": "data-platform",
+    "retries": 3,
+    "retry_delay": pendulum.duration(minutes=5),
+    "pool": API_POOL,  # inherit API pool across tasks
+}
 
 @dag(
     dag_id="polygon_stocks_ingest_daily",
-    start_date=pendulum.now(tz="UTC"),
-    schedule="0 0 * * 1-5",
-    catchup=True,
+    description="Polygon stocks daily ingest — Hive-layout raw JSON.gz + per-day & latest manifests (pointer).",
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),  # static; daily ops don't use catchup
+    schedule="0 0 * * 1-5",   # weekdays; previous trading day logic inside task
+    catchup=False,
     tags=["ingestion", "polygon", "daily", "aws", "stocks"],
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=4),
+    default_args=default_args,
 )
 def polygon_stocks_ingest_daily_dag():
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
+    # ───────────────────────────────
+    # Inputs
+    # ───────────────────────────────
     @task
     def get_custom_tickers() -> list[str]:
+        """Read seed tickers from dbt seeds."""
         path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
         tickers: list[str] = []
         with open(path, mode="r", newline="") as csvfile:
@@ -164,15 +149,24 @@ def polygon_stocks_ingest_daily_dag():
             raise AirflowSkipException("No tickers found in dbt/seeds/custom_tickers.csv.")
         return tickers
 
-    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool=API_POOL)
+    # ───────────────────────────────
+    # Fetch grouped bars and write Hive-partitioned objects
+    # ───────────────────────────────
+    @task(retries=3, retry_delay=pendulum.duration(minutes=10))
     def get_grouped_daily_data_and_split(custom_tickers: list[str], **context) -> list[str]:
+        """
+        Calls Polygon grouped bars for the previous business day, filters to seed tickers,
+        writes one gz JSON per {ticker,day} under:
+            raw/stocks/year=YYYY/month=MM/day=DD/ticker=<T>.json.gz
+        Returns the list of written S3 keys.
+        """
         s3 = S3Hook()
         api_key = _get_polygon_stocks_key()
         sess = _session_with_auth(api_key)
         custom = set(custom_tickers)
 
-        execution_date: str = context["ds"]
-        target_date = _previous_trading_day(execution_date)
+        logical: pendulum.DateTime = context["logical_date"]
+        target_date = _previous_trading_day_from_logical(logical)
 
         url = POLYGON_GROUPED_URL.format(date=target_date)
         params = {"adjusted": "true"}
@@ -181,6 +175,7 @@ def polygon_stocks_ingest_daily_dag():
         if resp.status_code == 404:
             return []
         if resp.status_code in (401, 403):
+            # log and skip gracefully
             try:
                 j = resp.json()
                 msg = j.get("error") or j.get("message") or str(j)
@@ -199,7 +194,9 @@ def polygon_stocks_ingest_daily_dag():
         run_id = context["run_id"]
         now_utc = pendulum.now("UTC").to_iso8601_string()
 
+        yyyy, mm, dd = target_date.split("-")
         processed: list[str] = []
+
         for r in results:
             ticker = (r.get("T") or "").upper()
             if not ticker or ticker not in custom:
@@ -230,34 +227,56 @@ def polygon_stocks_ingest_daily_dag():
                 "run_id": run_id,
             }
 
-            # Write as gzip for faster loads and lower storage
+            # Write as gzip (encrypted)
             buf = BytesIO()
             with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
                 gz.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-            gz_bytes = buf.getvalue()
-
-            s3_key = f"raw/stocks/{ticker}/{target_date}.json.gz"
-            s3.load_bytes(gz_bytes, key=s3_key, bucket_name=BUCKET_NAME, replace=True)
+            s3_key = f"raw/stocks/year={yyyy}/month={mm}/day={dd}/ticker={ticker}.json.gz"
+            s3.load_bytes(buf.getvalue(), key=s3_key, bucket_name=BUCKET_NAME, replace=True, encrypt=True)
             processed.append(s3_key)
-            time.sleep(REQUEST_DELAY_SECONDS)
+            # light client-side throttle
+            time.sleep(REQUEST_DELAY_SECONDS + (REQUEST_JITTER_SECONDS or 0.0))
 
         return processed
 
-    @task(outlets=[S3_STOCKS_MANIFEST_DATASET])
-    def write_pointer_manifest(s3_keys: list[str], **context):
+    # ───────────────────────────────
+    # Manifest writing (immutable per-day + mutable pointer)
+    # ───────────────────────────────
+    @task
+    def write_day_manifest(s3_keys: list[str], **context) -> str | None:
+        """
+        Write an immutable per-day manifest listing all S3 keys written for the day.
+        Stored at: raw/manifests/stocks/YYYY-MM-DD/manifest.txt
+        """
         if not s3_keys:
-            raise AirflowSkipException("No S3 keys were processed.")
+            return None
+        logical: pendulum.DateTime = context["logical_date"]
+        target_date = _previous_trading_day_from_logical(logical)
         s3 = S3Hook()
-        ts = pendulum.now("UTC").format("YYYY-MM-DDTHH-mm-ss")
-        pointed_key = f"{DAILY_MANIFEST_PREFIX}/manifest_{ts}.txt"
+        manifest_key = f"{DAY_MANIFEST_PREFIX}/{target_date}/manifest.txt"
+        body = "\n".join(sorted(set(s3_keys))) + "\n"
+        s3.load_string(body, key=manifest_key, bucket_name=BUCKET_NAME, replace=True, encrypt=True)
+        return manifest_key
 
-        s3.load_string("\n".join(s3_keys), key=pointed_key, bucket_name=BUCKET_NAME, replace=True)
-        s3.load_string(f"POINTER={pointed_key}\n", key=LATEST_MANIFEST_KEY,
-                       bucket_name=BUCKET_NAME, replace=True)
-        print(f"✅ Updated manifest pointer: s3://{BUCKET_NAME}/{LATEST_MANIFEST_KEY} → {pointed_key} (files: {len(s3_keys)})")
+    @task(outlets=[S3_STOCKS_MANIFEST_DATASET])
+    def update_latest_pointer(day_manifest_key: str | None) -> str | None:
+        """
+        Atomically point 'latest' to the immutable per-day manifest via a POINTER file.
+        This is what the loader subscribes to.
+        """
+        if not day_manifest_key:
+            raise AirflowSkipException("No per-day manifest; skipping latest pointer.")
+        s3 = S3Hook()
+        pointer_body = f"POINTER={day_manifest_key}\n"
+        s3.load_string(pointer_body, key=LATEST_POINTER_KEY, bucket_name=BUCKET_NAME, replace=True, encrypt=True)
+        return LATEST_POINTER_KEY
 
+    # ───────────────────────────────
+    # Wiring
+    # ───────────────────────────────
     custom_tickers = get_custom_tickers()
     s3_keys = get_grouped_daily_data_and_split(custom_tickers)
-    write_pointer_manifest(s3_keys)
+    day_manifest = write_day_manifest(s3_keys)
+    _ = update_latest_pointer(day_manifest)
 
 polygon_stocks_ingest_daily_dag()
