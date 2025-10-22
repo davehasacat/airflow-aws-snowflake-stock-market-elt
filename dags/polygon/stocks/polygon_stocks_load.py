@@ -57,19 +57,23 @@ def polygon_stocks_load_dag():
     x = conn.extra_dejson or {}
 
     SF_DB = x.get("database")
-    SF_SCHEMA = x.get("schema")
-    if not SF_DB or not SF_SCHEMA:
+    if not SF_DB:
         raise ValueError(
-            "Snowflake connection extras must include 'database' and 'schema'. "
+            "Snowflake connection extras must include 'database'. "
             "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
         )
 
-    STAGE_NAME = x.get("stage", "s3_stage")                      # external stage already configured
+    # NEW: separate schemas for target table (RAW) and stage (STAGES)
+    RAW_SCHEMA = x.get("raw_schema", "RAW")
+    STAGE_SCHEMA = x.get("stage_schema", x.get("schema", "STAGES"))
+
+    STAGE_NAME = x.get("stage", "s3_stage")                       # external stage already configured
     TABLE_NAME = x.get("stocks_table", "source_polygon_stocks_raw")
 
-    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"              # for COPY
-    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"         # for DESC/SHOW
+    # Table goes to RAW schema; Stage stays in STAGES (or as configured)
+    FQ_TABLE = f"{SF_DB}.{RAW_SCHEMA}.{TABLE_NAME}"
+    FQ_STAGE = f"@{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"            # for COPY
+    FQ_STAGE_NO_AT = f"{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"       # for DESC/SHOW
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -174,7 +178,6 @@ def polygon_stocks_load_dag():
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
         lookback = COPY_HISTORY_LOOKBACK_HOURS
-        # NOTE: copy_history returns FILE_NAME values that match FILES=() paths (stage-relative).
         sql = f"""
         with hist as (
           select FILE_NAME
@@ -201,15 +204,15 @@ def polygon_stocks_load_dag():
             raise AirflowSkipException("No files to load after prefiltering.")
         return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
 
-    def _copy_sql(files_clause: str, validation_only: bool = False) -> str:
+    def _copy_sql(files: list[str]) -> str:
         """
-        Compose COPY or VALIDATION SQL. We:
-          - project JSON fields into typed columns
-          - include lineage columns via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
-          - allow both .json and .json.gz (COMPRESSION inferred from extension)
-          - rely on load history for idempotency (FORCE={FORCE})
+        Compose transformed COPY SQL:
+        - projects JSON fields into typed columns
+        - includes lineage via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
+        - supports .json and .json.gz
+        - relies on load history for idempotency (FORCE={FORCE})
         """
-        validate = " VALIDATION_MODE = 'RETURN_ERRORS'" if validation_only else ""
+        files_clause = ", ".join(f"'{k}'" for k in files)
         return f"""
         COPY INTO {FQ_TABLE}
           (ticker, polygon_trade_date, volume, vwap, "open", "close", high, low, transactions, source_file, source_row_number)
@@ -237,20 +240,19 @@ def polygon_stocks_load_dag():
         FILES = ({files_clause})
         FILE_FORMAT = (TYPE = 'JSON')
         ON_ERROR = '{ON_ERROR}'
-        FORCE = {FORCE}
-        {validate};
+        FORCE = {FORCE};
         """
 
     @task(retries=2)
     def validate_batch_in_snowflake(batch: list[str]) -> int:
-        """Optional dry-run validation. Returns the number of files checked."""
+        """
+        Validation step (transformed COPY) is a no-op: Snowflake doesn't support VALIDATION_MODE here.
+        We keep this for interface symmetry and logging.
+        """
         if not DO_VALIDATE or not batch:
             return 0
-        files_clause = ", ".join(f"'{k}'" for k in batch)
-        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(files_clause, validation_only=True))
-        print(f"Validated batch of {len(batch)} files for {FQ_TABLE}.")
-        return len(batch)
+        print("Skipping transformed COPY validation: VALIDATION_MODE not supported with SELECT loads.")
+        return 0
 
     @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET], retries=2)
     def copy_batch_to_snowflake(batch: list[str]) -> int:
@@ -261,9 +263,8 @@ def polygon_stocks_load_dag():
         """
         if not batch:
             return 0
-        files_clause = ", ".join(f"'{k}'" for k in batch)
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(files_clause, validation_only=False))
+        hook.run(_copy_sql(batch))
         print(f"Loaded batch of {len(batch)} files into {FQ_TABLE}.")
         return len(batch)
 
@@ -287,7 +288,7 @@ def polygon_stocks_load_dag():
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
     total = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> remaining >> batches >> validated_counts >> loaded_counts >> total
+    tbl >> stage_ok >> rel_keys >> remaining >> batches >> validated_counts >> loaded_counts >> total
 
 
 # Instantiate the DAG

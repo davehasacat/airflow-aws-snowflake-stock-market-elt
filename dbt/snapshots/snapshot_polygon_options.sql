@@ -2,13 +2,13 @@
 
 {{
     config(
-      target_schema='public',
+      target_schema='snapshots',
       unique_key="option_symbol || '_' || polygon_trade_date",
       strategy='timestamp',
       updated_at='inserted_at'
     )
 }}
 
-select * from {{ source('public', 'source_polygon_options_raw') }}
+select * from {{ source('raw', 'source_polygon_options_raw') }}
 
 {% endsnapshot %}

@@ -170,8 +170,8 @@ def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max
     tags=["ingestion", "polygon", "stocks", "backfill", "aws"],
     params={
         # Inclusive date range for backfill; weekends are skipped inside the DAG.
-        "start_date": Param(default="2025-10-06", type="string", description="Backfill start date (YYYY-MM-DD)."),
-        "end_date":   Param(default="2025-10-11", type="string", description="Backfill end date (YYYY-MM-DD)."),
+        "start_date": Param(default="2025-10-17", type="string", description="Backfill start date (YYYY-MM-DD)."),
+        "end_date":   Param(default="2025-10-17", type="string", description="Backfill end date (YYYY-MM-DD)."),
     },
     dagrun_timeout=timedelta(hours=12),
     max_active_runs=1,

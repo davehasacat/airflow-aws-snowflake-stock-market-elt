@@ -2,35 +2,17 @@
 # dbt Project Configuration
 # ---------------------------------------------------------------------
 # File: dbt/dbt_project.yml
-# Purpose:
-#   Defines your dbt project’s metadata, structure, and default configs.
-#   This file tells dbt where to find models, macros, tests, etc.,
-#   and how to build them (e.g., materializations, tags, documentation).
-#
-# Reference:
-#   https://docs.getdbt.com/docs/build/projects
 # =====================================================================
 
-# ---------------------------------------------------------------------
-# 📦 Basic project metadata
-# ---------------------------------------------------------------------
-name: "stock_market_elt"          # Unique project name (used in manifest + schema naming)
+name: "stock_market_elt"
 version: "1.0.0"
 config-version: 2
 
-# ---------------------------------------------------------------------
-# 🔗 Profile configuration
-# ---------------------------------------------------------------------
-# dbt uses this profile name to find credentials in:
-#   ~/.dbt/profiles.yml  (local)
-#   or rendered via Airflow in /tmp/dbt_profiles (in DAG runtime)
-# The Airflow DAGs in this project dynamically generate it from
-# the `snowflake_default` connection stored in AWS Secrets Manager.
+# dbt profile name (credentials come from the Airflow-rendered profile
+# sourced from the `snowflake_default` secret in AWS Secrets Manager)
 profile: "stock_market_elt"
 
-# ---------------------------------------------------------------------
-# 🗂️ Project paths (all relative to this dbt/ directory)
-# ---------------------------------------------------------------------
+# Project paths (relative to this dbt/ directory)
 model-paths: ["models"]
 analysis-paths: ["analyses"]
 test-paths: ["tests"]
@@ -38,56 +20,48 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
-# Clean up build artifacts with `dbt clean`
 clean-targets:
   - "target"
   - "dbt_packages"
 
 # ---------------------------------------------------------------------
-# 🏗️ Model configurations (by layer)
-# ---------------------------------------------------------------------
-# dbt lets you organize models into logical layers:
-# - staging: raw → clean
-# - intermediate: transformations & joins
-# - marts: final reporting-ready tables
-#
-# Each section below defines defaults for models in that folder.
+# Schema routing + materializations
 # ---------------------------------------------------------------------
 models:
   stock_market_elt:
-    # -----------------------------------------------------------------
-    # Global defaults (applied to all models in this project)
-    # -----------------------------------------------------------------
+    # Global defaults
     +persist_docs:
-      relation: true    # Attach doc strings to tables/views
-      columns: true     # Attach doc strings to columns
+      relation: true
+      columns: true
 
-    # -----------------------------------------------------------------
-    # 📊 Staging Layer
-    # -----------------------------------------------------------------
-    # - Cleans and standardizes raw data
-    # - Usually views (not tables)
-    staging:
+    # RAW: optional dbt views only (actual landing tables are created by Airflow)
+    raw:
+      +schema: raw
       +materialized: view
-      # +schema: stg                    # Uncomment for separate schema
-      +tags: ["staging"]
+      +tags: ["raw"]
 
-    # -----------------------------------------------------------------
-    # 🔄 Intermediate Layer
-    # -----------------------------------------------------------------
-    # - Handles joins, enrichments, and logic between staging + marts
-    # - Usually tables (for downstream performance)
-    intermediate:
-      +materialized: table
-      # +schema: int                    # Uncomment for separate schema
-      +tags: ["intermediate"]
+    # PREP: staging + intermediate (incremental by default; set unique_key per model)
+    prep:
+      +schema: prep
+      +materialized: incremental
+      +incremental_strategy: merge
+      +on_schema_change: append_new_columns
+      +tags: ["prep"]
 
-    # -----------------------------------------------------------------
-    # 🏁 Marts Layer (Final)
-    # -----------------------------------------------------------------
-    # - Business-ready datasets consumed by BI tools or dashboards
-    # - Materialized as tables
+    # MARTS: facts/dims (incremental by default; set unique_key per model)
     marts:
-      +materialized: table
-      # +schema: marts                  # Uncomment for separate schema
+      +schema: marts
+      +materialized: incremental
+      +incremental_strategy: merge
+      +on_schema_change: append_new_columns
       +tags: ["marts"]
+
+# Snapshots: dedicated schema
+snapshots:
+  stock_market_elt:
+    +schema: snapshots
+
+# Seeds: keep reference seeds near transforms
+seeds:
+  stock_market_elt:
+    +schema: prep

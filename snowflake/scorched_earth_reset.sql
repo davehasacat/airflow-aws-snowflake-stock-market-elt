@@ -1,149 +1,133 @@
-USE ROLE ACCOUNTADMIN;
-
--- SCORCHED EARTH: DROP ALL ELT OBJECTS (Snowflake Scripting)
-DECLARE
-  DB                STRING DEFAULT 'STOCKS_ELT_DB';
-  SCHEMA_NAME       STRING DEFAULT 'PUBLIC';
-  ROLE_NAME         STRING DEFAULT 'STOCKS_ELT_ROLE';
-  WH_ELT            STRING DEFAULT 'STOCKS_ELT_WH';
-  WH_DASH           STRING DEFAULT 'STOCKS_DASHBOARD_WH';
-  INTEGRATION_NAME  STRING DEFAULT 'S3_INTEGRATION';
-  STAGE_NAME        STRING DEFAULT 'S3_STAGE';
-  FF_JSON           STRING DEFAULT 'FF_JSON';
-  FF_CSV            STRING DEFAULT 'FF_CSV';
-  PROJECT_USER      STRING DEFAULT 'DAVEHASACAT';
-BEGIN
-  -- Revoke role from user (ignore if not granted)
-  BEGIN
-    EXECUTE IMMEDIATE 'REVOKE ROLE ' || ROLE_NAME || ' FROM USER ' || PROJECT_USER;
-  EXCEPTION WHEN STATEMENT_ERROR THEN
-    NULL;
-  END;
-
-  -- Drop stage & file formats (they may or may not exist)
-  EXECUTE IMMEDIATE 'DROP STAGE IF EXISTS ' || DB || '.' || SCHEMA_NAME || '.' || STAGE_NAME;
-  EXECUTE IMMEDIATE 'DROP FILE FORMAT IF EXISTS ' || DB || '.' || SCHEMA_NAME || '.' || FF_JSON;
-  EXECUTE IMMEDIATE 'DROP FILE FORMAT IF EXISTS ' || DB || '.' || SCHEMA_NAME || '.' || FF_CSV;
-
-  -- Suspend & drop warehouses
-  BEGIN
-    EXECUTE IMMEDIATE 'ALTER WAREHOUSE ' || WH_ELT || ' SUSPEND';
-  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
-  EXECUTE IMMEDIATE 'DROP WAREHOUSE IF EXISTS ' || WH_ELT;
-
-  BEGIN
-    EXECUTE IMMEDIATE 'ALTER WAREHOUSE ' || WH_DASH || ' SUSPEND';
-  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
-  EXECUTE IMMEDIATE 'DROP WAREHOUSE IF EXISTS ' || WH_DASH;
-
-  -- Drop database (cascades schema/tables/views)
-  EXECUTE IMMEDIATE 'DROP DATABASE IF EXISTS ' || DB;
-
-  -- Drop integration (must be after stages are gone)
-  EXECUTE IMMEDIATE 'DROP INTEGRATION IF EXISTS ' || INTEGRATION_NAME;
-
-  -- Drop role (must be after revokes)
-  EXECUTE IMMEDIATE 'DROP ROLE IF EXISTS ' || ROLE_NAME;
-END;
-
-
--- --------------    RUN THIS SECOND    -------------- --
-
+-- ==========================================================
+-- TRUE NUKE: Destroy STOCKS_ELT_DB environment (idempotent)
+-- Requires: ROLE = ACCOUNTADMIN
+-- ==========================================================
 
 USE ROLE ACCOUNTADMIN;
 
--- Vars (just for your notes; these are inlined below)
--- DB: STOCKS_ELT_DB
--- SCHEMA: PUBLIC
--- ROLE: STOCKS_ELT_ROLE
--- WHs: STOCKS_ELT_WH / STOCKS_DASHBOARD_WH
--- INTEGRATION: S3_INTEGRATION
--- STAGE: S3_STAGE
--- FFs: FF_JSON, FF_CSV
--- USER: DAVEHASACAT
--- S3 URL / ARN
--- s3://stock-market-elt/raw/
--- arn:aws:iam::586159464756:role/SnowflakeS3Role
-
--- Warehouses
-CREATE WAREHOUSE IF NOT EXISTS STOCKS_ELT_WH
-  WAREHOUSE_SIZE = SMALL
-  AUTO_SUSPEND   = 60
-  AUTO_RESUME    = TRUE
-  INITIALLY_SUSPENDED = TRUE
-  COMMENT = 'Primary ELT compute for stocks/options ingestion & transforms';
-
-CREATE WAREHOUSE IF NOT EXISTS STOCKS_DASHBOARD_WH
+-- Ensure we have a safe, tiny maintenance warehouse to run from.
+-- If it already exists this is a no-op.
+CREATE WAREHOUSE IF NOT EXISTS ADMIN_MAINT_WH
   WAREHOUSE_SIZE = XSMALL
   AUTO_SUSPEND   = 60
   AUTO_RESUME    = TRUE
   INITIALLY_SUSPENDED = TRUE
-  COMMENT = 'BI/analytics/dashboard compute';
+  COMMENT = 'Temporary admin warehouse for destructive ops';
 
--- Database & Schema
-CREATE DATABASE IF NOT EXISTS STOCKS_ELT_DB COMMENT = 'Dev database for stocks/options ELT';
-CREATE SCHEMA   IF NOT EXISTS STOCKS_ELT_DB.PUBLIC COMMENT = 'Default schema for ELT objects';
+-- Use maintenance warehouse so we are not using the target warehouses when dropping them.
+USE WAREHOUSE ADMIN_MAINT_WH;
 
--- Role
-CREATE ROLE IF NOT EXISTS STOCKS_ELT_ROLE COMMENT = 'Service role for Airflow/dbt running the ELT';
+-- Variables (edit these if your object names differ)
+DECLARE
+  DB_NAME          STRING DEFAULT 'STOCKS_ELT_DB';
+  ROLE_NAME        STRING DEFAULT 'STOCKS_ELT_ROLE';
+  WH_ELT           STRING DEFAULT 'STOCKS_ELT_WH';
+  WH_DASH          STRING DEFAULT 'STOCKS_DASHBOARD_WH';
+  MAINT_WH         STRING DEFAULT 'ADMIN_MAINT_WH';
+  INTEGRATION_NAME STRING DEFAULT 'S3_INTEGRATION';
+  STAGE_NAME       STRING DEFAULT 'S3_STAGE';
+  FF_JSON          STRING DEFAULT 'FF_JSON';
+  FF_CSV           STRING DEFAULT 'FF_CSV';
+  SERVICE_USER     STRING DEFAULT 'AIRFLOW_STOCKS_USER';
+  HUMAN_USER       STRING DEFAULT 'DAVEHASACAT';
+BEGIN
+  -- -----------------------
+  -- 1) Revoke role from users (best-effort)
+  -- -----------------------
+  BEGIN
+    EXECUTE IMMEDIATE 'REVOKE ROLE ' || ROLE_NAME || ' FROM USER ' || SERVICE_USER;
+  EXCEPTION WHEN STATEMENT_ERROR THEN
+    NULL;
+  END;
 
--- Storage Integration
-CREATE OR REPLACE STORAGE INTEGRATION S3_INTEGRATION
-  TYPE = EXTERNAL_STAGE
-  STORAGE_PROVIDER = S3
-  ENABLED = TRUE
-  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::586159464756:role/SnowflakeS3Role'
-  STORAGE_ALLOWED_LOCATIONS = ('s3://stock-market-elt/raw/')
-  COMMENT = 'Integration between Snowflake and S3 for ELT data (scoped to /raw folder)';
+  BEGIN
+    EXECUTE IMMEDIATE 'REVOKE ROLE ' || ROLE_NAME || ' FROM USER ' || HUMAN_USER;
+  EXCEPTION WHEN STATEMENT_ERROR THEN
+    NULL;
+  END;
 
--- File Formats
-CREATE OR REPLACE FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_JSON
-  TYPE = JSON
-  STRIP_OUTER_ARRAY = TRUE
-  COMMENT = 'Default JSON format for Polygon & other API payloads';
+  -- -----------------------
+  -- 2) Suspend other warehouses (best-effort), then drop them
+  --    We are running on MAINT_WH, so altering/dropping target WHs is safe.
+  -- -----------------------
+  BEGIN
+    EXECUTE IMMEDIATE 'ALTER WAREHOUSE ' || WH_ELT || ' SUSPEND';
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP WAREHOUSE IF EXISTS ' || WH_ELT;
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
 
-CREATE OR REPLACE FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_CSV
-  TYPE = CSV
-  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-  SKIP_HEADER = 1
-  NULL_IF = ('', 'NULL', 'null')
-  EMPTY_FIELD_AS_NULL = TRUE
-  COMMENT = 'CSV loader (headers in row 1)';
+  BEGIN
+    EXECUTE IMMEDIATE 'ALTER WAREHOUSE ' || WH_DASH || ' SUSPEND';
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP WAREHOUSE IF EXISTS ' || WH_DASH;
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
 
--- Stage
-CREATE OR REPLACE STAGE STOCKS_ELT_DB.PUBLIC.S3_STAGE
-  STORAGE_INTEGRATION = S3_INTEGRATION
-  URL = 's3://stock-market-elt/raw/'
-  FILE_FORMAT = STOCKS_ELT_DB.PUBLIC.FF_JSON
-  COMMENT = 'Stage for ELT raw data ingestion (restricted to /raw prefix)';
+  -- -----------------------
+  -- 3) If DB exists, switch into it and try to drop infra objects that require DB context.
+  --    Guarded so compile-time errors do not abort the entire script.
+  -- -----------------------
+  BEGIN
+    -- Try to set context to the DB; if DB doesn't exist, this block will be skipped by the exception handler
+    EXECUTE IMMEDIATE 'USE DATABASE ' || DB_NAME;
+    -- Attempt to drop stage and file formats in PUBLIC schema (unqualified now)
+    BEGIN
+      EXECUTE IMMEDIATE 'USE SCHEMA ' || DB_NAME || '.PUBLIC';
+      EXECUTE IMMEDIATE 'DROP STAGE IF EXISTS ' || STAGE_NAME;
+      EXECUTE IMMEDIATE 'DROP FILE FORMAT IF EXISTS ' || FF_JSON;
+      EXECUTE IMMEDIATE 'DROP FILE FORMAT IF EXISTS ' || FF_CSV;
+    EXCEPTION WHEN STATEMENT_ERROR THEN
+      -- if schema or objects missing, ignore and continue
+      NULL;
+    END;
+  EXCEPTION WHEN STATEMENT_ERROR THEN
+    -- DB does not exist or cannot be used; ignore and continue to global DROPs
+    NULL;
+  END;
 
--- Privileges
-GRANT USAGE, OPERATE, MONITOR ON WAREHOUSE STOCKS_ELT_WH       TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE, OPERATE, MONITOR ON WAREHOUSE STOCKS_DASHBOARD_WH TO ROLE STOCKS_ELT_ROLE;
+  -- -----------------------
+  -- 4) Drop the database (this cascades schemas/tables/views/stages/objects under it).
+  --    DROP DATABASE IF EXISTS is safe even if DB is missing.
+  -- -----------------------
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP DATABASE IF EXISTS ' || DB_NAME;
+  EXCEPTION WHEN STATEMENT_ERROR THEN
+    NULL;
+  END;
 
-GRANT USAGE         ON DATABASE STOCKS_ELT_DB        TO ROLE STOCKS_ELT_ROLE;
-GRANT CREATE SCHEMA ON DATABASE STOCKS_ELT_DB        TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE         ON SCHEMA   STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+  -- -----------------------
+  -- 5) Drop integration & any remaining account-scoped objects
+  -- -----------------------
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP INTEGRATION IF EXISTS ' || INTEGRATION_NAME;
+  EXCEPTION WHEN STATEMENT_ERROR THEN
+    NULL;
+  END;
 
-GRANT CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT,
-      CREATE PIPE, CREATE FUNCTION, CREATE PROCEDURE
-  ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+  -- -----------------------
+  -- 6) Revoke, drop service + human users (best-effort)
+  -- -----------------------
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP USER IF EXISTS ' || SERVICE_USER;
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
 
-GRANT USAGE ON INTEGRATION S3_INTEGRATION                TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE ON STAGE       STOCKS_ELT_DB.PUBLIC.S3_STAGE TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE ON FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_JSON  TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE ON FILE FORMAT STOCKS_ELT_DB.PUBLIC.FF_CSV   TO ROLE STOCKS_ELT_ROLE;
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP USER IF EXISTS ' || HUMAN_USER;
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
 
-GRANT ALL PRIVILEGES ON SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+  -- -----------------------
+  -- 7) Drop role (best-effort)
+  -- -----------------------
+  BEGIN
+    EXECUTE IMMEDIATE 'DROP ROLE IF EXISTS ' || ROLE_NAME;
+  EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON FUTURE TABLES       IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
-GRANT SELECT                          ON FUTURE VIEWS        IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE                           ON FUTURE STAGES       IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
-GRANT USAGE                           ON FUTURE FILE FORMATS IN SCHEMA STOCKS_ELT_DB.PUBLIC TO ROLE STOCKS_ELT_ROLE;
+  -- -----------------------
+  -- 8) Clean up the maintenance warehouse (optional): suspend & drop it
+  --    We drop it last so the script can use it until the very end.
+  -- -----------------------
+  BEGIN EXECUTE IMMEDIATE 'ALTER WAREHOUSE ' || MAINT_WH || ' SUSPEND'; EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
+  BEGIN EXECUTE IMMEDIATE 'DROP WAREHOUSE IF EXISTS ' || MAINT_WH; EXCEPTION WHEN STATEMENT_ERROR THEN NULL; END;
 
--- Assign role to your user
-GRANT ROLE STOCKS_ELT_ROLE TO USER DAVEHASACAT;
--- Optional defaults:
--- ALTER USER DAVEHASACAT SET DEFAULT_ROLE = STOCKS_ELT_ROLE;
--- ALTER USER DAVEHASACAT SET DEFAULT_WAREHOUSE = STOCKS_ELT_WH;
--- ALTER USER DAVEHASACAT SET DEFAULT_NAMESPACE = STOCKS_ELT_DB.PUBLIC;
+END;

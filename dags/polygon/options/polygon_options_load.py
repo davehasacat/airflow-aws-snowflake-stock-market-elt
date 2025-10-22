@@ -57,26 +57,28 @@ DO_PROBE_VALIDATE = os.getenv("SNOWFLAKE_PROBE_VALIDATE", "FALSE").upper() == "T
 )
 def polygon_options_load_dag():
 
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────────
     # Resolve Snowflake context (from Secrets-backed connection extras)
-    # ────────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────────
     conn = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     x = conn.extra_dejson or {}
 
     SF_DB = x.get("database")
-    SF_SCHEMA = x.get("schema")
-    if not SF_DB or not SF_SCHEMA:
-        raise ValueError(
-            "Snowflake connection extras must include 'database' and 'schema'. "
-            "Edit secret 'airflow/connections/snowflake_default' extras accordingly."
-        )
+    # NEW: allow different schemas for stage vs target table
+    RAW_SCHEMA = x.get("raw_schema", "RAW")
+    STAGE_SCHEMA = x.get("stage_schema", x.get("schema", "STAGES"))
 
-    STAGE_NAME = x.get("stage", "s3_stage")                           # external stage already configured
-    TABLE_NAME = x.get("options_table", "source_polygon_options_raw")  # landing table name overrideable via extras
+    if not SF_DB:
+        raise ValueError("Snowflake connection extras must include 'database'.")
 
-    FQ_TABLE = f"{SF_DB}.{SF_SCHEMA}.{TABLE_NAME}"
-    FQ_STAGE = f"@{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"                    # for COPY
-    FQ_STAGE_NO_AT = f"{SF_DB}.{SF_SCHEMA}.{STAGE_NAME}"               # for DESC/SHOW
+    STAGE_NAME = x.get("stage", "s3_stage")                            # external stage name
+    TABLE_NAME = x.get("options_table", "source_polygon_options_raw")   # landing table name
+
+    # Table goes to RAW schema
+    FQ_TABLE = f"{SF_DB}.{RAW_SCHEMA}.{TABLE_NAME}"
+    # Stage stays in STAGES schema (or whatever you set in extras)
+    FQ_STAGE = f"@{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
+    FQ_STAGE_NO_AT = f"{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
 
     if not BUCKET_NAME:
         raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
