@@ -2,22 +2,24 @@
 # =============================================================================
 # Polygon Options Backfill (Ingestion)
 # -----------------------------------------------------------------------------
-# Enterprise updates aligned to the new stream/backfill split:
+# Enterprise strategy (stream/backfill split):
 #   1) S3 layout (Hive-style): raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
 #   2) Per-day manifests (immutable): raw/manifests/options/YYYY-MM-DD/manifest.txt
-#      - NOTE: This backfill DAG does NOT update the "latest" pointer and does NOT emit a Dataset.
-#        Daily stream loading is triggered only by the daily ingest DAG.
+#      - Default: this backfill DAG does NOT update the "latest" pointer and thus
+#        does NOT emit a Dataset (keeps stream loader idle).
+#      - Opt-in: pass update_latest_pointer=true in dag_run.conf to write the pointer
+#        and emit the Dataset to trigger polygon_options_load.
 #   3) Contract filter: only contracts "alive" on target day (list_date ≤ day ≤ expiration_date)
-#   4) XCom-safety: workers return small {day:count} maps; manifests are built via S3 listing
+#   4) Small XComs: workers return tiny {day:count} maps; manifests built via S3 listing
 #   5) Retry & rate-limit hardened: Bearer auth + apiKey param, 429/5xx handling
-#   6) Observability: per-(day,underlying) worklogs under raw/manifests/options/worklogs/YYYY-MM-DD/<U>.log
+#   6) Observability: per-(day,underlying) worklogs at raw/manifests/options/worklogs/YYYY-MM-DD/<U>.log
 #   7) Encrypted S3 writes by default (encrypt=True)
 # =============================================================================
 from __future__ import annotations
 
+import os
 import csv
 import json
-import os
 import time
 import gzip
 from io import BytesIO
@@ -30,10 +32,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from airflow.decorators import dag, task
+from airflow.operators.python import get_current_context
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
+
+from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config / Constants
@@ -41,7 +46,7 @@ from airflow.hooks.base import BaseHook
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
-BUCKET_NAME = os.getenv("BUCKET_NAME")
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
@@ -59,7 +64,9 @@ DISABLE_CONTRACT_DATE_FILTER = os.getenv(
     "POLYGON_DISABLE_CONTRACT_DATE_FILTER", "false"
 ).lower() in ("1","true","yes")
 
-DAY_MANIFEST_PREFIX = "raw/manifests/options"  # per-day manifests live under: <prefix>/<YYYY-MM-DD>/manifest.txt
+# Manifests (immutable per-day) + optional latest pointer
+DAY_MANIFEST_PREFIX = os.getenv("OPTIONS_DAY_MANIFEST_PREFIX", "raw/manifests/options")
+LATEST_POINTER_KEY  = os.getenv("OPTIONS_LATEST_POINTER_KEY", "raw/manifests/polygon_options_manifest_latest.txt")
 
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -69,7 +76,7 @@ if not BUCKET_NAME:
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_polygon_options_key() -> str:
     """
-    Resolve the Polygon Options API key from an Airflow Connection 'polygon_options_api_key',
+    Resolve the Polygon Options API key from Airflow Connection 'polygon_options_api_key',
     falling back to env POLYGON_OPTIONS_API_KEY.
     """
     try:
@@ -105,6 +112,7 @@ def _session(api_key: str) -> requests.Session:
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
+        respect_retry_after_header=True,
     )
     s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=64, pool_maxsize=64))
     s.headers.update({
@@ -127,8 +135,7 @@ def _rate_limited_get(sess: requests.Session, url: str, params: dict | None, max
         resp = sess.get(url, params=params, timeout=REQUEST_TIMEOUT_SECS)
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
-            sleep_s = float(retry_after) if retry_after else delay
-            time.sleep(sleep_s)
+            time.sleep(float(retry_after) if retry_after else delay)
             delay *= backoff
             tries += 1
         elif 500 <= resp.status_code < 600:
@@ -165,9 +172,16 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────────
 # DAG
 # ────────────────────────────────────────────────────────────────────────────────
+default_args = {
+    "owner": "data-platform",
+    "retries": 3,
+    "retry_delay": pendulum.duration(minutes=5),
+    "pool": API_POOL,
+}
+
 @dag(
     dag_id="polygon_options_ingest_backfill",
-    description="Polygon options backfill ingest — writes raw JSON.gz & immutable per-day manifests (no latest pointer updates).",
+    description="Polygon options backfill ingest — raw JSON.gz & immutable per-day manifests (pointer update optional).",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=None,           # manual runs only
     catchup=False,
@@ -175,9 +189,13 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
     params={
         "start_date": Param(default="2025-10-17", type="string", description="Backfill start date (YYYY-MM-DD)"),
         "end_date":   Param(default="2025-10-17", type="string", description="Backfill end date (YYYY-MM-DD)"),
+        # Opt-in: update 'latest' pointer and emit Dataset to trigger polygon_options_load
+        "update_latest_pointer": Param(default=False, type="boolean",
+                                       description="When true, write 'latest' POINTER and emit Dataset"),
     },
     dagrun_timeout=timedelta(hours=36),
     max_active_runs=1,
+    default_args=default_args,
 )
 def polygon_options_ingest_backfill_dag():
 
@@ -268,7 +286,7 @@ def polygon_options_ingest_backfill_dag():
             p = resp.json() or {}
             all_recs.extend([r for r in (p.get("results") or []) if r and r.get("ticker")])
             next_url = p.get("next_url")
-            time.sleep(REQUEST_DELAY_SECONDS)
+            time.sleep(REQUEST_DELAY_SECONDS + REQUEST_JITTER_SECONDS)
 
         filtered = [r for r in all_recs if _alive_on_day(r, target_date)]
         contracts = sorted({r["ticker"] for r in filtered})
@@ -381,7 +399,7 @@ def polygon_options_ingest_backfill_dag():
                     bump(target_date, underlying, "err_other")
                     continue
 
-                time.sleep(REQUEST_DELAY_SECONDS)
+                time.sleep(REQUEST_DELAY_SECONDS + REQUEST_JITTER_SECONDS)
 
             if wrote:
                 counts_by_day[target_date] = counts_by_day.get(target_date, 0) + wrote
@@ -437,6 +455,35 @@ def polygon_options_ingest_backfill_dag():
         return manifest_keys
 
     # ───────────────────────────────
+    # Optional: update "latest" pointer and emit Dataset (opt-in)
+    # ───────────────────────────────
+    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
+    def maybe_update_latest_pointer(manifest_keys: List[str]) -> None:
+        """
+        Optionally update the mutable 'latest' POINTER so downstream loaders see a dataset event.
+        Controlled by dag_run.conf/params.update_latest_pointer (default False).
+        - If False: task SKIPs (no Dataset event; loaders won't trigger).
+        - If True:  writes POINTER=<latest per-day manifest> and SUCCEEDS (emits Dataset).
+        """
+        ctx = get_current_context()
+        do_update = bool(ctx["params"].get("update_latest_pointer"))
+
+        if not do_update:
+            # Skip on purpose so we do NOT emit an event or alter the pointer.
+            raise AirflowSkipException("update_latest_pointer=False — not updating pointer.")
+
+        if not manifest_keys:
+            # Nothing to point to → skip (no event emission)
+            raise AirflowSkipException("No per-day manifests; leaving latest pointer unchanged.")
+
+        latest_mkey = sorted(manifest_keys)[-1]
+        s3 = S3Hook()
+        pointer_body = f"POINTER={latest_mkey}\n"
+        s3.load_string(pointer_body, key=LATEST_POINTER_KEY, bucket_name=BUCKET_NAME,
+                       replace=True, encrypt=True)
+        print(f"✅ Updated latest pointer: s3://{BUCKET_NAME}/{LATEST_POINTER_KEY} → {latest_mkey}")
+
+    # ───────────────────────────────
     # Wiring
     # ───────────────────────────────
     underlyings   = read_underlyings()
@@ -452,8 +499,9 @@ def polygon_options_ingest_backfill_dag():
     day_counts_list    = process_chunk.expand(specs=chunked_specs)
     counts_by_day      = merge_day_counts(day_counts_list)
 
-    # Build immutable per-day manifests (NO pointer update)
-    _day_manifests     = write_day_manifests_from_s3(trading_days, counts_by_day)
+    # Build immutable per-day manifests; optionally update pointer (opt-in)
+    day_manifests      = write_day_manifests_from_s3(trading_days, counts_by_day)
+    _ = maybe_update_latest_pointer(day_manifests)
 
 
 # Instantiate

@@ -1,17 +1,26 @@
 # dags/polygon/options/polygon_options_ingest_daily.py
 # =============================================================================
-# Polygon Options Ingest (Daily) — backfill-parity raw ingest
+# Polygon Options Ingest (Daily) — stream path aligned to dbt incremental strategy
 # -----------------------------------------------------------------------------
-# Enterprise/modern updates:
-#   • S3 layout (Hive-style): raw/options/year=YYYY/month=%m/day=%d/underlying=<U>/contract=<C>.json.gz
-#   • Per-day manifest is immutable at: raw/manifests/options/YYYY-MM-DD/manifest.txt
-#   • “Latest” manifest is a POINTER file (not a copy of the manifest contents):
-#         raw/manifests/polygon_options_manifest_latest.txt
-#         → contains a single line: POINTER=raw/manifests/options/YYYY-MM-DD/manifest.txt
+# Enterprise/modern strategy:
+#   • S3 layout (Hive-style):
+#       raw/options/year=YYYY/month=%m/day=%d/underlying=<U>/contract=<C>.json.gz
+#   • Per-day manifest (immutable):
+#       raw/manifests/options/YYYY-MM-DD/manifest.txt
+#   • “Latest” manifest is a POINTER file (tiny & stable):
+#       raw/manifests/polygon_options_manifest_latest.txt
+#       → single line: POINTER=raw/manifests/options/YYYY-MM-DD/manifest.txt
 #   • Dataset emit happens only after the pointer is atomically updated
-#   • All S3 writes encrypted at rest (encrypt=True)
-#   • Static start_date, catchup=False, and pool inheritance for uniform throttling
-#   • Idempotent file writes via deterministic keys; skip on empty/404 responses
+#   • All S3 writes encrypted at rest (encrypt=True) with deterministic keys
+#   • Previous-business-day targeting using Airflow’s logical date
+#   • Connection-aware API key resolution + robust retries/backoff/throttling
+#   • Output JSON includes minimal lineage fields to aid dbt incremental models:
+#       as_of_date (YYYY-MM-DD), ingested_at_utc (ISO8601)
+#
+# dbt fit (incremental MERGE-friendly):
+#   • Loader projects into RAW with lineage columns, append-only, idempotent
+#   • dbt staging models can use `inserted_at` (loader-populated) or event time
+#   • Daily stream updates trigger downstream loaders via Dataset subscription
 # =============================================================================
 
 from __future__ import annotations
@@ -44,17 +53,20 @@ from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
 POLYGON_CONTRACTS_URL = "https://api.polygon.io/v3/reference/options/contracts"
 POLYGON_AGGS_URL_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
-BUCKET_NAME = os.getenv("BUCKET_NAME")
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: 'stock-market-elt'
 DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
 
 REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-options-daily (auto)")
-API_POOL = "api_pool"
+API_POOL = os.getenv("API_POOL", "api_pool")
 
 CONTRACT_BATCH_SIZE = int(os.getenv("OPTIONS_DAILY_CONTRACT_BATCH_SIZE", "400"))
 REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
 REQUEST_JITTER_SECONDS = float(os.getenv("POLYGON_REQUEST_JITTER_SECONDS", "0.05"))
 REPLACE_FILES = os.getenv("DAILY_REPLACE", "true").lower() == "true"
+
+# Optional cap as a guardrail around huge discovery fans (0 = no cap)
+MAX_CONTRACTS_PER_UNDERLYING = int(os.getenv("OPTIONS_MAX_CONTRACTS_PER_UNDERLYING", "0"))
 
 # Toggle the date-alive filter (same env flag used by backfill)
 DISABLE_CONTRACT_DATE_FILTER = os.getenv(
@@ -62,8 +74,8 @@ DISABLE_CONTRACT_DATE_FILTER = os.getenv(
 ).lower() in ("1", "true", "yes")
 
 # Manifests: immutable per-day + mutable pointer
-DAY_MANIFEST_PREFIX = "raw/manifests/options"
-LATEST_POINTER_KEY = "raw/manifests/polygon_options_manifest_latest.txt"
+DAY_MANIFEST_PREFIX = os.getenv("OPTIONS_DAY_MANIFEST_PREFIX", "raw/manifests/options")
+LATEST_POINTER_KEY = os.getenv("OPTIONS_LATEST_POINTER_KEY", "raw/manifests/polygon_options_manifest_latest.txt")
 
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -113,6 +125,7 @@ def _session(api_key: str) -> requests.Session:
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
+        respect_retry_after_header=True,  # honor vendor-provided backoff precisely
     )
     s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=64, pool_maxsize=64))
     s.headers.update({
@@ -168,7 +181,7 @@ def _alive_on_day(rec: Dict[str, Any], day_iso: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────────
 @dag(
     dag_id="polygon_options_ingest_daily",
-    description="Polygon options daily ingest (backfill-parity): raw JSON.gz to S3 + per-day & latest manifests.",
+    description="Polygon options daily ingest (backfill-parity): raw JSON.gz to S3 + immutable per-day manifest + POINTER latest.",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),  # static start; daily ops don’t use catchup
     schedule="0 0 * * 1-5",  # weekdays; compute_target_date handles previous biz day logic
     catchup=False,            # backfills are handled by the dedicated backfill DAG
@@ -221,6 +234,7 @@ def polygon_options_ingest_daily_dag():
             Return {'underlying': <seed ticker>, 'contracts': [tickers...]} after:
               • Pagination
               • Alive-on-day filtering (aligned with backfill)
+              • Optional cap to bound fan-out
             """
             api_key = _get_polygon_options_key()
             sess = _session(api_key)
@@ -253,6 +267,10 @@ def polygon_options_ingest_daily_dag():
             # Apply alive-on-day filter + de-dupe to list of tickers
             filtered = [r for r in all_recs if _alive_on_day(r, target_date)]
             contracts = sorted({r["ticker"] for r in filtered})
+
+            if MAX_CONTRACTS_PER_UNDERLYING and len(contracts) > MAX_CONTRACTS_PER_UNDERLYING:
+                contracts = contracts[:MAX_CONTRACTS_PER_UNDERLYING]
+
             return {"underlying": ticker, "contracts": contracts}
 
         @task
@@ -276,7 +294,7 @@ def polygon_options_ingest_daily_dag():
         return to_pairs(discoveries, target_date)
 
     # ───────────────────────────────
-    # Batching & Fetch (write only non-empty results)
+    # Batching & Fetch (write only non-empty results + lineage)
     # ───────────────────────────────
     @task
     def batch_pairs(pairs: List[Dict[str, str]]) -> List[List[Dict[str, str]]]:
@@ -290,6 +308,7 @@ def polygon_options_ingest_daily_dag():
         """
         Fetch daily bars per contract and write gzipped JSON to S3.
         Idempotent by key; only writes when Polygon returns non-empty 'results'.
+        Adds minimal lineage fields (as_of_date, ingested_at_utc) to aid dbt.
         """
         if not batch:
             return []
@@ -331,6 +350,10 @@ def polygon_options_ingest_daily_dag():
                 _sleep()
                 continue
 
+            # Add minimal lineage that downstream dbt can reference if needed
+            obj["as_of_date"] = target_date
+            obj["ingested_at_utc"] = pendulum.now("UTC").to_iso8601_string()
+
             buf = BytesIO()
             with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
                 gz.write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
@@ -348,7 +371,7 @@ def polygon_options_ingest_daily_dag():
         return written
 
     # ───────────────────────────────
-    # Manifest writing (immutable per-day + mutable pointer)
+    # Manifest writing (immutable per-day + hardened POINTER update)
     # ───────────────────────────────
     @task
     def flatten_keys(list_of_lists: List[List[str]]) -> List[str]:
@@ -379,11 +402,15 @@ def polygon_options_ingest_daily_dag():
         """
         Atomically point 'latest' to the immutable per-day manifest via a POINTER file.
         This is what the stream loader subscribes to.
+        Includes a content check to avoid emitting events for empty manifests.
         """
         if not day_manifest_key:
             raise AirflowSkipException("No per-day manifest; skipping latest pointer.")
-        pointer_body = f"POINTER={day_manifest_key}\n"
         s3 = S3Hook()
+        body = s3.read_key(key=day_manifest_key, bucket_name=BUCKET_NAME) or ""
+        if not body.strip():
+            raise AirflowSkipException(f"Per-day manifest is empty: {day_manifest_key}")
+        pointer_body = f"POINTER={day_manifest_key}\n"
         s3.load_string(
             pointer_body,
             key=LATEST_POINTER_KEY,
