@@ -19,17 +19,32 @@ airflow:
     # --------------------------------------------------
     # API Pool - limits outbound API concurrency
     # --------------------------------------------------
-    # Used by DAGs that make heavy external API calls
-    # (e.g., Polygon.io or other rate-limited vendors).
-    # Adjust slots based on vendor throughput & API key limits.
     - pool_name: "api_pool"
       pool_slot: 8
       pool_description: "Pool for controlling API-heavy tasks"
 
     # --------------------------------------------------
+    # LOAD Pool - limits Snowflake COPY concurrency (stream)
+    # --------------------------------------------------
+    - pool_name: "load_pool"
+      pool_slot: 4
+      pool_description: "Pool for Snowflake load tasks (stream loaders)"
+
+    # (Optional) Backfill loaders—keep tighter control to avoid WH thrash
+    - pool_name: "load_backfill_pool"
+      pool_slot: 1
+      pool_description: "Pool for Snowflake load tasks (backfill loaders)"
+
+    # --------------------------------------------------
     # Default Pool - fallback for all tasks without a pool
     # --------------------------------------------------
-    # Do not set this too low; it controls global concurrency.
     - pool_name: "default_pool"
       pool_slot: 128
       pool_description: "Default Airflow pool for general-purpose tasks"
+
+    # --------------------------------------------------
+    # Snowflake Pool - for Snowflake heavy tasks
+    # --------------------------------------------------
+    - pool_name: "snowflake_pool"
+      pool_slot: 6
+      pool_description: "Snowflake COPY/SQL concurrency limit for stocks/options loaders"

@@ -1,30 +1,28 @@
-# dags/polygon/options/polygon_options_load.py
+# dags/polygon/options/polygon_options_load_stream.py
 # =============================================================================
-# Polygon Options → Snowflake (Loader) — manual/backfill-friendly
+# Polygon Options → Snowflake (Load Stream)
 # -----------------------------------------------------------------------------
-# Loads raw JSON(.gz) produced by the options ingest DAGs from S3 (external stage)
-# into a typed RAW table. Supports both:
-#   • POINTER manifest:    single line "POINTER=raw/manifests/options/YYYY-MM-DD/manifest.txt"
-#   • Flat manifest:       one 'raw/options/.../*.json[.gz]' key per line
+# Stream loader subscribed to the *POINTER* manifest dataset produced by the
+# daily ingest DAG. It dereferences the pointer to an immutable per-day manifest,
+# loads the listed JSON(.gz) files from S3 external stage into a typed RAW table,
+# and emits a Snowflake dataset on success for downstream dbt jobs.
 #
 # Enterprise/modern behavior:
-#   • Transformed COPY SELECT → typed columns + lineage
-#   • Idempotent via Snowflake load history (FORCE=FALSE) + optional prefilter
-#   • Deterministic FILES=() batching for stable runtimes
-#   • Optional probe validation (VALIDATION_MODE on a temp table)
-#   • Stage-relative paths (strip 'raw/' → 'options/...') for COPY
-#   • Emits SNOWFLAKE_OPTIONS_RAW_DATASET for downstream dbt incremental models
-#
-# Usage patterns
-#   1) Backfill load (manual): trigger this DAG with {"manifest_key": "raw/manifests/options/2025-10-20/manifest.txt"}
-#      - You can also pass a POINTER file: {"manifest_key": "raw/manifests/polygon_options_manifest_latest.txt"}
-#   2) Daily stream: handled by polygon_options_load_stream (subscribes to Dataset)
+#   • Subscribes to S3_OPTIONS_MANIFEST_DATASET (POINTER file)
+#   • Pointer format: a single line →  "POINTER=raw/manifests/options/YYYY-MM-DD/manifest.txt"
+#   • Transformed COPY SELECT projects JSON to typed columns + lineage
+#   • Idempotent via Snowflake load history (FORCE=FALSE) and optional prefilter
+#   • Small, deterministic COPY batches to stabilize runtime
+#   • Optional probe validation step (VALIDATION_MODE on a temp table)
+#   • All S3 object paths are stage-relative (strip 'raw/' prefix)
+#   • Emits SNOWFLAKE_OPTIONS_RAW_DATASET for dbt incremental models
+#   • Pools to control concurrency: load_pool (configurable)
 # =============================================================================
 
 from __future__ import annotations
 import os
 from datetime import timedelta
-from typing import List, Tuple, Optional
+from typing import List
 
 import pendulum
 
@@ -33,9 +31,11 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
-from airflow.models.param import Param
 
-from dags.utils.polygon_datasets import SNOWFLAKE_OPTIONS_RAW_DATASET
+from dags.utils.polygon_datasets import (
+    S3_OPTIONS_MANIFEST_DATASET,
+    SNOWFLAKE_OPTIONS_RAW_DATASET,
+)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config (env-first; sensible defaults)
@@ -43,15 +43,18 @@ from dags.utils.polygon_datasets import SNOWFLAKE_OPTIONS_RAW_DATASET
 BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: stock-market-elt
 SNOWFLAKE_CONN_ID = os.getenv("SNOWFLAKE_CONN_ID", "snowflake_default")
 
+# Manifest pointer location (dataset must point here). Loader reads the file content.
+LATEST_POINTER_KEY = os.getenv(
+    "OPTIONS_LATEST_POINTER_KEY", "raw/manifests/polygon_options_manifest_latest.txt"
+)
+
 # COPY tuning
 BATCH_SIZE = int(os.getenv("SNOWFLAKE_COPY_BATCH_SIZE", "500"))      # FILES list size per COPY
 ON_ERROR = os.getenv("SNOWFLAKE_COPY_ON_ERROR", "ABORT_STATEMENT")   # or 'CONTINUE'
 FORCE = os.getenv("SNOWFLAKE_COPY_FORCE", "FALSE").upper()           # TRUE to bypass load history
 DO_VALIDATE = os.getenv("SNOWFLAKE_COPY_VALIDATE", "FALSE").upper() == "TRUE"
 PREFILTER_LOADED = os.getenv("SNOWFLAKE_PREFILTER_LOADED", "TRUE").upper() == "TRUE"
-
-# IMPROVEMENT #2: dynamic lookback — minimum from env, but auto-extends for deep backfills
-COPY_HISTORY_LOOKBACK_HOURS_MIN = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # default 7d (min)
+COPY_HISTORY_LOOKBACK_HOURS = int(os.getenv("SNOWFLAKE_COPY_HISTORY_LOOKBACK_HOURS", "168"))  # 7d
 
 # Optional: non-transform probe validation (fast-fail for JSON/compression/access)
 DO_PROBE_VALIDATE = os.getenv("SNOWFLAKE_PROBE_VALIDATE", "FALSE").upper() == "TRUE"
@@ -67,32 +70,21 @@ default_args = {
     "pool": LOAD_POOL,
 }
 
-if not BUCKET_NAME:
-    raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
-
 # ────────────────────────────────────────────────────────────────────────────────
 # DAG
 # ────────────────────────────────────────────────────────────────────────────────
 @dag(
-    dag_id="polygon_options_load",
-    description="Polygon options loader — reads POINTER or flat manifest and COPYs to Snowflake RAW.",
+    dag_id="polygon_options_load_stream",
+    description="Load stream for Polygon options: subscribe to POINTER manifest and COPY to Snowflake RAW.",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
-    schedule=None,          # manual / backfill-triggered
+    schedule=[S3_OPTIONS_MANIFEST_DATASET],   # fires when the POINTER file is updated
     catchup=False,
-    tags=["load", "polygon", "snowflake", "options"],
-    dagrun_timeout=timedelta(hours=3),
+    tags=["load", "polygon", "snowflake", "options", "stream"],
+    dagrun_timeout=timedelta(hours=2),
     max_active_runs=1,
     default_args=default_args,
-    params={
-        # Accept either a POINTER file or a flat manifest
-        "manifest_key": Param(
-            default=os.getenv("OPTIONS_MANUAL_MANIFEST_KEY", "raw/manifests/options/2025-10-20/manifest.txt"),
-            type="string",
-            description="S3 key to a POINTER file or a flat manifest (under the configured bucket).",
-        ),
-    },
 )
-def polygon_options_load_dag():
+def polygon_options_load_stream_dag():
 
     # ────────────────────────────────────────────────────────────────────────────
     # Resolve Snowflake context (from Secrets-backed connection extras)
@@ -116,44 +108,8 @@ def polygon_options_load_dag():
     FQ_STAGE = f"@{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
     FQ_STAGE_NO_AT = f"{SF_DB}.{STAGE_SCHEMA}.{STAGE_NAME}"
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # Helpers (local)
-    # ────────────────────────────────────────────────────────────────────────────
-    def _parse_minmax_date_from_keys(keys: List[str]) -> Tuple[Optional[pendulum.Date], Optional[pendulum.Date]]:
-        """
-        Inspect stage-relative keys like:
-          options/year=YYYY/month=MM/day=DD/underlying=.../contract=....json.gz
-        Return (min_date, max_date) or (None, None) if not parseable.
-        """
-        mins: Optional[pendulum.Date] = None
-        maxs: Optional[pendulum.Date] = None
-        for k in keys or []:
-            try:
-                # quick split lookup; resilient to extra segments
-                parts = k.split("/")
-                y = next(int(p.split("=")[1]) for p in parts if p.startswith("year="))
-                m = next(int(p.split("=")[1]) for p in parts if p.startswith("month="))
-                d = next(int(p.split("=")[1]) for p in parts if p.startswith("day="))
-                dt = pendulum.date(y, m, d)
-                mins = dt if mins is None or dt < mins else mins
-                maxs = dt if maxs is None or dt > maxs else maxs
-            except Exception:
-                continue
-        return mins, maxs
-
-    def _dynamic_copy_history_lookback_hours(keys: List[str]) -> int:
-        """
-        IMPROVEMENT #2: Increase copy_history lookback automatically for deep backfills.
-        We compute (now - min_file_date) in hours and take the max with the configured minimum.
-        """
-        min_dt, _ = _parse_minmax_date_from_keys(keys)
-        if not min_dt:
-            return COPY_HISTORY_LOOKBACK_HOURS_MIN
-        now = pendulum.now("UTC").date()
-        delta_days = max((now - min_dt).days, 0)
-        derived_hours = max(delta_days * 24, COPY_HISTORY_LOOKBACK_HOURS_MIN)
-        print(f"Dynamic copy_history lookback hours = {derived_hours} (min={min_dt.to_date_string()}, now={now})")
-        return derived_hours
+    if not BUCKET_NAME:
+        raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
     # ────────────────────────────────────────────────────────────────────────────
     # Tasks
@@ -197,35 +153,33 @@ def polygon_options_load_dag():
             )
 
     @task
-    def read_manifest_keys(**context) -> List[str]:
+    def read_pointer_and_manifest() -> List[str]:
         """
-        Read the provided manifest key from S3. Auto-detects:
-          • POINTER manifest → dereference to immutable per-day manifest
-          • Flat manifest    → use as-is
-        Returns an ordered list of stage-relative keys (options/*).
+        1) Read the POINTER file content from S3 (Dataset producer writes this).
+        2) Dereference to the immutable per-day manifest.
+        3) Return ordered list of *stage-relative* object keys for COPY.
         """
         s3 = S3Hook()
-        manifest_key = context["params"]["manifest_key"]
 
+        # 1) Read latest pointer file
+        if not s3.check_for_key(LATEST_POINTER_KEY, bucket_name=BUCKET_NAME):
+            raise AirflowSkipException(f"Latest pointer not found: s3://{BUCKET_NAME}/{LATEST_POINTER_KEY}")
+        pointer = (s3.read_key(key=LATEST_POINTER_KEY, bucket_name=BUCKET_NAME) or "").strip()
+        if not pointer.startswith("POINTER="):
+            raise RuntimeError(f"Pointer file is malformed: {pointer[:120]}")
+        manifest_key = pointer.split("=", 1)[1].strip()
+        if not manifest_key:
+            raise RuntimeError("Pointer file has empty target manifest path.")
+
+        # 2) Read the immutable per-day manifest
         if not s3.check_for_key(manifest_key, bucket_name=BUCKET_NAME):
-            raise FileNotFoundError(f"Manifest not found: s3://{BUCKET_NAME}/{manifest_key}")
-        content = (s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME) or "").strip()
-
-        # If first line is POINTER=..., dereference
-        first_line = content.splitlines()[0] if content else ""
-        if first_line.startswith("POINTER="):
-            pointed_key = first_line.split("=", 1)[1].strip()
-            if not pointed_key:
-                raise ValueError(f"Pointer manifest has empty target in {manifest_key}")
-            if not s3.check_for_key(pointed_key, bucket_name=BUCKET_NAME):
-                raise FileNotFoundError(f"Pointer target not found: s3://{BUCKET_NAME}/{pointed_key}")
-            content = s3.read_key(key=pointed_key, bucket_name=BUCKET_NAME) or ""
-
-        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+            raise AirflowSkipException(f"Per-day manifest not found: s3://{BUCKET_NAME}/{manifest_key}")
+        manifest_body = s3.read_key(key=manifest_key, bucket_name=BUCKET_NAME) or ""
+        lines = [ln.strip() for ln in manifest_body.splitlines() if ln.strip()]
         if not lines:
-            raise AirflowSkipException("Manifest is empty; nothing to load.")
+            raise AirflowSkipException(f"Per-day manifest is empty: s3://{BUCKET_NAME}/{manifest_key}")
 
-        # Normalize to stage-relative: strip 'raw/' prefix, filter to options/
+        # 3) Normalize to stage-relative keys: strip leading 'raw/' and keep options/*
         rel = [(k[4:] if k.startswith("raw/") else k) for k in lines]
         rel = [k for k in rel if k.startswith("options/")]
 
@@ -239,8 +193,41 @@ def polygon_options_load_dag():
 
         if not deduped:
             raise AirflowSkipException("No eligible options files in manifest after filtering.")
-        print(f"Eligible files (options/*): {len(deduped)}")
+
+        print(f"Pointer → manifest: {manifest_key}")
+        print(f"Files eligible (options/*): {len(deduped)}")
         return deduped
+
+    @task(pool=SNOWFLAKE_POOL)
+    def prefilter_already_loaded(keys: List[str]) -> List[str]:
+        """
+        Optional: prefilter keys that Snowflake already loaded into {FQ_TABLE}
+        (based on information_schema.copy_history). Defaults on; disable with
+        SNOWFLAKE_PREFILTER_LOADED=FALSE.
+        """
+        if not PREFILTER_LOADED or not keys:
+            return keys
+
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        lookback = COPY_HISTORY_LOOKBACK_HOURS
+        sql = f"""
+        with hist as (
+          select FILE_NAME
+          from table(information_schema.copy_history(
+            table_name => '{FQ_TABLE}',
+            start_time => dateadd('hour', -{lookback}, current_timestamp())
+          ))
+        )
+        select FILE_NAME from hist;
+        """
+        rows = hook.get_records(sql) or []
+        already = {r[0] for r in rows if r and r[0]}
+        if not already:
+            return keys
+
+        remaining = [k for k in keys if k not in already]
+        print(f"Prefiltered {len(keys) - len(remaining)} already-loaded files (lookback {lookback}h).")
+        return remaining
 
     @task
     def chunk_keys(keys: List[str]) -> List[List[str]]:
@@ -288,50 +275,23 @@ def polygon_options_load_dag():
         FORCE = {FORCE};
         """
 
-    @task(pool=SNOWFLAKE_POOL)
-    def compute_dynamic_lookback(keys: List[str]) -> int:
+    @task(retries=1, pool=SNOWFLAKE_POOL)
+    def validate_batch_in_snowflake(batch: List[str]) -> int:
         """
-        IMPROVEMENT #2 (cont.): compute a dynamic lookback for copy_history
-        based on the earliest partition date in the manifest keys.
+        Validation step (transformed COPY) is a no-op: Snowflake doesn't support VALIDATION_MODE here.
+        We keep this for interface symmetry and logging.
         """
-        return _dynamic_copy_history_lookback_hours(keys)
-
-    @task(pool=SNOWFLAKE_POOL)
-    def prefilter_already_loaded(keys: List[str], lookback_hours: int) -> List[str]:
-        """
-        Optional: prefilter keys that Snowflake already loaded into {FQ_TABLE}
-        using information_schema.copy_history. We auto-extend the lookback
-        for deep backfills so we skip more already-loaded files up-front.
-        """
-        if not PREFILTER_LOADED or not keys:
-            return keys
-
-        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        sql = f"""
-        with hist as (
-          select FILE_NAME
-          from table(information_schema.copy_history(
-            table_name => '{FQ_TABLE}',
-            start_time => dateadd('hour', -{lookback_hours}, current_timestamp())
-          ))
-        )
-        select FILE_NAME from hist;
-        """
-        rows = hook.get_records(sql) or []
-        already = {r[0] for r in rows if r and r[0]}
-        if not already:
-            return keys
-
-        remaining = [k for k in keys if k not in already]
-        print(f"Prefiltered {len(keys) - len(remaining)} files using lookback {lookback_hours}h.")
-        return remaining
+        if not DO_VALIDATE or not batch:
+            return 0
+        print("Skipping transformed COPY validation: VALIDATION_MODE not supported with SELECT loads.")
+        return 0
 
     @task(retries=1, pool=SNOWFLAKE_POOL)
     def probe_validate_batch(batch: List[str]) -> int:
         """
-        IMPROVEMENT #1 (enforced): Optional non-transform JSON validation.
-        When enabled (SNOWFLAKE_PROBE_VALIDATE=TRUE), downstream COPY will
-        wait for this probe to complete.
+        Optional non-transform JSON validation: dry-run COPY that returns errors.
+        Checks JSON/compression/access before the transformed load.
+        Enabled when SNOWFLAKE_PROBE_VALIDATE=TRUE.
         """
         if not DO_PROBE_VALIDATE or not batch:
             return 0
@@ -350,7 +310,9 @@ def polygon_options_load_dag():
             VALIDATION_MODE = 'RETURN_ERRORS';
         """
         rows = hook.get_records(validate_sql) or []
+
         if rows:
+            # Each row describes an error (row/file/error). Raise with first error for brevity.
             raise RuntimeError(f"Probe validation failed for {len(rows)} row(s); first error: {rows[0]}")
         print(f"Probe validated batch of {len(batch)} files (no errors).")
         return len(batch)
@@ -377,28 +339,20 @@ def polygon_options_load_dag():
         return total
 
     # ────────────────────────────────────────────────────────────────────────────
-    # Flow (dependency order + optional probe dependency)
+    # Flow (dependency order + optional probe)
     # ────────────────────────────────────────────────────────────────────────────
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
-    manifest_keys = read_manifest_keys()
-
-    # Compute a dynamic copy_history lookback (IMPROVEMENT #2)
-    lookback_hours = compute_dynamic_lookback(manifest_keys)
-
-    remaining = prefilter_already_loaded(manifest_keys, lookback_hours)
+    manifest_keys = read_pointer_and_manifest()
+    remaining = prefilter_already_loaded(manifest_keys)
     batches = chunk_keys(remaining)
 
-    # IMPROVEMENT #1: Ensure COPY waits for PROBE when enabled
-    probe_counts = probe_validate_batch.expand(batch=batches)          # gated by DO_PROBE_VALIDATE
+    _ = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
+    _ = probe_validate_batch.expand(batch=batches)         # gated by DO_PROBE_VALIDATE
     loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
-    if DO_PROBE_VALIDATE:
-        # Explicit dependency so mapped COPY waits for mapped PROBE
-        probe_counts >> loaded_counts
-
     _ = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> manifest_keys >> lookback_hours >> remaining >> batches >> loaded_counts
+    tbl >> stage_ok >> manifest_keys >> remaining >> batches >> loaded_counts
 
 # Instantiate the DAG
-polygon_options_load_dag()
+polygon_options_load_stream_dag()
