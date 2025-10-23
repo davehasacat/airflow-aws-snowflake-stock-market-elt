@@ -5,15 +5,17 @@
 # Enterprise strategy (stream/backfill split):
 #   1) S3 layout (Hive-style): raw/options/year=YYYY/month=MM/day=DD/underlying=<U>/contract=<C>.json.gz
 #   2) Per-day manifests (immutable): raw/manifests/options/YYYY-MM-DD/manifest.txt
-#      - Default: this backfill DAG does NOT update the "latest" pointer and thus
-#        does NOT emit a Dataset (keeps stream loader idle).
-#      - Opt-in: pass update_latest_pointer=true in dag_run.conf to write the pointer
-#        and emit the Dataset to trigger polygon_options_load.
 #   3) Contract filter: only contracts "alive" on target day (list_date ≤ day ≤ expiration_date)
 #   4) Small XComs: workers return tiny {day:count} maps; manifests built via S3 listing
 #   5) Retry & rate-limit hardened: Bearer auth + apiKey param, 429/5xx handling
 #   6) Observability: per-(day,underlying) worklogs at raw/manifests/options/worklogs/YYYY-MM-DD/<U>.log
 #   7) Encrypted S3 writes by default (encrypt=True)
+#
+# NEW (backfill behavior):
+#   • Do NOT update the “latest” pointer or emit a Dataset.
+#   • Instead, optionally TRIGGER the manual loader DAG (`polygon_options_load`)
+#     with one run per non-empty day manifest (conf={"manifest_key": <mkey>}).
+#     Controlled by param: trigger_loader (default: True).
 # =============================================================================
 from __future__ import annotations
 
@@ -37,8 +39,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
-
-from dags.utils.polygon_datasets import S3_OPTIONS_MANIFEST_DATASET
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config / Constants
@@ -64,9 +65,11 @@ DISABLE_CONTRACT_DATE_FILTER = os.getenv(
     "POLYGON_DISABLE_CONTRACT_DATE_FILTER", "false"
 ).lower() in ("1","true","yes")
 
-# Manifests (immutable per-day) + optional latest pointer
+# Manifests (immutable per-day)
 DAY_MANIFEST_PREFIX = os.getenv("OPTIONS_DAY_MANIFEST_PREFIX", "raw/manifests/options")
-LATEST_POINTER_KEY  = os.getenv("OPTIONS_LATEST_POINTER_KEY", "raw/manifests/polygon_options_manifest_latest.txt")
+
+# Pools (optional, if you want to isolate the trigger fan-out)
+LOAD_POOL = os.getenv("LOAD_POOL", "load_pool")
 
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -181,7 +184,7 @@ default_args = {
 
 @dag(
     dag_id="polygon_options_ingest_backfill",
-    description="Polygon options backfill ingest — raw JSON.gz & immutable per-day manifests (pointer update optional).",
+    description="Polygon options backfill ingest — raw JSON.gz & immutable per-day manifests; optionally triggers polygon_options_load.",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=None,           # manual runs only
     catchup=False,
@@ -189,9 +192,9 @@ default_args = {
     params={
         "start_date": Param(default="2025-10-17", type="string", description="Backfill start date (YYYY-MM-DD)"),
         "end_date":   Param(default="2025-10-17", type="string", description="Backfill end date (YYYY-MM-DD)"),
-        # Opt-in: update 'latest' pointer and emit Dataset to trigger polygon_options_load
-        "update_latest_pointer": Param(default=False, type="boolean",
-                                       description="When true, write 'latest' POINTER and emit Dataset"),
+        # NEW: directly trigger the manual loader per non-empty day
+        "trigger_loader": Param(default=True, type="boolean",
+                                description="When true, trigger polygon_options_load for each per-day manifest."),
     },
     dagrun_timeout=timedelta(hours=36),
     max_active_runs=1,
@@ -455,33 +458,23 @@ def polygon_options_ingest_backfill_dag():
         return manifest_keys
 
     # ───────────────────────────────
-    # Optional: update "latest" pointer and emit Dataset (opt-in)
+    # NEW: Trigger the manual loader DAG per day (opt-in)
     # ───────────────────────────────
-    @task(outlets=[S3_OPTIONS_MANIFEST_DATASET])
-    def maybe_update_latest_pointer(manifest_keys: List[str]) -> None:
+    @task
+    def maybe_build_loader_confs(manifest_keys: List[str]) -> List[dict]:
         """
-        Optionally update the mutable 'latest' POINTER so downstream loaders see a dataset event.
-        Controlled by dag_run.conf/params.update_latest_pointer (default False).
-        - If False: task SKIPs (no Dataset event; loaders won't trigger).
-        - If True:  writes POINTER=<latest per-day manifest> and SUCCEEDS (emits Dataset).
+        Only build loader confs when:
+          • trigger_loader=True (param), and
+          • we actually have per-day manifests.
+        Otherwise skip (to avoid accidental loads).
         """
         ctx = get_current_context()
-        do_update = bool(ctx["params"].get("update_latest_pointer"))
-
-        if not do_update:
-            # Skip on purpose so we do NOT emit an event or alter the pointer.
-            raise AirflowSkipException("update_latest_pointer=False — not updating pointer.")
-
+        trigger = bool(ctx["params"].get("trigger_loader", True))
+        if not trigger:
+            raise AirflowSkipException("trigger_loader=False — not triggering polygon_options_load.")
         if not manifest_keys:
-            # Nothing to point to → skip (no event emission)
-            raise AirflowSkipException("No per-day manifests; leaving latest pointer unchanged.")
-
-        latest_mkey = sorted(manifest_keys)[-1]
-        s3 = S3Hook()
-        pointer_body = f"POINTER={latest_mkey}\n"
-        s3.load_string(pointer_body, key=LATEST_POINTER_KEY, bucket_name=BUCKET_NAME,
-                       replace=True, encrypt=True)
-        print(f"✅ Updated latest pointer: s3://{BUCKET_NAME}/{LATEST_POINTER_KEY} → {latest_mkey}")
+            raise AirflowSkipException("No manifests to trigger loads for.")
+        return [{"manifest_key": k} for k in manifest_keys]
 
     # ───────────────────────────────
     # Wiring
@@ -499,9 +492,19 @@ def polygon_options_ingest_backfill_dag():
     day_counts_list    = process_chunk.expand(specs=chunked_specs)
     counts_by_day      = merge_day_counts(day_counts_list)
 
-    # Build immutable per-day manifests; optionally update pointer (opt-in)
+    # Build immutable per-day manifests
     day_manifests      = write_day_manifests_from_s3(trading_days, counts_by_day)
-    _ = maybe_update_latest_pointer(day_manifests)
+
+    # Build confs conditionally and map a single TriggerDagRunOperator over them
+    loader_confs       = maybe_build_loader_confs(day_manifests)
+
+    TriggerDagRunOperator.partial(
+        task_id="trigger_polygon_options_load",
+        trigger_dag_id="polygon_options_load",
+        reset_dag_run=False,
+        wait_for_completion=False,
+        pool=LOAD_POOL,
+    ).expand(conf=loader_confs)
 
 
 # Instantiate

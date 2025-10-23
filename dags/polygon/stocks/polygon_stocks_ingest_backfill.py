@@ -10,13 +10,14 @@
 #   • All S3 writes encrypted at rest (encrypt=True) with deterministic keys
 #   • Inclusive date range params; weekends skipped; holidays handled via 404
 #   • Connection-aware API key resolution + robust retries/backoff
-#   • Minimal lineage fields added to aid downstream dbt:
+#   • Minimal lineage fields for downstream dbt:
 #       as_of_date (YYYY-MM-DD), ingested_at_utc (ISO8601)
 #
-# Notes:
-#   • This backfill DAG does NOT emit S3_STOCKS_MANIFEST_DATASET and does NOT
-#     touch the “latest” pointer; daily stream handles that for production ops.
-#   • Idempotent by S3 key; controlled by BACKFILL_REPLACE (defaults true).
+# Backfill behavior:
+#   • Does NOT emit S3_STOCKS_MANIFEST_DATASET and does NOT touch the “latest” pointer.
+#   • Instead, optionally TRIGGERS the manual loader DAG `polygon_stocks_load`
+#     with one run per non-empty day (conf={"manifest_key": <mkey>}). Controlled by
+#     param trigger_loader (default: True).
 # =============================================================================
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import csv
 import time
 import gzip
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 
 import pendulum
 import requests
@@ -40,6 +41,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.models.param import Param
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config / Constants
@@ -57,6 +59,9 @@ REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25")
 REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "true").lower() == "true"
 
 DAY_MANIFEST_PREFIX = os.getenv("STOCKS_DAY_MANIFEST_PREFIX", "raw/manifests/stocks")
+
+# Optional pool for fan-out triggers to the loader
+LOAD_POOL = os.getenv("LOAD_POOL", "load_pool")
 
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
@@ -126,7 +131,7 @@ def _date_list_inclusive(start_iso: str, end_iso: str) -> List[str]:
 # ────────────────────────────────────────────────────────────────────────────────
 @dag(
     dag_id="polygon_stocks_ingest_backfill",
-    description="Polygon stocks backfill — raw JSON.gz to S3 + immutable per-day manifests (no pointer updates).",
+    description="Polygon stocks backfill — raw JSON.gz to S3 + immutable per-day manifests; optionally triggers polygon_stocks_load.",
     start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     schedule=None,           # manual runs only
     catchup=False,
@@ -134,6 +139,9 @@ def _date_list_inclusive(start_iso: str, end_iso: str) -> List[str]:
     params={
         "start_date": Param(default="2025-10-17", type="string", description="Backfill start date (YYYY-MM-DD)"),
         "end_date":   Param(default="2025-10-20", type="string", description="Backfill end date (YYYY-MM-DD)"),
+        # NEW: directly trigger the manual loader per non-empty day
+        "trigger_loader": Param(default=True, type="boolean",
+                                description="When true, trigger polygon_stocks_load for each per-day manifest."),
     },
     dagrun_timeout=timedelta(hours=12),
     max_active_runs=1,
@@ -263,7 +271,7 @@ def polygon_stocks_ingest_backfill_dag():
     # Manifest writing (immutable per-day; NO pointer update here)
     # ───────────────────────────────
     @task
-    def write_day_manifest(s3_keys: List[str], target_date: str) -> str | None:
+    def write_day_manifest(s3_keys: List[str], target_date: str) -> Optional[str]:
         """
         Write an immutable per-day manifest listing all S3 keys written for the day.
         Stored at: raw/manifests/stocks/YYYY-MM-DD/manifest.txt
@@ -282,17 +290,40 @@ def polygon_stocks_ingest_backfill_dag():
         )
         return manifest_key
 
+    @task
+    def build_loader_confs(manifest_keys: List[Optional[str]], **kwargs) -> List[dict]:
+        """
+        Build a list of {'manifest_key': <mkey>} for non-empty days — only if
+        params.trigger_loader is True.
+        """
+        trigger = bool(kwargs["params"].get("trigger_loader", True))
+        if not trigger:
+            raise AirflowSkipException("trigger_loader=False — not triggering polygon_stocks_load.")
+        kept = [k for k in (manifest_keys or []) if k]
+        if not kept:
+            raise AirflowSkipException("No non-empty per-day manifests to trigger loads for.")
+        return [{"manifest_key": k} for k in kept]
+
     # ───────────────────────────────
     # Wiring
     # ───────────────────────────────
     custom_tickers = get_custom_tickers()
     dates = generate_trading_dates()
     per_day_keys = process_date.partial(custom_tickers=custom_tickers).expand(target_date=dates)
-    # Write a manifest per day
-    _ = write_day_manifest.partial(target_date=None).expand(
+    manifest_keys = write_day_manifest.partial(target_date=None).expand(
         s3_keys=per_day_keys,
         target_date=dates,
     )
+    loader_confs = build_loader_confs(manifest_keys)
+
+    # One TriggerDagRunOperator mapped over per-day confs (no duplicates)
+    TriggerDagRunOperator.partial(
+        task_id="trigger_polygon_stocks_load",
+        trigger_dag_id="polygon_stocks_load",
+        reset_dag_run=False,
+        wait_for_completion=False,
+        pool=LOAD_POOL,
+    ).expand(conf=loader_confs)
 
 # Instantiate
 polygon_stocks_ingest_backfill_dag()
