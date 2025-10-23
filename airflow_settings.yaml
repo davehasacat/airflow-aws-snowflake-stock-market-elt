@@ -24,6 +24,13 @@ airflow:
       pool_description: "Pool for controlling API-heavy tasks"
 
     # --------------------------------------------------
+    # INGEST Pool - governs raw data ingestion tasks
+    # --------------------------------------------------
+    - pool_name: "ingest_pool"
+      pool_slot: 4
+      pool_description: "Pool for S3 write and Polygon ingestion tasks (stocks/options backfills)"
+
+    # --------------------------------------------------
     # LOAD Pool - limits Snowflake COPY concurrency (stream)
     # --------------------------------------------------
     - pool_name: "load_pool"
@@ -36,15 +43,15 @@ airflow:
       pool_description: "Pool for Snowflake load tasks (backfill loaders)"
 
     # --------------------------------------------------
-    # Default Pool - fallback for all tasks without a pool
-    # --------------------------------------------------
-    - pool_name: "default_pool"
-      pool_slot: 128
-      pool_description: "Default Airflow pool for general-purpose tasks"
-
-    # --------------------------------------------------
     # Snowflake Pool - for Snowflake heavy tasks
     # --------------------------------------------------
     - pool_name: "snowflake_pool"
       pool_slot: 6
       pool_description: "Snowflake COPY/SQL concurrency limit for stocks/options loaders"
+
+    # --------------------------------------------------
+    # Default Pool - fallback for all tasks without a pool
+    # --------------------------------------------------
+    - pool_name: "default_pool"
+      pool_slot: 128
+      pool_description: "Default Airflow pool for general-purpose tasks"
