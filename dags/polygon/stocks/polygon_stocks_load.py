@@ -18,13 +18,16 @@
 # Usage patterns
 #   1) Backfill load (manual): trigger this DAG with {"manifest_key": "raw/manifests/stocks/2025-10-20/manifest.txt"}
 #      - You can also pass a POINTER file: {"manifest_key": "raw/manifests/polygon_stocks_manifest_latest.txt"}
+#      - Per-run knobs:
+#         • "prefilter_loaded": false   (skip copy_history prefilter)
+#         • "force": true                (FORCE=TRUE on COPY)
 #   2) Daily stream: handled by polygon_stocks_load_stream (subscribes to Dataset)
 # =============================================================================
 
 from __future__ import annotations
 import os
 from datetime import timedelta
-from typing import List
+from typing import List, Dict
 
 import pendulum
 
@@ -88,6 +91,17 @@ if not BUCKET_NAME:
             type="string",
             description="S3 key to a POINTER file or a flat manifest (under the configured bucket).",
         ),
+        # Per-run behavior knobs (override env defaults)
+        "prefilter_loaded": Param(
+            default=PREFILTER_LOADED,
+            type="boolean",
+            description="Prefilter already-loaded files via Snowflake copy_history.",
+        ),
+        "force": Param(
+            default=(FORCE == "TRUE"),
+            type="boolean",
+            description="Force COPY to reload files even if seen in load history (FORCE=TRUE).",
+        ),
     },
 )
 def polygon_stocks_load_dag():
@@ -117,6 +131,17 @@ def polygon_stocks_load_dag():
     # ────────────────────────────────────────────────────────────────────────────
     # Tasks
     # ────────────────────────────────────────────────────────────────────────────
+    @task
+    def read_effective_flags(**context) -> Dict[str, bool]:
+        """Compute effective per-run flags using params, fallback to env defaults."""
+        prm = context["params"]
+        flags = {
+            "prefilter_loaded": bool(prm.get("prefilter_loaded", PREFILTER_LOADED)),
+            "force": bool(prm.get("force", (FORCE == "TRUE"))),
+        }
+        print(f"Effective flags → prefilter_loaded={flags['prefilter_loaded']} force={flags['force']}")
+        return flags
+
     @task(pool=SNOWFLAKE_POOL)
     def create_snowflake_table():
         """Create/ensure the typed landing table (lineage-friendly for dbt incremental)."""
@@ -198,17 +223,25 @@ def polygon_stocks_load_dag():
 
         if not deduped:
             raise AirflowSkipException("No eligible stocks files in manifest after filtering.")
-        print(f"Eligible files (stocks/*): {len(deduped)}")
+        print(f"Eligible files (stocks/*): {len(deduped)}; sample: {deduped[:5]}")
         return deduped
 
     @task(pool=SNOWFLAKE_POOL)
-    def prefilter_already_loaded(keys: List[str]) -> List[str]:
+    def prefilter_already_loaded(keys: List[str], flags: Dict[str, bool]) -> List[str]:
         """
         Optional: prefilter keys that Snowflake already loaded into {FQ_TABLE}
-        (based on information_schema.copy_history). Defaults on; disable with
-        SNOWFLAKE_PREFILTER_LOADED=FALSE.
+        (based on information_schema.copy_history). Disabled when:
+          • flags['force'] == True, or
+          • flags['prefilter_loaded'] == False
         """
-        if not PREFILTER_LOADED or not keys:
+        if not keys:
+            return keys
+
+        if flags.get("force"):
+            print("force=True → skipping prefilter (will reload files).")
+            return keys
+        if not flags.get("prefilter_loaded", True):
+            print("prefilter_loaded=False → skipping prefilter.")
             return keys
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
@@ -224,28 +257,34 @@ def polygon_stocks_load_dag():
         select FILE_NAME from hist;
         """
         rows = hook.get_records(sql) or []
-        already = {r[0] for r in rows if r and r[0]}
-        if not already:
-            return keys
+        # Snowflake FILE_NAME for stage loads is relative to the stage root; we already pass 'stocks/...'
+        already = {str(r[0]).strip() for r in rows if r and r[0]}
+
+        sample_hist = list(already)[:5]
+        print(f"copy_history FILE_NAME count={len(already)} (sample: {sample_hist})")
+        print(f"candidate FILES count={len(keys)} (sample: {keys[:5]})")
 
         remaining = [k for k in keys if k not in already]
-        print(f"Prefiltered {len(keys) - len(remaining)} already-loaded files (lookback {lookback}h).")
+        removed = len(keys) - len(remaining)
+        print(f"Prefilter removed {removed} files (lookback {lookback}h). Remaining={len(remaining)}")
         return remaining
 
     @task
     def chunk_keys(keys: List[str]) -> List[List[str]]:
         """Split keys into FILES=() batches to keep COPY statements predictable."""
         if not keys:
+            print("After prefilter: 0 files remain.")
             raise AirflowSkipException("No files to load after prefiltering.")
+        print(f"After prefilter: {len(keys)} files remain.")
         return [keys[i : i + BATCH_SIZE] for i in range(0, len(keys), BATCH_SIZE)]
 
-    def _copy_sql(files: List[str]) -> str:
+    def _copy_sql(files: List[str], force_kw: str) -> str:
         """
         Compose COPY SQL using transformed SELECT.
         - projects JSON fields into typed columns
         - includes lineage via METADATA$FILENAME / METADATA$FILE_ROW_NUMBER
         - supports .json and .json.gz
-        - relies on load history for idempotency (FORCE={FORCE})
+        - relies on load history for idempotency (FORCE={force_kw})
         """
         files_clause = ", ".join(f"'{k}'" for k in files)
         return f"""
@@ -275,7 +314,7 @@ def polygon_stocks_load_dag():
         FILES = ({files_clause})
         FILE_FORMAT = (TYPE = 'JSON')
         ON_ERROR = '{ON_ERROR}'
-        FORCE = {FORCE};
+        FORCE = {force_kw};
         """
 
     @task(retries=1, pool=SNOWFLAKE_POOL)
@@ -321,17 +360,20 @@ def polygon_stocks_load_dag():
         return len(batch)
 
     @task(outlets=[SNOWFLAKE_STOCKS_RAW_DATASET], retries=2, pool=SNOWFLAKE_POOL)
-    def copy_batch_to_snowflake(batch: List[str]) -> int:
+    def copy_batch_to_snowflake(batch: List[str], flags: Dict[str, bool]) -> int:
         """
         COPY a single batch using FILES=().
         - FORCE=FALSE + Snowflake load history → skip already ingested files.
         - ON_ERROR configurable (ABORT_STATEMENT or CONTINUE).
+        - Per-run 'force' overrides env FORCE.
         """
         if not batch:
             return 0
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(_copy_sql(batch))
-        print(f"Loaded batch of {len(batch)} files into {FQ_TABLE}.")
+        force_kw = "TRUE" if flags.get("force") else FORCE
+        sql = _copy_sql(batch, force_kw)
+        hook.run(sql)
+        print(f"Loaded batch of {len(batch)} files into {FQ_TABLE} (FORCE={force_kw}).")
         return len(batch)
 
     @task
@@ -344,18 +386,19 @@ def polygon_stocks_load_dag():
     # ────────────────────────────────────────────────────────────────────────────
     # Flow (dependency order + optional probe)
     # ────────────────────────────────────────────────────────────────────────────
+    flags = read_effective_flags()
     tbl = create_snowflake_table()
     stage_ok = check_stage_exists()
     manifest_keys = read_manifest_keys()
-    remaining = prefilter_already_loaded(manifest_keys)
+    remaining = prefilter_already_loaded(manifest_keys, flags)
     batches = chunk_keys(remaining)
 
     _ = validate_batch_in_snowflake.expand(batch=batches)  # no-op for transformed loads
     _ = probe_validate_batch.expand(batch=batches)         # gated by DO_PROBE_VALIDATE
-    loaded_counts = copy_batch_to_snowflake.expand(batch=batches)
+    loaded_counts = copy_batch_to_snowflake.expand(batch=batches, flags=flags)
     _ = sum_loaded(loaded_counts)
 
-    tbl >> stage_ok >> manifest_keys >> remaining >> batches >> loaded_counts
+    tbl >> stage_ok >> manifest_keys >> flags >> remaining >> batches >> loaded_counts
 
 # Instantiate the DAG
 polygon_stocks_load_dag()

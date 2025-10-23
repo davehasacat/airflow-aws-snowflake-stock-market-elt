@@ -1,329 +1,360 @@
 # dags/polygon/stocks/polygon_stocks_ingest_backfill.py
 # =============================================================================
-# Polygon Stocks Backfill (Ingestion)
+# Polygon Stocks → S3 (Backfill) — immutable per-day manifest writer
 # -----------------------------------------------------------------------------
-# Enterprise/modern strategy (aligned with options + dbt incremental):
-#   • S3 layout (per-ticker, per-day, gz):
-#       raw/stocks/<TICKER>/<YYYY-MM-DD>.json.gz
-#   • Per-day manifest (immutable; NO latest-pointer update in backfills):
-#       raw/manifests/stocks/YYYY-MM-DD/manifest.txt
-#   • All S3 writes encrypted at rest (encrypt=True) with deterministic keys
-#   • Inclusive date range params; weekends skipped; holidays handled via 404
-#   • Connection-aware API key resolution + robust retries/backoff
-#   • Minimal lineage fields for downstream dbt:
-#       as_of_date (YYYY-MM-DD), ingested_at_utc (ISO8601)
+# For an inclusive date range:
+#   • Fetches Polygon "grouped" endpoint once per day
+#   • Writes per-ticker, per-day JSON(.gz): raw/stocks/<TICKER>/<YYYY-MM-DD>.json.gz
+#   • Writes per-day manifest (flat list of raw/* keys):
+#         raw/manifests/stocks/<YYYY-MM-DD>/manifest.txt
+#   • Does NOT update the "latest" pointer
+#   • Triggers polygon_stocks_load with {"manifest_key": ...} per produced day
 #
-# Backfill behavior:
-#   • Does NOT emit S3_STOCKS_MANIFEST_DATASET and does NOT touch the “latest” pointer.
-#   • Instead, optionally TRIGGERS the manual loader DAG `polygon_stocks_load`
-#     with one run per non-empty day (conf={"manifest_key": <mkey>}). Controlled by
-#     param trigger_loader (default: True).
+# Notes:
+#   • Weekend/holiday handling: 404 or empty "results" → skip day (no manifest)
+#   • Connection-aware: Polygon API key read from Airflow Connection
+#   • Retries/backoff on HTTP errors and 429s
+#   • Deterministic file ordering in manifests (sorted by ticker)
 # =============================================================================
 
 from __future__ import annotations
 
+import io
 import os
 import json
-import csv
-import time
 import gzip
-from io import BytesIO
-from typing import List, Optional
+from datetime import timedelta
+from typing import Dict, List, Tuple
 
 import pendulum
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import timedelta
 
 from airflow.decorators import dag, task
-from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.models.param import Param
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Config / Constants
+# Constants & Config
 # ────────────────────────────────────────────────────────────────────────────────
-POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
 
-BUCKET_NAME = os.getenv("BUCKET_NAME")  # expected: 'stock-market-elt'
-DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/usr/local/airflow/dbt")
-
-REQUEST_TIMEOUT_SECS = int(os.getenv("HTTP_REQUEST_TIMEOUT_SECS", "60"))
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-stocks-backfill (manual)")
-API_POOL = os.getenv("API_POOL", "api_pool")
-
-REQUEST_DELAY_SECONDS = float(os.getenv("POLYGON_REQUEST_DELAY_SECONDS", "0.25"))
-REPLACE_FILES = os.getenv("BACKFILL_REPLACE", "true").lower() == "true"
-
-DAY_MANIFEST_PREFIX = os.getenv("STOCKS_DAY_MANIFEST_PREFIX", "raw/manifests/stocks")
-
-# Optional pool for fan-out triggers to the loader
-LOAD_POOL = os.getenv("LOAD_POOL", "load_pool")
-
+# S3 bucket (required)
+BUCKET_NAME = os.getenv("BUCKET_NAME")  # e.g., stock-market-elt
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required (e.g., 'stock-market-elt').")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Helpers (API key, session, trading calendar)
-# ────────────────────────────────────────────────────────────────────────────────
-def _get_polygon_stocks_key() -> str:
-    """
-    Resolve Polygon Stocks API key from Airflow Connection 'polygon_stocks_api_key'
-    (password/login/extras.api_key), else env POLYGON_STOCKS_API_KEY.
-    """
-    try:
-        conn = BaseHook.get_connection("polygon_stocks_api_key")
-        for candidate in (conn.password, conn.login):
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-        x = conn.extra_dejson or {}
-        for k in ("api_key", "key", "token", "password", "polygon_stocks_api_key", "value"):
-            v = x.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    except Exception:
-        pass
-    env = os.getenv("POLYGON_STOCKS_API_KEY", "").strip()
-    if env:
-        return env
-    raise RuntimeError(
-        "Polygon Stocks API key not found. Define Airflow connection 'polygon_stocks_api_key' "
-        "or set env POLYGON_STOCKS_API_KEY."
-    )
+# Pools
+API_POOL = os.getenv("API_POOL", "api_pool")
+INGEST_POOL = os.getenv("INGEST_POOL", "ingest_pool")
 
-def _session_with_auth(api_key: str) -> requests.Session:
-    """HTTP session with retry/backoff + Bearer token auth."""
-    s = requests.Session()
-    retries = Retry(
-        total=6,
-        backoff_factor=1.2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET"]),
+# Polygon
+POLYGON_STOCKS_CONN_ID = os.getenv("POLYGON_STOCKS_CONN_ID", "polygon_stocks_api")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "stocks-elt/polygon-stocks-ingest-backfill/1.0")
+
+# Grouped endpoint (daily aggregates by ticker)
+POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+
+# Triggered loader DAG id
+STOCKS_LOAD_DAG_ID = os.getenv("STOCKS_LOAD_DAG_ID", "polygon_stocks_load")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _get_polygon_api_key() -> str:
+    """
+    Resolve API key from Airflow connection.
+    - Prefer conn.password
+    - Fallback to conn.extra['api_key']
+    """
+    conn = BaseHook.get_connection(POLYGON_STOCKS_CONN_ID)
+    if conn.password:
+        return conn.password
+    extra = conn.extra_dejson or {}
+    key = (extra.get("api_key") or extra.get("token") or "").strip()
+    if not key:
+        raise RuntimeError(
+            f"Polygon key not found in connection '{POLYGON_STOCKS_CONN_ID}'. "
+            "Put the key in the connection password or extras.api_key."
+        )
+    return key
+
+
+def _requests_session() -> requests.Session:
+    """
+    Build a retrying session:
+    - Retries 5x on 429/5xx with backoff
+    - Short timeouts (connect=5s, read=30s)
+    """
+    sess = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
         raise_on_status=False,
-        respect_retry_after_header=True,
     )
-    s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
-    s.headers.update({
-        "User-Agent": USER_AGENT,
-        "Authorization": f"Bearer {api_key}",
-    })
-    return s
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.headers.update({"User-Agent": USER_AGENT})
+    return sess
 
-def _date_list_inclusive(start_iso: str, end_iso: str) -> List[str]:
-    """Inclusive [start, end]; skip Sat/Sun; holidays handled via 404 later."""
-    start = pendulum.parse(start_iso)
-    end = pendulum.parse(end_iso)
-    if start > end:
-        raise ValueError("start_date cannot be after end_date.")
-    out: List[str] = []
+
+def _date_range_inclusive(start: pendulum.DateTime, end: pendulum.DateTime) -> List[str]:
+    days = []
     cur = start
     while cur <= end:
-        if cur.day_of_week not in (5, 6):  # Sat/Sun
-            out.append(cur.to_date_string())
+        days.append(cur.to_date_string())
         cur = cur.add(days=1)
-    return out
+    return days
+
+
+def _is_weekend(yyyy_mm_dd: str, tz: str = "America/New_York") -> bool:
+    d = pendulum.parse(yyyy_mm_dd, tz=tz)
+    return d.weekday() >= 5  # 5=Sat, 6=Sun
+
+
+def _split_grouped_payload_to_per_ticker_files(payload: Dict) -> List[Tuple[str, Dict]]:
+    """
+    Convert Polygon grouped response into per-ticker mini-documents that match
+    the loader's COPY SELECT expectation:
+
+    { "ticker": "<TICKER>", "results": [ { o, h, l, c, v, n, vw, t } ] }
+
+    Returns list of (ticker, doc) tuples.
+    """
+    results = payload.get("results") or []
+    docs: List[Tuple[str, Dict]] = []
+    for r in results:
+        ticker = r.get("T") or r.get("tiker") or r.get("ticker") or r.get("TICKER")
+        if not ticker:
+            ticker = r.get("symbol")  # defensive
+        if not ticker:
+            # Skip malformed row
+            continue
+        # Normalize fields to lower-case keys similar to Polygon docs:
+        # T (ticker), t (timestamp ms), o,h,l,c (prices), v (volume), n (transactions), vw (vwap)
+        doc = {
+            "ticker": ticker,
+            "results": [
+                {
+                    "o": r.get("o"),
+                    "h": r.get("h"),
+                    "l": r.get("l"),
+                    "c": r.get("c"),
+                    "v": r.get("v"),
+                    "n": r.get("n"),
+                    "vw": r.get("vw"),
+                    "t": r.get("t"),
+                }
+            ],
+        }
+        docs.append((ticker, doc))
+    return docs
+
+
+def _gzip_bytes(obj: Dict) -> bytes:
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    return buf.getvalue()
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # DAG
 # ────────────────────────────────────────────────────────────────────────────────
+
+default_args = {
+    "owner": "data-platform",
+    "retries": 2,
+    "retry_delay": pendulum.duration(minutes=5),
+    "pool": INGEST_POOL,
+}
+
 @dag(
     dag_id="polygon_stocks_ingest_backfill",
-    description="Polygon stocks backfill — raw JSON.gz to S3 + immutable per-day manifests; optionally triggers polygon_stocks_load.",
-    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
-    schedule=None,           # manual runs only
+    description="Backfill Polygon grouped daily → per-ticker gz files + per-day manifest (no latest pointer).",
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+    schedule=None,  # trigger manually
     catchup=False,
-    tags=["ingestion", "polygon", "stocks", "backfill", "aws"],
-    params={
-        "start_date": Param(default="2025-10-17", type="string", description="Backfill start date (YYYY-MM-DD)"),
-        "end_date":   Param(default="2025-10-20", type="string", description="Backfill end date (YYYY-MM-DD)"),
-        # NEW: directly trigger the manual loader per non-empty day
-        "trigger_loader": Param(default=True, type="boolean",
-                                description="When true, trigger polygon_stocks_load for each per-day manifest."),
-    },
-    dagrun_timeout=timedelta(hours=12),
+    dagrun_timeout=timedelta(hours=6),
     max_active_runs=1,
+    tags=["ingest", "polygon", "stocks", "backfill"],
+    default_args=default_args,
+    params={
+        # Inclusive date range (YYYY-MM-DD)
+        "date_from": Param(default=pendulum.now("UTC").subtract(days=1).to_date_string(), type="string"),
+        "date_to": Param(default=pendulum.now("UTC").subtract(days=1).to_date_string(), type="string"),
+        # Optional: pass through to loader when triggering (override env defaults there)
+        "loader_prefilter_loaded": Param(default=True, type="boolean"),
+        "loader_force": Param(default=False, type="boolean"),
+        # Optional: dry-run (fetch only; do not write S3 or trigger)
+        "dry_run": Param(default=False, type="boolean"),
+    },
 )
 def polygon_stocks_ingest_backfill_dag():
 
-    # ───────────────────────────────
-    # Inputs
-    # ───────────────────────────────
-    @task
-    def get_custom_tickers() -> List[str]:
-        """Read seed tickers to limit ingest scope (keeps costs/risk low)."""
-        path = os.path.join(DBT_PROJECT_DIR, "seeds", "custom_tickers.csv")
-        tickers: List[str] = []
-        with open(path, mode="r", newline="") as csvfile:
-            for row in csv.DictReader(csvfile):
-                t = (row.get("ticker") or "").strip().upper()
-                if t:
-                    tickers.append(t)
-        if not tickers:
-            raise AirflowSkipException("No tickers found in dbt/seeds/custom_tickers.csv.")
-        return tickers
+    # ────────────────────────────────────────────────────────────────────────────
+    # Tasks
+    # ────────────────────────────────────────────────────────────────────────────
 
-    @task
-    def generate_trading_dates(**kwargs) -> List[str]:
-        """Compute inclusive weekday date list; holidays handled downstream."""
-        dates = _date_list_inclusive(kwargs["params"]["start_date"], kwargs["params"]["end_date"])
-        if not dates:
-            raise AirflowSkipException("No trading dates in the given range.")
-        return dates
-
-    # ───────────────────────────────
-    # Fetch grouped, split per-ticker, write raw
-    # ───────────────────────────────
-    @task(retries=3, retry_delay=pendulum.duration(minutes=10), pool=API_POOL)
-    def process_date(target_date: str, custom_tickers: List[str]) -> List[str]:
+    @task(pool=API_POOL)
+    def fetch_day_payload(yyyy_mm_dd: str) -> Dict:
         """
-        For a given date:
-          - Fetch grouped daily bars (all U.S. stocks),
-          - Filter to your custom tickers,
-          - Transform to the per-ticker JSON shape your loaders expect (results[0]),
-          - Add minimal lineage (as_of_date, ingested_at_utc),
-          - Write to s3://<bucket>/raw/stocks/<TICKER>/<YYYY-MM-DD>.json.gz (encrypted).
-        Returns written S3 keys for this date.
+        Call Polygon grouped endpoint for a single date.
+        Weekend/holiday handling:
+          - 404 → skip
+          - 200 with empty results → skip
         """
-        s3 = S3Hook()
-        api_key = _get_polygon_stocks_key()
-        sess = _session_with_auth(api_key)
-        custom = set(custom_tickers)
+        if _is_weekend(yyyy_mm_dd):
+            raise AirflowSkipException(f"{yyyy_mm_dd} is weekend; skipping.")
 
-        url = POLYGON_GROUPED_URL.format(date=target_date)
-        params = {"adjusted": "true"}
+        api_key = _get_polygon_api_key()
+        url = POLYGON_GROUPED_URL.format(date=yyyy_mm_dd)
 
-        resp = sess.get(url, params=params, timeout=REQUEST_TIMEOUT_SECS)
+        sess = _requests_session()
+        resp = sess.get(url, params={"adjusted": "true", "apiKey": api_key}, timeout=(5, 30))
+
         if resp.status_code == 404:
-            # Market holiday/closure → nothing to do
-            return []
-        if resp.status_code in (401, 403):
-            try:
-                j = resp.json()
-                msg = j.get("error") or j.get("message") or str(j)
-            except Exception:
-                msg = resp.text
-            print(f"⚠️  {target_date} -> {resp.status_code}: {msg[:200]}")
-            return []
-        resp.raise_for_status()
+            # Market holiday or missing data
+            raise AirflowSkipException(f"{yyyy_mm_dd}: Polygon returned 404 (likely market holiday).")
+        if resp.status_code >= 400:
+            # Let retry handle transient; if it reaches here it's final failure
+            raise RuntimeError(f"{yyyy_mm_dd}: HTTP {resp.status_code} from Polygon: {resp.text[:200]}")
 
-        data = resp.json() or {}
-        results = data.get("results") or []
+        payload = resp.json()
+        results = payload.get("results") or []
         if not results:
-            return []
+            raise AirflowSkipException(f"{yyyy_mm_dd}: empty 'results' from Polygon; skipping.")
+        return {"date": yyyy_mm_dd, "payload": payload}
 
-        run_ts = pendulum.now("UTC").to_iso8601_string()
-        written: List[str] = []
+    @task
+    def write_per_ticker_files(day: Dict) -> Dict:
+        """
+        Transform grouped payload into per-ticker gz files and upload to S3.
+        Returns a dict with the date and list of raw keys written.
+        """
+        yyyy_mm_dd = day["date"]
+        payload = day["payload"]
+        docs = _split_grouped_payload_to_per_ticker_files(payload)
 
-        for r in results:
-            ticker = (r.get("T") or "").upper()
-            if not ticker or ticker not in custom:
-                continue
+        if not docs:
+            raise AirflowSkipException(f"{yyyy_mm_dd}: no per-ticker docs after split; skipping.")
 
-            payload = {
-                # business keys (unchanged so loader SQL keeps working)
-                "ticker": ticker,
-                "queryCount": 1,
-                "resultsCount": 1,
-                "adjusted": True,
-                "results": [{
-                    "v": r.get("v"),
-                    "vw": r.get("vw"),
-                    "o": r.get("o"),
-                    "c": r.get("c"),
-                    "h": r.get("h"),
-                    "l": r.get("l"),
-                    "t": r.get("t"),
-                    "n": r.get("n"),
-                }],
-                "status": "OK",
-                "request_id": data.get("request_id"),
+        # Sort by ticker for deterministic manifest ordering
+        docs.sort(key=lambda x: x[0])
 
-                # minimal lineage for dbt/ops
-                "as_of_date": target_date,
-                "ingested_at_utc": run_ts,
-            }
+        s3 = S3Hook()
+        raw_keys: List[str] = []
 
-            s3_key = f"raw/stocks/{ticker}/{target_date}.json.gz"
-
-            if not REPLACE_FILES and s3.check_for_key(s3_key, bucket_name=BUCKET_NAME):
-                continue
-
-            buf = BytesIO()
-            with gzip.GzipFile(filename="", mode="wb", fileobj=buf) as gz:
-                gz.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-
+        for ticker, doc in docs:
+            key = f"raw/stocks/{ticker}/{yyyy_mm_dd}.json.gz"
+            body = _gzip_bytes(doc)
             s3.load_bytes(
-                buf.getvalue(),
-                key=s3_key,
+                bytes_data=body,
+                key=key,
                 bucket_name=BUCKET_NAME,
                 replace=True,
-                encrypt=True,
+                encrypt=True,  # SSE-S3
             )
-            written.append(s3_key)
-            time.sleep(REQUEST_DELAY_SECONDS)
+            raw_keys.append(key)
 
-        return written
+        print(f"{yyyy_mm_dd}: wrote {len(raw_keys)} per-ticker files (sample: {raw_keys[:5]})")
+        return {"date": yyyy_mm_dd, "raw_keys": raw_keys}
 
-    # ───────────────────────────────
-    # Manifest writing (immutable per-day; NO pointer update here)
-    # ───────────────────────────────
     @task
-    def write_day_manifest(s3_keys: List[str], target_date: str) -> Optional[str]:
+    def write_manifest(day_files: Dict, **context) -> Dict:
         """
-        Write an immutable per-day manifest listing all S3 keys written for the day.
-        Stored at: raw/manifests/stocks/YYYY-MM-DD/manifest.txt
+        Write per-day flat manifest listing each raw key on its own line.
+        Returns manifest key metadata to feed the loader trigger.
         """
-        if not s3_keys:
-            return None
+        yyyy_mm_dd = day_files["date"]
+        raw_keys: List[str] = day_files["raw_keys"]
+
+        if not raw_keys:
+            raise AirflowSkipException(f"{yyyy_mm_dd}: no raw keys; manifest not written.")
+
+        # Deterministic order (already sorted); join with newline
+        manifest_body = "\n".join(raw_keys) + "\n"
+        manifest_key = f"raw/manifests/stocks/{yyyy_mm_dd}/manifest.txt"
+
         s3 = S3Hook()
-        manifest_key = f"{DAY_MANIFEST_PREFIX}/{target_date}/manifest.txt"
-        body = "\n".join(sorted(set(s3_keys))) + "\n"
         s3.load_string(
-            body,
+            string_data=manifest_body,
             key=manifest_key,
             bucket_name=BUCKET_NAME,
             replace=True,
             encrypt=True,
         )
-        return manifest_key
+
+        prm = context["params"]
+        print(
+            f"{yyyy_mm_dd}: manifest written at s3://{BUCKET_NAME}/{manifest_key} "
+            f"(prefilter_loaded={prm['loader_prefilter_loaded']} force={prm['loader_force']})"
+        )
+        return {
+            "date": yyyy_mm_dd,
+            "manifest_key": manifest_key,
+            "prefilter_loaded": bool(prm["loader_prefilter_loaded"]),
+            "force": bool(prm["loader_force"]),
+        }
 
     @task
-    def build_loader_confs(manifest_keys: List[Optional[str]], **kwargs) -> List[dict]:
+    def expand_dates(**context) -> List[str]:
         """
-        Build a list of {'manifest_key': <mkey>} for non-empty days — only if
-        params.trigger_loader is True.
+        Compute the inclusive date list from params.
         """
-        trigger = bool(kwargs["params"].get("trigger_loader", True))
-        if not trigger:
-            raise AirflowSkipException("trigger_loader=False — not triggering polygon_stocks_load.")
-        kept = [k for k in (manifest_keys or []) if k]
-        if not kept:
-            raise AirflowSkipException("No non-empty per-day manifests to trigger loads for.")
-        return [{"manifest_key": k} for k in kept]
+        dfrom = pendulum.parse(context["params"]["date_from"]).start_of("day")
+        dto = pendulum.parse(context["params"]["date_to"]).start_of("day")
+        if dto < dfrom:
+            raise ValueError("date_to must be >= date_from")
+        dates = _date_range_inclusive(dfrom, dto)
+        print(f"Backfill range: {dates[0]} → {dates[-1]} (n={len(dates)})")
+        return dates
 
-    # ───────────────────────────────
-    # Wiring
-    # ───────────────────────────────
-    custom_tickers = get_custom_tickers()
-    dates = generate_trading_dates()
-    per_day_keys = process_date.partial(custom_tickers=custom_tickers).expand(target_date=dates)
-    manifest_keys = write_day_manifest.partial(target_date=None).expand(
-        s3_keys=per_day_keys,
-        target_date=dates,
+    @task
+    def maybe_skip_side_effects(**context) -> bool:
+        """
+        If dry_run=True, signal downstream to skip S3 writes and triggers.
+        """
+        return bool(context["params"]["dry_run"])
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Graph
+    # ────────────────────────────────────────────────────────────────────────────
+
+    dates = expand_dates()
+    dry = maybe_skip_side_effects()
+
+    # Map over dates → fetch → write files → write manifest
+    # Properly gate S3 side-effects on dry_run
+    day_payloads = fetch_day_payload.expand(yyyy_mm_dd=dates).as_teardown(dry)  # fetch still runs in dry-run
+    day_files = write_per_ticker_files.expand(day=day_payloads).skip_if(dry)
+    manifests = write_manifest.expand(day_files=day_files).skip_if(dry)
+
+    # One TriggerDagRun per produced manifest
+    trigger_loads = TriggerDagRunOperator.partial(
+        task_id="trigger_stocks_load",
+        trigger_dag_id=STOCKS_LOAD_DAG_ID,
+        reset_dag_run=True,           # replace if same run_id occurs
+        wait_for_completion=False,    # fire-and-forget
+    ).expand(
+        conf=[
+            {
+                "manifest_key": m["manifest_key"],
+                "prefilter_loaded": m["prefilter_loaded"],
+                "force": m["force"],
+            }
+            for m in manifests
+        ]
     )
-    loader_confs = build_loader_confs(manifest_keys)
 
-    # One TriggerDagRunOperator mapped over per-day confs (no duplicates)
-    TriggerDagRunOperator.partial(
-        task_id="trigger_polygon_stocks_load",
-        trigger_dag_id="polygon_stocks_load",
-        reset_dag_run=False,
-        wait_for_completion=False,
-        pool=LOAD_POOL,
-    ).expand(conf=loader_confs)
+    # Basic ordering: fetch → files → manifest → trigger
+    day_payloads >> day_files >> manifests >> trigger_loads
 
 # Instantiate
 polygon_stocks_ingest_backfill_dag()
